@@ -95,8 +95,8 @@ private val tabIcon = Color(0xFFA2A2A2)
 
 /**
  * The home screen's bottom navigation, as the reference's: 64.2 dp, a 24 dp icon 10.2 dp from its
- * top over a label, 175.1 dp a tab. Two tabs where its first two are: the phone's gallery and
- * LightCraft's library (its third, its community, is online).
+ * top over a label, 175.1 dp a tab. Two tabs, the phone's gallery and LightCraft's library, in the
+ * middle (the reference's third, its online community, has no counterpart: issue 6).
  */
 @Composable
 fun HomeNav(tab: String, onTab: (String) -> Unit, modifier: Modifier = Modifier) {
@@ -106,9 +106,6 @@ fun HomeNav(tab: String, onTab: (String) -> Unit, modifier: Modifier = Modifier)
     Row(modifier.fillMaxWidth().background(Lc.bar).height(64.2.dp), horizontalArrangement = Arrangement.Center) {
         HomeTab(LcIcon.DevicePhotos, "Gallery", tab == "device", width) { onTab("device") }
         HomeTab(LcIcon.Library, "LightCraft", tab == "library", width) { onTab("library") }
-        // the reference's third tab (its online community) has no LightCraft counterpart: its
-        // place stays empty so the two tabs sit where its first two do
-        Spacer(Modifier.width(width))
     }
 }
 
@@ -121,8 +118,6 @@ fun HomeRail(tab: String, onTab: (String) -> Unit, modifier: Modifier = Modifier
     Column(modifier, verticalArrangement = Arrangement.spacedBy(7.8.dp)) {
         HomeTab(LcIcon.DevicePhotos, "Gallery", tab == "device", 80.3.dp, Modifier.height(59.3.dp), iconTop = 7.8.dp) { onTab("device") }
         HomeTab(LcIcon.Library, "LightCraft", tab == "library", 80.3.dp, Modifier.height(59.3.dp), iconTop = 7.8.dp) { onTab("library") }
-        // the empty place of the reference's third tab
-        Spacer(Modifier.height(59.3.dp))
     }
 }
 

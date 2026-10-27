@@ -311,7 +311,8 @@ private fun UprightEditor(vm: AppViewModel, ed: EditorState, createPreset: () ->
         if (!ed.immersive) {
             val before = ed.showingBefore
             Column(Modifier.fillMaxWidth().alpha(if (before) 0f else 1f)) {
-                Spacer(Modifier.windowInsetsTopHeight(WindowInsets.statusBars))
+                // the status bar is shaded, not black, so a zoomed photo shows through it (the reference's)
+                Spacer(Modifier.fillMaxWidth().background(STATUS_SHADE).windowInsetsTopHeight(WindowInsets.statusBars))
                 if (ed.rangePicker == null) EditorTopBar(vm, ed, createPreset, onExport, Modifier.windowInsetsPadding(horizontalInsets))
                 // a mask part's value slider: its name and value 7.8 dp under the bar (the reference's)
                 ed.barPill?.let { Pill(it, Modifier.align(Alignment.CenterHorizontally).padding(top = 7.8.dp)) }
@@ -433,6 +434,9 @@ private fun sheetCap(ed: EditorState): Dp = when {
     ed.tool == MainTool.EDIT && (ed.section == EditSection.EFFECTS || ed.section == EditSection.DETAIL) -> 229.dp
     else -> SheetPeek
 }
+
+/** The editor's status bar over a zoomed photo: shaded, as the reference's. */
+private val STATUS_SHADE = Color.Black.copy(alpha = 0.35f)
 
 /** The strip behind the status bar. */
 @Composable
@@ -1277,7 +1281,9 @@ private fun PhotoView(vm: AppViewModel, ed: EditorState, modifier: Modifier, sid
     Box(
         modifier
             .background(Lc.canvas)
-            .clipToBounds()
+            // zoomed in, the photo runs on under the status bar, the top bar and round the tools, as the
+            // reference's does (issue 5); fitted, it stays in its room
+            .then(if (zoom <= 1f) Modifier.clipToBounds() else Modifier)
             .onSizeChanged { vm.onViewport(it) }
             .pointerInput(ed.photoId, freeScroll) {
                 if (!freeScroll) return@pointerInput
