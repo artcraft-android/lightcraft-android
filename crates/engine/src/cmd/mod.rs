@@ -42,6 +42,8 @@ pub mod recheck;
 pub mod reload;
 mod slideshow;
 mod sync;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod remote;
 mod xmp;
 
 use serde::Serialize;
@@ -170,6 +172,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(missing::specs());
         v.extend(recheck::specs());
         v.extend(sync::specs());
+        #[cfg(not(target_arch = "wasm32"))]
+        v.extend(remote::specs());
         v.extend(metadata::specs());
         v.extend(geocode::specs());
         v.extend(filters::specs());

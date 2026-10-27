@@ -713,6 +713,12 @@ impl MediaCache {
         // used here (no file-system call on the UI thread in the app); an original not known to
         // be offline is tried first and its smart preview is the render worker's fallback.
         #[cfg(not(target_arch = "wasm32"))]
+        if let Source::File { path } = &p.source
+            && self.availability.remote_of(path).is_some()
+        {
+            return self.remote_ref(p, path, max_edge);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         if let (Source::File { path }, Some(dir)) = (&p.source, &self.smart_dir) {
             let sharded = crate::smart::sharded_file_path(dir, p);
             let legacy = dir.join(crate::smart::file_name(p));
@@ -729,6 +735,27 @@ impl MediaCache {
             return r;
         }
         self.origin_ref(&p.source, max_edge)
+    }
+
+    /// How to load cloud photo `p` (its original is on the remote): its smart preview, which is the
+    /// render worker's fallback for the original that cannot be read (and is only used when
+    /// complete); without one, a "not downloaded" error.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remote_ref(&self, p: &Photo, path: &str, max_edge: usize) -> SourceRef {
+        let there = |f: &std::path::Path| self.availability.exists(&f.to_string_lossy()) == Some(true);
+        // (in the sharded place, or the flat one of older releases; only cached answers, like above)
+        let sp = self.smart_dir.as_ref().map(|d| {
+            let sharded = crate::smart::sharded_file_path(d, p);
+            if there(&sharded) { sharded } else { d.join(crate::smart::file_name(p)) }
+        });
+        let loader: FileLoader = Arc::new(|path, _| Err(format!("not downloaded: {path} is on the remote; open it online to download its smart preview")));
+        SourceRef::File { path: path.to_string(), max_edge, loader: Some(loader), fallback: sp, denoise: None, reduced: None }
+    }
+
+    /// The published thumbnail of cloud photo `p` (its file may not be there yet).
+    pub fn published_thumbnail(&self, p: &Photo) -> Option<std::path::PathBuf> {
+        let Source::File { path } = &p.source else { return None };
+        self.availability.remote_of(path)?.thumb_of(p.content_hash.as_deref()?)
     }
 
     /// How to load `origin` at most `max_edge` pixels long, ignoring decoded sources in memory (a
@@ -789,6 +816,9 @@ pub struct RenderJob {
     /// to a 64 px step) and the window would otherwise shrink the texture with 2-tap bilinear sampling, which blurs fine detail at
     /// small ratios and aliases it at large ones. The caches keep the full render.
     pub display_fit: Option<(usize, usize)>,
+    /// A cloud photo's published thumbnail (JPEG, already developed with the edits the remote has):
+    /// shown as is, scaled, when neither the original nor a smart preview can be read.
+    pub published: Option<std::path::PathBuf>,
 }
 
 /// `img` shrunk to fit `max_w × max_h` with a Lanczos filter (see [`RenderJob::display_fit`]).
@@ -1065,8 +1095,34 @@ impl RenderJob {
                     display,
                 }
             }
-            Err(e) => self.failed(e),
+            Err(e) => {
+                // (neither original nor smart preview: the remote's thumbnail, if it was downloaded; not cached, so
+                // that the render with the photo's own edits replaces it once a smart preview is there)
+                let rendered = match self.published.as_deref().and_then(|f| published_thumbnail(f, self.request.max_w.max(self.request.max_h))) {
+                    Some(image) => {
+                        let histogram = Histogram::of_srgb8(&image);
+                        Ok(Rendered { image, histogram, deep: None })
+                    }
+                    None => Err(e),
+                };
+                RenderResult { rendered, ..self.failed(String::new()) }
+            }
         }
+    }
+}
+
+/// The published thumbnail at `file` as display pixels no larger than `edge` pixels long.
+fn published_thumbnail(file: &std::path::Path, edge: usize) -> Option<Rgba8> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bytes = std::fs::read(file).ok()?;
+        let t = lightcraft_codecs::decode_thumbnail(&bytes, u32::try_from(edge.max(1)).unwrap_or(u32::MAX)).ok()?;
+        Some(t.image)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (file, edge);
+        None
     }
 }
 
@@ -1260,8 +1316,12 @@ impl crate::Session {
     pub fn thumb_job(&mut self, id: PhotoId, long_edge: usize) -> Option<RenderJob> {
         let b = thumb_bucket(long_edge);
         let mut job = self.build_job(id, b, b, false, true, Some(b))?;
-        // (a thumbnail may develop a smaller copy of the raw image that the file keeps)
-        if let SourceRef::File { reduced, .. } = &mut job.source {
+        // (a thumbnail may develop a smaller copy of the raw image that the file keeps; a cloud
+        // photo's file is not here to read)
+        let remote = matches!(self.catalog.photo(id).map(|p| &p.source), Some(Source::File { path }) if self.media.availability.remote_of(path).is_some());
+        if let SourceRef::File { reduced, .. } = &mut job.source
+            && !remote
+        {
             reduced.clone_from(&self.media.reduced_loader);
         }
         Some(job)
@@ -1330,6 +1390,7 @@ impl crate::Session {
             slide: None,
             preview_cut: None,
             display_fit: None,
+            published: thumb_bucket.and_then(|_| self.media.published_thumbnail(&p)),
         })
     }
 
@@ -1389,6 +1450,7 @@ impl crate::Session {
             slide: None,
             preview_cut: None,
             display_fit: None,
+            published: None,
         })
     }
 
@@ -1444,6 +1506,7 @@ impl crate::Session {
             slide: None,
             preview_cut,
             display_fit: None,
+            published: None,
         })
     }
 

@@ -41,14 +41,16 @@ pub fn missing(s: &Session) -> Vec<(PhotoId, String)> {
     if cfg!(target_arch = "wasm32") {
         return Vec::new();
     }
-    missing_with(&s.catalog, |f| Path::new(f).exists())
+    // (a cloud library's originals are on the remote, not missing)
+    let avail = &s.media.availability;
+    missing_with(&s.catalog, |f| avail.remote_of(f).is_some() || Path::new(f).exists())
 }
 
 /// Whether photo `id` is in scope and its file is gone (the Missing Photos view checks only
 /// the photos its query already narrowed to). In the app `avail` answers from its cache (files
 /// not checked yet count as present until the background check finds them gone).
 pub fn is_missing(cat: &Catalog, avail: &crate::availability::Availability, id: PhotoId) -> bool {
-    !cfg!(target_arch = "wasm32") && cat.photo(id).and_then(|p| checked_path(p)).is_some_and(|f| avail.is_offline(f))
+    !cfg!(target_arch = "wasm32") && cat.photo(id).and_then(|p| checked_path(p)).is_some_and(|f| avail.is_offline(f) && avail.remote_of(f).is_none())
 }
 
 pub(crate) fn relink_op(id: PhotoId, path: &str) -> Op {
@@ -412,7 +414,9 @@ fn find_missing(s: &mut Session, p: &Value) -> Result<Value> {
         return commit_find(s, FindPlan::from_json(p));
     }
     let folder = str_param(p, "folder").ok_or_else(|| bad(C, "missing `folder`"))?;
-    let plan = plan_find_missing(&find_candidates(&s.catalog), folder).map_err(|e| bad(C, e))?;
+    let mut candidates = find_candidates(&s.catalog);
+    candidates.retain(|c| s.media.availability.remote_of(&c.path).is_none());
+    let plan = plan_find_missing(&candidates, folder).map_err(|e| bad(C, e))?;
     commit_find(s, plan)
 }
 

@@ -503,7 +503,7 @@ pub fn load(path: &Path) -> Result<crate::media::DecodedSource, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn temp(tag: &str) -> PathBuf {

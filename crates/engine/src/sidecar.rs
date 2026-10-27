@@ -785,8 +785,10 @@ impl Session {
             return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the library", p.file_name)));
         }
         let orig = file_path(p).ok_or_else(|| EngineError::Other(format!("{} is not a file on disk", p.file_name)))?;
-        // A relative path would be taken from the working directory.
-        if Path::new(orig).is_relative() || !Path::new(orig).is_file() {
+        // A relative path would be taken from the working directory. (A cloud photo's original is
+        // on the remote, so it is not there to find.)
+        let remote = self.media.availability.remote_of(orig).is_some();
+        if Path::new(orig).is_relative() || (!remote && !Path::new(orig).is_file()) {
             return Err(EngineError::Other(format!("{}: the original {orig} is missing; no XMP sidecar is written", p.file_name)));
         }
         let naming = owners.naming(p, self.xmp.naming);
@@ -815,6 +817,11 @@ impl Session {
         self.validate_sidecar_packets_for_paths(std::slice::from_ref(&path), &crate::rename::RealFs)?;
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         let err = |e: std::io::Error| EngineError::Other(format!("{}: {e}", path.display()));
+        // a cloud photo's original is not here, and nor is its folder until the first sidecar goes in it
+        // (a local photo's folder is never recreated: it may be an unplugged drive)
+        if let Some(dir) = path.parent().filter(|_| remote) {
+            std::fs::create_dir_all(dir).map_err(err)?;
+        }
         let (data, merged, backup) = sidecar_contents(&path, sidecar_packet(p, &self.catalog), &(self.clock)()).map_err(err)?;
         write_atomic(&path, data.as_bytes()).map_err(err)?;
         self.note_sidecar_write(&path, data.as_bytes());

@@ -17,6 +17,8 @@
 //! reads of an import or a scan on the same share. So the worker starts no sweep check while the
 //! caller says files are busy ([`Availability::sweep_yields_to`]); what is asked still gets
 //! answered (within [`YIELD_POLL`]), and the sweep goes on where it stopped when the work ends.
+//! Files under a [`RemoteRoot`] (a cloud library's local mirror, whose originals stay on the
+//! remote) are never probed: they are known to be offline, and never counted as missing.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -42,8 +44,31 @@ fn fs_exists(path: &str) -> bool {
     cfg!(target_arch = "wasm32") || std::path::Path::new(path).exists()
 }
 
+/// A folder that mirrors a cloud library: the paths of its photos are where their originals
+/// would be on this device, but the originals are on the remote and are not downloaded.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRoot {
+    /// Absolute folder.
+    pub root: String,
+    /// Folder of the published thumbnails (`<content hash>.jpg`), shown for photos with neither
+    /// their original nor a smart preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbs: Option<String>,
+}
+
+impl RemoteRoot {
+    /// The published thumbnail of a photo with content hash `hash`, if the folder is known and the
+    /// hash is a plain name.
+    pub fn thumb_of(&self, hash: &str) -> Option<std::path::PathBuf> {
+        let plain = !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_alphanumeric());
+        self.thumbs.as_ref().filter(|_| plain).map(|d| std::path::Path::new(d).join(format!("{hash}.jpg")))
+    }
+}
+
 #[derive(Default)]
 struct State {
+    remotes: Vec<RemoteRoot>,
     /// path → (exists, when checked)
     known: HashMap<String, (bool, std::time::Instant)>,
     queue: VecDeque<String>,
@@ -121,9 +146,33 @@ impl Availability {
         self.background.is_some()
     }
 
+    /// The cloud library folders (see [`RemoteRoot`]).
+    pub fn remotes(&self) -> Vec<RemoteRoot> {
+        lock(&self.state).remotes.clone()
+    }
+
+    pub fn set_remotes(&self, remotes: Vec<RemoteRoot>) {
+        let mut st = lock(&self.state);
+        if st.remotes != remotes {
+            st.remotes = remotes;
+            st.gone_generation += 1;
+        }
+    }
+
+    /// The cloud library folder `path` is under, if any.
+    pub fn remote_of(&self, path: &str) -> Option<RemoteRoot> {
+        let st = lock(&self.state);
+        let p = std::path::Path::new(path);
+        st.remotes.iter().filter(|r| p.starts_with(&r.root)).max_by_key(|r| r.root.len()).cloned()
+    }
+
     /// Does `path` exist? Synchronous mode: checked now. Background mode: the cached answer
-    /// (`None` while unknown); unknown or stale answers are queued for the worker.
+    /// (`None` while unknown); unknown or stale answers are queued for the worker. A file of a
+    /// cloud library is never there.
     pub fn exists(&self, path: &str) -> Option<bool> {
+        if self.remote_of(path).is_some() {
+            return Some(false);
+        }
         let Some(wake) = &self.background else {
             return Some((self.probe)(path));
         };
@@ -164,6 +213,8 @@ impl Availability {
 
     fn sweep_checked(&self, epoch: Option<u64>, paths: Vec<String>) -> bool {
         let Some(wake) = &self.background else { return false };
+        // (a cloud library's files are known to be offline: never probed, never counted as missing)
+        let paths: Vec<String> = paths.into_iter().filter(|p| self.remote_of(p).is_none()).collect();
         let mut st = lock(&self.state);
         if !st.sweep.is_empty() || epoch.is_some_and(|e| e != st.sweep_epoch) {
             return false;
