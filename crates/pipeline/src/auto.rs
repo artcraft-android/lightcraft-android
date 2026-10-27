@@ -21,6 +21,9 @@ pub struct AutoTone {
     pub saturation: f64,
 }
 
+/// Scene EV (from mid grey) at or below which Auto treats a pixel as black: about code 2.5 in a JPEG.
+const BLACK_EV: f32 = -6.0;
+
 fn percentile(sorted: &[f32], q: f32) -> f32 {
     if sorted.is_empty() {
         return 0.0;
@@ -36,10 +39,18 @@ pub fn auto_tone(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings) -> AutoTo
     crate::local::scene_linear_pre(&mut img, info, &base);
     let mut ev: Vec<f32> = img.data.iter().map(|c| (luminance_2020(*c).max(1e-6) / 0.18).log2()).collect();
     ev.sort_by(|a, b| a.total_cmp(b));
-    let median = percentile(&ev, 0.5);
+    // a black background (a low-key portrait) isn't what the photo is exposed for: the median comes
+    // from the rest, and black counts as BLACK_EV for Shadows, so Auto doesn't push +4 EV and lift the
+    // black into noise
+    let lit = ev.get(ev.partition_point(|v| *v <= BLACK_EV)..).filter(|l| !l.is_empty()).unwrap_or(&ev);
+    let median = percentile(lit, 0.5);
     let exposure = (-median * 0.85 - 0.1).clamp(-4.0, 4.0);
-    let (p01, p05, p95, p995) =
-        (percentile(&ev, 0.01) + exposure, percentile(&ev, 0.05) + exposure, percentile(&ev, 0.95) + exposure, percentile(&ev, 0.995) + exposure);
+    let (p01, p05, p95, p995) = (
+        percentile(&ev, 0.01) + exposure,
+        percentile(&ev, 0.05).max(BLACK_EV) + exposure,
+        percentile(&ev, 0.95) + exposure,
+        percentile(&ev, 0.995) + exposure,
+    );
     let highlights = if p995 > 2.2 { -((p995 - 2.2) * 38.0).min(90.0) } else { 0.0 };
     let shadows = if p05 < -4.0 { ((-4.0 - p05) * 22.0).min(70.0) } else { 0.0 };
     let spread = p95 - p05;
@@ -190,6 +201,15 @@ mod tests {
         let bright = Rgb32f::from_fn(64, 64, |x, _| [0.8 + x as f32 * 0.01; 3]);
         let b = auto_tone(&bright, &SourceInfo::default(), &DevelopSettings::default());
         assert!(b.exposure < -1.0, "{b:?}");
+    }
+
+    #[test]
+    fn a_black_background_does_not_set_the_exposure() {
+        // a low-key frame: two thirds black, the subject at mid grey
+        let img = Rgb32f::from_fn(60, 60, |x, _| if x < 40 { [0.0002; 3] } else { [0.18; 3] });
+        let a = auto_tone(&img, &SourceInfo::default(), &DevelopSettings::default());
+        assert!(a.exposure.abs() < 0.5, "{a:?}");
+        assert!(a.shadows < 50.0, "{a:?}");
     }
 
     #[test]
