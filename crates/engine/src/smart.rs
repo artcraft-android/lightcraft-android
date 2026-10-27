@@ -381,6 +381,9 @@ pub fn migrate(from: &Path, to: &Path, what: Existing) -> (usize, Vec<String>) {
 /// A cheap check that the smart preview at `path` is complete: our header, then a JPEG from its
 /// start marker to its end marker. A file cut short by a crash, a full drive or an unplugged one
 /// fails it (and is then rebuilt by Build Smart Previews, not counted as there).
+///
+/// Desktop LightCraft appends `tail` extra bytes after the JPEG (a `tail` field in the header,
+/// absent = 0): the end marker is then that far before the end of the file.
 pub fn is_valid(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else { return false };
@@ -582,6 +585,52 @@ mod tests {
         // moving onto a damaged copy replaces it instead of deleting the good one
         assert_eq!(migrate(&a, &b, Existing::Move).0, 1);
         assert_eq!(std::fs::read(b.join("1.lcsp")).unwrap(), good);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `good` with its header's `fields` set (and the JPEG and anything after it as they were).
+    pub(crate) fn with_header(good: &[u8], fields: &[(&str, serde_json::Value)]) -> Vec<u8> {
+        let nl = MAGIC.len() + good[MAGIC.len()..].iter().position(|b| *b == b'\n').unwrap();
+        let mut head: serde_json::Value = serde_json::from_slice(&good[MAGIC.len()..nl]).unwrap();
+        for (k, v) in fields {
+            head[*k] = v.clone();
+        }
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(head.to_string().as_bytes());
+        out.extend_from_slice(&good[nl..]);
+        out
+    }
+
+    /// `good` as desktop LightCraft writes it: more header fields, and `tail` extra bytes after the JPEG.
+    pub(crate) fn desktop_like(good: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut out = with_header(good, &[("enc", 3.into()), ("look_version", 5.into()), ("tail", tail.len().into())]);
+        out.extend_from_slice(tail);
+        out
+    }
+
+    #[test]
+    fn desktop_proxies_with_a_tail_are_valid_unless_cut_short() {
+        let base = temp("tail");
+        let img = lightcraft_scenes::demo_library()[0].render(64, 40);
+        let good = encode(&img, None).unwrap();
+        let tail: Vec<u8> = (0..300u32).map(|i| (i * 7 % 251) as u8).collect();
+        let desktop = desktop_like(&good, &tail);
+        let f = base.join("d.lcsp");
+        std::fs::write(&f, &desktop).unwrap();
+        assert!(is_valid(&f));
+        assert!(decode(&desktop).is_ok(), "the decoder reads past the tail");
+        for cut in [desktop.len() - 1, desktop.len() - tail.len(), desktop.len() - tail.len() - 1, desktop.len() / 2, 10] {
+            std::fs::write(&f, &desktop[..cut]).unwrap();
+            assert!(!is_valid(&f), "cut at {cut}");
+        }
+        // bytes after the JPEG that the header does not account for are not a complete file
+        std::fs::write(&f, with_header(&good, &[]).iter().chain(&tail).copied().collect::<Vec<u8>>()).unwrap();
+        assert!(!is_valid(&f));
+        // a tail longer than the file, or not a number
+        for t in [serde_json::json!(1u64 << 40), serde_json::json!("many")] {
+            std::fs::write(&f, with_header(&desktop, &[("tail", t)])).unwrap();
+            assert!(!is_valid(&f));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
