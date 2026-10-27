@@ -327,7 +327,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let d = clamp(dark[i] / pf(F_AIR_PRE), 0.0, 1.0);
         let air = pf(F_AIR);
         if (dz > 0.0) {
-            let t = max(1.0 - 0.95 * min(dz, 1.0) * d, 0.12);
+            // held to the pixel's own darkest channel, as the CPU's (strength `DEHAZE_STRENGTH`)
+            let own = clamp(min(c.x, min(c.y, c.z)) / max(air, 1e-6), 0.0, 1.0);
+            let t = max(1.0 - pf(F_DEHAZE_K) * min(dz, 1.0) * min(d, own), 0.12);
             c = max((c - air * (1.0 - t)) / t, vec3<f32>(0.0));
         } else {
             let k = min(-dz, 1.0) * 0.7 * (0.35 + 0.65 * d);

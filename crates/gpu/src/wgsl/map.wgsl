@@ -115,7 +115,9 @@ fn xguided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     dst[i] = max(c[i], clamp(b[2u * i] * a[i] + b[2u * i + 1u], 0.0, 1.0));
 }
 
-// White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0.
+// White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0. A rendered photo
+// (P[11] set) first goes onto the scene scale, as `JpegTone::expand`: its luminance through the
+// curve's inverse (P[12..15] = p, k, q, scene white), its colour kept.
 @compute @workgroup_size(256)
 fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -123,6 +125,15 @@ fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
         return;
     }
     var c = rgb_a(i);
+    if (pu(11u) != 0u) {
+        let y = dot(c, vec3<f32>(0.2627, 0.6780, 0.0593));
+        if (y > 0.0) {
+            let yc = min(y, 1.0);
+            let r = pow(yc, 1.0 / pf(14u));
+            let u = pf(13u) * r / max(1.0 + pf(13u) - r, 1e-6);
+            c = c * (pow(u, 1.0 / pf(12u)) * pf(15u) / yc);
+        }
+    }
     if (pu(1u) != 0u) {
         c = vec3<f32>(
             pf(2u) * c.x + pf(3u) * c.y + pf(4u) * c.z,

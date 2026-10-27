@@ -120,6 +120,9 @@ pub fn auto_wb(src: &Rgb32f, info: &SourceInfo) -> (f64, f64) {
         return (info.as_shot_temp, info.as_shot_tint);
     }
     let avg = acc.map(|v| v / wsum);
+    if !info.raw {
+        return auto_wb_rendered(avg, info);
+    }
     // the white that makes `avg` neutral, through the same model the white balance renders with
     // (`local::wb_matrix_for`): the camera's own colour model, else a Bradford adaptation
     let camera = info.camera_color.as_deref().filter(|_| info.raw && !info.relative_wb);
@@ -132,6 +135,42 @@ pub fn auto_wb(src: &Rgb32f, info: &SourceInfo) -> (f64, f64) {
     };
     let (t, tint) = xy_to_temp_tint(seen);
     (t.clamp(2000.0, 50000.0).round(), tint.clamp(-150.0, 150.0).round())
+}
+
+/// [`auto_wb`] for a rendered photo, through the model its white balance renders with
+/// (`local::wb_matrix_for`): the Temp whose channel gains make red and blue equal (their ratio rises
+/// with Temp, so a bisection finds it), then the tint that takes the green left over.
+fn auto_wb_rendered(avg: [f64; 3], info: &SourceInfo) -> (f64, f64) {
+    if !(avg.iter().all(|v| v.is_finite() && *v > 0.0)) {
+        return (info.as_shot_temp, info.as_shot_tint);
+    }
+    let balance = |rel: f64| {
+        let g = crate::local::rendered_temp_gains(rel);
+        (avg[0] * g[0]).ln() - (avg[2] * g[2]).ln()
+    };
+    let (mut lo, mut hi) = (-100.0, 100.0);
+    let rel = if balance(lo) >= 0.0 {
+        lo
+    } else if balance(hi) <= 0.0 {
+        hi
+    } else {
+        for _ in 0..50 {
+            let mid = (lo + hi) / 2.0;
+            if balance(mid) < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) / 2.0
+    };
+    let g = crate::local::rendered_temp_gains(rel);
+    let balanced = [avg[0] * g[0], avg[1] * g[1], avg[2] * g[2]];
+    let shot = lightcraft_color::cct::temp_tint_to_xy(info.as_shot_temp, info.as_shot_tint);
+    let seen = Xy::from_xyz(bradford(REC2020.white, shot).apply(REC2020.to_xyz().apply(balanced)));
+    let (_, tint) = xy_to_temp_tint(seen);
+    let kelvin = 1e6 / (1e6 / info.as_shot_temp - rel * 0.8);
+    (kelvin.clamp(2000.0, 50000.0).round(), tint.clamp(-150.0, 150.0).round())
 }
 
 /// Temperature/tint currently in effect (for UI display).

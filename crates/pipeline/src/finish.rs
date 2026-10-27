@@ -121,6 +121,9 @@ pub const MASK_TERMS: usize = 21;
 /// Number of alpha-weighted terms at the start of [`mask_terms`].
 pub const MASK_SUMS: usize = 17;
 
+/// How much of the haze model Dehaze +100 applies (see the finish's dehaze step; the GPU's is the same).
+pub const DEHAZE_STRENGTH: f32 = 0.78;
+
 /// A mask's local adjustments as the per-pixel stage uses them (alpha-weighted sums), in order:
 /// exposure, temp, tint, contrast, highlights, shadows, whites, blacks, texture, clarity, dehaze,
 /// saturation, hue, sharpness, noise, moiré, defringe, then the colour overlay: on (0/1), cos and
@@ -238,7 +241,8 @@ impl FinishParams {
             } else if info.raw {
                 ToneMap::new(s.light.contrast, s.light.whites, s.light.blacks)
             } else {
-                ToneMap::display(s.light.contrast, s.light.whites, s.light.blacks)
+                // a rendered photo was expanded onto the scene scale (`local::wb_gain`): back with its curve
+                ToneMap::jpeg(s.light.contrast, s.light.whites, s.light.blacks)
             },
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
@@ -416,7 +420,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             {
                 let d = (dark.data[i] / air_pre).clamp(0.0, 1.0);
                 if dz > 0.0 {
-                    let t = (1.0 - 0.95 * dz.min(1.0) * d).max(0.12);
+                    // the haze map is held to the pixel's own darkest channel: a pixel darker than its
+                    // neighbourhood isn't haze, and capping it never takes away more than the pixel has, so
+                    // shadows keep their steps instead of crushing to black (issue 7); the strength (0.78 at
+                    // +100) sits between what matches Lightroom on our chart (0.7) and on a hazy photo (0.85)
+                    let own = (c[0].min(c[1]).min(c[2]) / air.max(1e-6)).clamp(0.0, 1.0);
+                    let t = (1.0 - DEHAZE_STRENGTH * dz.min(1.0) * d.min(own)).max(0.12);
                     c = c.map(|v| ((v - air * (1.0 - t)) / t).max(0.0));
                 } else {
                     let k = (-dz).min(1.0) * 0.7 * (0.35 + 0.65 * d);

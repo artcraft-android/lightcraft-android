@@ -37,21 +37,46 @@ pub fn wb_matrix_for(info: &SourceInfo, s: &DevelopSettings) -> Option<[[f32; 3]
     {
         return Some(m.to_f32());
     }
-    let set = wb_matrix(&REC2020, temp_tint_to_xy(t, tint));
+    // A rendered photo's Temp: channel gains on its scene scale (`rendered_temp_gains`); its tint as before
+    let (t_bradford, temp_gains) = if info.raw {
+        (t, [1.0; 3])
+    } else {
+        let relative = ((1e6 / info.as_shot_temp - 1e6 / t.max(1.0)) / 0.8).clamp(-100.0, 100.0);
+        (info.as_shot_temp, rendered_temp_gains(relative))
+    };
+    let set = wb_matrix(&REC2020, temp_tint_to_xy(t_bradford, tint));
     let shot = wb_matrix(&REC2020, temp_tint_to_xy(info.as_shot_temp, info.as_shot_tint));
     let m = set.mul(&shot.inverse().unwrap_or(lightcraft_color::Mat3::IDENTITY));
     // Normalize so neutral luminance is preserved (WB shouldn't change exposure).
     let g = m.apply([1.0, 1.0, 1.0]);
     let y = g[0] * 0.2627 + g[1] * 0.6780 + g[2] * 0.0593;
-    Some(m.mul(&lightcraft_color::Mat3::diag(1.0 / y, 1.0 / y, 1.0 / y)).to_f32())
+    let m = m.mul(&lightcraft_color::Mat3::diag(1.0 / y, 1.0 / y, 1.0 / y));
+    let [r, gr, b] = temp_gains;
+    Some(lightcraft_color::Mat3::diag(r, gr, b).mul(&m).to_f32())
+}
+
+/// A rendered photo's Temp (relative, −100…100) as linear Rec.2020 channel gains on its scene scale
+/// ([`crate::tone::JpegTone`]): warming lifts red and green, cooling lifts blue, both brighten a
+/// little, as the rendered photo's own curve then shows them. Each channel's log₂ gain is
+/// `a·x + b·x²` (`x` = Temp / 100) per side, fitted (issue 7) to how far Temp moves the greys of our
+/// test chart in Lightroom's output (measured at −66 … +100; no table is taken from it).
+pub(crate) fn rendered_temp_gains(relative: f64) -> [f64; 3] {
+    const WARM: [[f64; 2]; 3] = [[2.7018, -0.9033], [1.8949, -0.6041], [0.2741, -0.4116]];
+    const COOL: [[f64; 2]; 3] = [[0.38, 0.0], [-0.5238, 0.107], [-3.0805, 0.5513]];
+    let x = relative / 100.0;
+    let ab = if x >= 0.0 { WARM } else { COOL };
+    ab.map(|[a, b]| (a * x + b * x * x).exp2())
 }
 
 fn wb_gain(img: &mut Rgb32f, info: &SourceInfo, s: &DevelopSettings, gain: f32) {
     let m = wb_matrix_for(info, s);
+    // a rendered photo (JPEG, PNG…) is developed on the scene scale, as a raw is (issue 7): white
+    // balance and exposure then move its tones as far as a raw's, and its curve brings it back
+    let rendered = !info.raw;
     let w = img.width;
     for_rows(&mut img.data, w, |_, row| {
         for p in row.iter_mut() {
-            let mut c = *p;
+            let mut c = if rendered { crate::tone::JpegTone::expand(*p) } else { *p };
             if let Some(m) = &m {
                 c = [
                     m[0][0] * c[0] + m[0][1] * c[1] + m[0][2] * c[2],
@@ -390,7 +415,8 @@ mod tests {
     #[test]
     fn wb_as_shot_is_identity_and_warming_adds_red() {
         let s = DevelopSettings::default();
-        let info = SourceInfo::default();
+        // scene-linear input (a raw's); a rendered photo is first expanded (tested below)
+        let info = SourceInfo { raw: true, ..SourceInfo::default() };
         let mut img = Rgb32f::filled(4, 4, [0.3, 0.3, 0.3]);
         scene_linear_pre(&mut img, &info, &s);
         assert!((img.get(0, 0)[0] - 0.3).abs() < 1e-6);
@@ -410,8 +436,50 @@ mod tests {
         let mut s = DevelopSettings::default();
         s.light.exposure = 1.0;
         let mut img = Rgb32f::filled(2, 2, [0.1, 0.2, 0.3]);
-        scene_linear_pre(&mut img, &SourceInfo::default(), &s);
+        scene_linear_pre(&mut img, &SourceInfo { raw: true, ..SourceInfo::default() }, &s);
         assert!((img.get(1, 1)[2] - 0.6).abs() < 1e-5);
+    }
+
+    // Issue 7: a rendered photo is developed on the scene scale and its curve brings it back
+    #[test]
+    fn a_rendered_photo_round_trips_through_its_scene_scale() {
+        use crate::tone::{GREY, JpegTone, ToneMap};
+        let s = DevelopSettings::default();
+        let info = SourceInfo::default();
+        // display grey stays at scene grey; display white lands about 4.1 EV above it
+        assert!((JpegTone::to_scene(GREY) - GREY).abs() < 1e-5);
+        let white_ev = (JpegTone::scale() / GREY).log2();
+        assert!((3.9..4.4).contains(&white_ev), "{white_ev}");
+        // expanded then toned with neutral sliders: unchanged, colour kept
+        let tone = ToneMap::jpeg(0.0, 0.0, 0.0);
+        for c in [[0.02f32, 0.05, 0.01], [0.3, 0.2, 0.1], [0.18, 0.18, 0.18], [0.9, 0.95, 0.85], [1.0, 1.0, 1.0]] {
+            let mut img = Rgb32f::filled(1, 1, c);
+            scene_linear_pre(&mut img, &info, &s);
+            let e = img.get(0, 0);
+            let (ye, yc) = (luminance_2020(e), luminance_2020(c));
+            let back = tone.apply(ye);
+            assert!((back - yc).abs() < 2e-4 * yc.max(0.05), "{c:?}: {back} vs {yc}");
+            // the same colour: all channels scaled alike
+            assert!((e[0] / e[1] - c[0] / c[1]).abs() < 1e-4, "{c:?}");
+        }
+    }
+
+    // Issue 7: exposure on a rendered photo rolls its highlights off into white instead of clipping
+    #[test]
+    fn exposure_on_a_rendered_photo_rolls_off() {
+        use crate::tone::ToneMap;
+        let mut s = DevelopSettings::default();
+        s.light.exposure = 2.7;
+        let tone = ToneMap::jpeg(0.0, 0.0, 0.0);
+        let mut out = Vec::new();
+        // display-linear 0.1, 0.2, 0.3 (8-bit 89, 124, 149): ×6.5 put all three past white before
+        for v in [0.1f32, 0.2, 0.3] {
+            let mut img = Rgb32f::filled(1, 1, [v, v, v]);
+            scene_linear_pre(&mut img, &SourceInfo::default(), &s);
+            out.push(tone.apply(luminance_2020(img.get(0, 0))));
+        }
+        // brighter, still apart and short of white (the display-only path clipped all three to 1)
+        assert!(out[0] > 0.6 && out[0] < out[1] && out[1] < out[2] && out[2] < 0.99, "{out:?}");
     }
 }
 

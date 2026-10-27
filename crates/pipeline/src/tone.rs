@@ -87,6 +87,66 @@ impl CameraTone {
     }
 }
 
+/// The scene scale rendered (non-raw) photos are developed on, as a raw is. A decoded JPEG's
+/// display-linear luminance is expanded onto it ([`JpegTone::to_scene`]: display grey stays at
+/// [`GREY`], display white lands about 4.1 EV above), the develop works there (white balance,
+/// exposure, the local tools), and [`ToneMap::jpeg`] brings the result back with the forward curve,
+/// so a photo with no edits comes out unchanged. The curve is a smooth shoulder,
+/// `y = ((1 + k)·u / (u + k))^q` with `u = (S / scale)^p`: exposure then rolls highlights off into
+/// white instead of clipping them, and white balance moves tones as far as the rendered photo's
+/// own curve allows. Its three numbers were fitted (issue 7) to how far edits move tones in
+/// Lightroom's output, measured on our own test chart; no curve or table is taken from it.
+pub struct JpegTone;
+
+impl JpegTone {
+    const P: f32 = 2.1634;
+    const K: f32 = 0.0322;
+    const Q: f32 = 0.6142;
+
+    /// The shape's three numbers (`p`, `k`, `q`) and the scene value of display white, for the GPU.
+    pub fn params() -> [f32; 4] {
+        [Self::P, Self::K, Self::Q, Self::scale()]
+    }
+
+    /// The scene value of display white.
+    pub fn scale() -> f32 {
+        GREY / Self::unit_scene(GREY)
+    }
+
+    /// The inverse on a white = 1 scale.
+    fn unit_scene(y: f32) -> f32 {
+        let r = y.clamp(0.0, 1.0).powf(1.0 / Self::Q);
+        let u = Self::K * r / (1.0 + Self::K - r).max(1e-6);
+        u.powf(1.0 / Self::P)
+    }
+
+    /// Display-linear luminance (0..=1) → scene luminance.
+    pub fn to_scene(y: f32) -> f32 {
+        if y > 0.0 { Self::unit_scene(y) * Self::scale() } else { 0.0 }
+    }
+
+    /// Scene luminance → display-linear luminance (white and beyond: 1).
+    pub fn to_display(s: f32) -> f32 {
+        if s.is_nan() || s <= 0.0 {
+            return 0.0;
+        }
+        let u = (s / Self::scale()).min(1.0).powf(Self::P);
+        ((1.0 + Self::K) * u / (u + Self::K)).powf(Self::Q)
+    }
+
+    /// A display-linear Rec.2020 pixel on the scene scale: its luminance expanded, its colour kept
+    /// (all three channels scaled alike, as the tone map scales them back).
+    pub fn expand(c: [f32; 3]) -> [f32; 3] {
+        let y = c[0] * 0.2627 + c[1] * 0.6780 + c[2] * 0.0593;
+        if y.is_nan() || y <= 0.0 {
+            return c;
+        }
+        let yc = y.min(1.0);
+        let k = Self::to_scene(yc) / yc;
+        c.map(|v| v * k)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ToneMap {
     lut: Vec<f32>,
@@ -139,6 +199,21 @@ impl ToneMap {
         ToneMap { lut, chroma: NO_CHROMA }
     }
 
+    /// Tone map for rendered (non-raw) sources developed on [`JpegTone`]'s scene scale: its curve,
+    /// with Contrast, Whites and Blacks on top (identity with neutral sliders).
+    pub fn jpeg(contrast: f64, whites: f64, blacks: f64) -> ToneMap {
+        let adjustment = Self::display(contrast, whites, blacks);
+        let neutral = contrast == 0.0 && whites == 0.0 && blacks == 0.0;
+        let lut = (0..LUT_N)
+            .map(|i| {
+                let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
+                let y = JpegTone::to_display(GREY * 2f32.powf(ev));
+                if neutral { y } else { adjustment.apply(y) }
+            })
+            .collect();
+        ToneMap { lut, chroma: NO_CHROMA }
+    }
+
     /// Tone map for display-referred sources: identity at neutral settings.
     pub fn display(contrast: f64, whites: f64, blacks: f64) -> ToneMap {
         let c = (contrast / 100.0) as f32;
@@ -153,13 +228,23 @@ impl ToneMap {
                 if p <= 1.0 {
                     // S-curve anchored at 0, grey and 1
                     p += c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2));
-                    // whites: lift/lower the upper tones; blacks: the lower tones
-                    let up = smooth(0.45, 1.0, p);
-                    p += w * 0.12 * up * (1.0 - p * 0.5);
-                    let lo = 1.0 - smooth(0.0, 0.45, p);
-                    p += b * 0.07 * lo * (p * 2.0).min(1.0);
-                } else {
-                    p += w * 0.12 * 0.5;
+                }
+                // Blacks and Whites (issue 7), shapes of our own whose few numbers were fitted to how far
+                // Lightroom's sliders move the greys of our test chart. Blacks −: the black point moves up
+                // (a soft toe) and the rest stretches back to white; +: the shadows lift, black stays black.
+                if b < 0.0 {
+                    let bp = 0.2078 * (-b).powf(2.2152);
+                    let soft = |v: f32| 0.5 * (v + (v * v + 0.0004).sqrt()) - 0.01;
+                    p = (soft((p - bp) / (1.0 - bp)) / soft(1.0)).max(0.0);
+                } else if b > 0.0 {
+                    let q = p.min(1.0);
+                    p += 0.535 * b * q * (1.0 - q) * (1.0 - q);
+                }
+                // Whites +: the mid-tones and highlights brighten towards white; −: the upper tones dim
+                if w > 0.0 {
+                    p *= 1.0 + 0.4469 * w * smooth(0.0209, 0.4361, p);
+                } else if w < 0.0 {
+                    p *= 1.0 + 0.0982 * w * smooth(0.2, 0.6, p);
                 }
                 let mut o = p.max(0.0).powf(2.2);
                 // short shoulder: slope 1 at 0.95, reaching 1.0 at 1.05
