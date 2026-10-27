@@ -379,3 +379,26 @@ fn real_desktop_smart_previews_decode() {
     }
     eprintln!("decoded {} desktop smart preview(s)", files.len());
 }
+
+/// `photo.sidecarPaths` names the file each record's sidecar lives in (the partner of a raw+JPEG pair
+/// gets `<file>.xmp`), and `photo.readMetadataFromFile` reads explicit ids without a selection.
+#[test]
+fn sidecar_paths_follow_the_engines_naming() {
+    let root = temp_dir("sidecar-paths");
+    let mut s = remote_session(&root);
+    let all = json!([item(1, "A/shot.ARW"), item(2, "A/shot.JPG"), item(3, "B/solo.jpg")]);
+    s.execute("library.addRemote", &json!({"root": root.to_string_lossy(), "photos": all})).unwrap();
+    let every: Vec<u64> = s.catalog.photos().map(|p| p.id.0).collect();
+    let r = s.execute("photo.sidecarPaths", &json!({"ids": every})).unwrap();
+    let mut got: Vec<(String, bool)> = r["paths"].as_array().unwrap().iter().map(|e| (e["path"].as_str().unwrap().replace(&root.to_string_lossy().to_string(), ""), e["exists"].as_bool().unwrap())).collect();
+    got.sort();
+    assert_eq!(got, vec![("/A/shot.JPG.xmp".to_string(), false), ("/A/shot.xmp".to_string(), false), ("/B/solo.xmp".to_string(), false)]);
+    let id = photo_at(&s, &root.join("B/solo.jpg")).unwrap().id;
+    let r = s.execute("photo.sidecarPaths", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(r["paths"].as_array().unwrap().len(), 1);
+    // no selection needed
+    s.selection = crate::Selection::default();
+    let r = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0], "onlyChanged": true})).unwrap();
+    assert_eq!(r["failed"].as_array().unwrap().len(), 1, "no sidecar: {r}");
+    let _ = std::fs::remove_dir_all(&root);
+}
