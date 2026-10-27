@@ -486,6 +486,18 @@ pub struct CloudStatus {
     pub last_error: Option<String>,
 }
 
+/// Which photos of the library are the cloud's, and which of those have their smart preview on the phone.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct CloudPhotos {
+    /// Every photo of the cloud library (partners of pairs included).
+    pub ids: Vec<u64>,
+    /// Those whose smart preview is downloaded (the others show their published thumbnail until opened).
+    pub previews: Vec<u64>,
+    /// By photo id: what the phone shows of the photo (thumbnail and applied sidecar versions). Changes
+    /// whenever either does, refresh events seen or not.
+    pub versions: std::collections::HashMap<u64, String>,
+}
+
 /// The connection settings of the cloud library, kept in the library folder (`cloud.json`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1282,6 +1294,12 @@ impl MobileSession {
     /// Cap the downloaded smart previews at `bytes` (default 2 GiB) and trim to it now.
     pub fn cloud_set_cache_cap(&self, bytes: u64) -> Result<(), MobileError> {
         self.cloud_library()?.set_cache_cap(&mut CloudEngine(self), bytes).map_err(cloud_err)
+    }
+
+    /// Which photos are the cloud's and which of them have a preview on the phone; cheap (no network).
+    /// Empty when nothing is connected.
+    pub fn cloud_photos(&self) -> CloudPhotos {
+        self.cloud_library().map(|l| { let (ids, previews) = l.photo_ids(); CloudPhotos { ids, previews, versions: l.content_versions().into_iter().collect() } }).unwrap_or_default()
     }
 
     /// Photo ids of the partners of raw+JPEG pairs, as of the last refresh: leave them out of the grid.

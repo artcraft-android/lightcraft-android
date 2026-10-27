@@ -264,6 +264,23 @@ impl CloudLibrary {
         v
     }
 
+    /// Engine ids of every photo of the library, and of those whose smart preview is on the phone.
+    pub fn photo_ids(&self) -> (Vec<u64>, Vec<u64>) {
+        let g = lock(&self.inner);
+        let mut all: Vec<u64> = g.state.photos.values().map(|p| p.engine_id).collect();
+        let mut with: Vec<u64> = g.state.photos.iter().filter(|(id, _)| g.state.previews.contains_key(*id)).map(|(_, p)| p.engine_id).collect();
+        all.sort_unstable();
+        with.sort_unstable();
+        (all, with)
+    }
+
+    /// The version of what the phone shows of each photo (engine id, `<thumbnail>/<sidecar>` versions
+    /// as recorded): changes whenever the thumbnail or the applied sidecar does.
+    pub fn content_versions(&self) -> Vec<(u64, String)> {
+        let g = lock(&self.inner);
+        g.state.photos.values().map(|p| (p.engine_id, format!("{}/{}", p.thumb.as_deref().unwrap_or("-"), p.manifest.as_deref().unwrap_or("-")))).collect()
+    }
+
     pub fn status(&self) -> Status {
         let g = lock(&self.inner);
         let hidden = g.items.iter().filter(|i| i.alternate).count();

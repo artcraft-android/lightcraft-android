@@ -861,7 +861,9 @@ fn the_cloud_library_connects_refreshes_sends_edits_and_comes_back_after_a_resta
     let solo = shown.iter().find(|p| p.file_name == "solo.jpg").unwrap().id;
     let path = s.cloud_download_original(solo).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    assert!(s.cloud_photos().ids.contains(&solo) && s.cloud_photos().previews.is_empty());
     assert!(s.cloud_open(solo).unwrap().downloaded);
+    assert_eq!(s.cloud_photos().previews, vec![solo]);
     assert!(!s.cloud_open(solo).unwrap().downloaded);
     assert!(s.cloud_status().cache_bytes > 0);
     s.cloud_set_cache_cap(1).unwrap();
