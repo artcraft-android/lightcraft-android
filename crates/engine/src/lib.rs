@@ -1438,6 +1438,8 @@ mod tests_process;
 #[cfg(test)]
 mod tests_recheck;
 #[cfg(test)]
+mod tests_remote;
+#[cfg(test)]
 mod tests_segment;
 #[cfg(test)]
 mod tests_settings_files;
