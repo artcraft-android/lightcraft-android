@@ -792,3 +792,102 @@ fn reading_a_sidecar_in_the_sync_does_not_write_it_back() {
     s.set_control("light.exposure".into(), 0.1).unwrap();
     assert_ne!(std::fs::read_to_string(&sidecar).unwrap(), foreign);
 }
+
+// ---------------------------------------------------------------------------------------------
+// cloud library (a folder on this computer stands in for the remote; needs the host librclone)
+
+fn host_librclone() -> bool {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("librclone-host/librclone.so").is_file()
+}
+
+fn cloud_hex(n: u8) -> String {
+    format!("{:032x}", u128::from(n) * 0x0101_0101_0101_0101)
+}
+
+/// A published library with a JPEG + raw pair (the JPEG is the photo) and one more photo.
+fn cloud_remote(dir: &std::path::Path) -> std::path::PathBuf {
+    let remote = dir.join("pc");
+    let put = |rel: &str, bytes: &[u8]| {
+        let p = remote.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    };
+    let entry = |n: u8, path: &str, sidecar: &str| {
+        put(&format!("originals/{path}"), b"original");
+        put(&format!("mobile/thumbs/{}.jpg", cloud_hex(n)), b"thumb");
+        put(&format!("mobile/previews/{}.lcsp", cloud_hex(n)), b"preview");
+        serde_json::json!({"id": cloud_hex(n), "path": path, "sidecar": sidecar, "sidecarVersion": null, "width": 6000, "height": 4000,
+            "thumb": format!("thumbs/{}.jpg", cloud_hex(n)), "preview": format!("previews/{}.lcsp", cloud_hex(n)), "previewKey": cloud_hex(n + 100), "previewBytes": 7})
+    };
+    let mut pair = entry(1, "A/shot.JPG", "A/shot.JPG.xmp");
+    pair["alternates"] = serde_json::json!([entry(2, "A/shot.ARW", "A/shot.xmp")]);
+    let photos = serde_json::json!([pair, entry(3, "B/solo.jpg", "B/solo.xmp")]);
+    put("mobile/manifest.json", serde_json::json!({"format": 1, "generated": "x", "photos": photos}).to_string().as_bytes());
+    remote
+}
+
+#[test]
+fn the_cloud_library_connects_refreshes_sends_edits_and_comes_back_after_a_restart() {
+    if !host_librclone() {
+        eprintln!("skipped: scripts/build-librclone.sh host has not been run");
+        return;
+    }
+    let base = temp_dir("cloud");
+    let remote = cloud_remote(&base);
+    let conf = base.join("rclone.conf");
+    std::fs::write(&conf, "").unwrap();
+    let lib = base.join("lib");
+    let s = MobileSession::open(lib.to_string_lossy().to_string(), false).unwrap();
+    let st = s.cloud_status();
+    assert!(!st.connected && st.remote.is_empty());
+    assert!(matches!(s.cloud_refresh(), Err(MobileError::Cloud(_))));
+    // not a cloud library / bad names are refused up front
+    assert!(s.cloud_connect(conf.to_string_lossy().to_string(), base.to_string_lossy().to_string(), "phone".into()).is_err());
+    assert!(s.cloud_connect(conf.to_string_lossy().to_string(), remote.to_string_lossy().to_string(), "bad name!".into()).is_err());
+    s.cloud_connect(conf.to_string_lossy().to_string(), remote.to_string_lossy().to_string(), "pixel-9".into()).unwrap();
+    assert!(s.cloud_status().connected);
+
+    let r = s.cloud_refresh().unwrap();
+    assert_eq!((r.total, r.added, r.hidden.len(), r.thumbs.len()), (3, 3, 1, 3), "{r:?}");
+    assert_eq!(s.cloud_hidden_photos(), r.hidden);
+    let shown: Vec<PhotoInfo> = s.photos().into_iter().filter(|p| !r.hidden.contains(&p.id)).collect();
+    assert_eq!(shown.len(), 2);
+    let st = s.cloud_status();
+    assert_eq!((st.photos, st.hidden, st.pending_uploads, st.device.as_str()), (2, 1, 0, "pixel-9"));
+    assert!(st.last_refresh.is_some() && st.last_error.is_none());
+    assert_eq!(s.cloud_refresh().unwrap().thumbs.len(), 0, "nothing new the second time");
+
+    // an original and a preview come down
+    let solo = shown.iter().find(|p| p.file_name == "solo.jpg").unwrap().id;
+    let path = s.cloud_download_original(solo).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    assert!(s.cloud_open(solo).unwrap().downloaded);
+    assert!(!s.cloud_open(solo).unwrap().downloaded);
+    assert!(s.cloud_status().cache_bytes > 0);
+    s.cloud_set_cache_cap(1).unwrap();
+    assert_eq!(s.cloud_status().cache_bytes, 0);
+
+    // an edit goes to the inbox once
+    s.execute("library.select".into(), format!("{{\"ids\": [{solo}]}}")).unwrap();
+    s.execute("photo.rate".into(), format!("{{\"ids\": [{solo}], \"rating\": 4}}")).unwrap();
+    assert_eq!(s.cloud_status().pending_uploads, 1);
+    assert_eq!(s.cloud_push().unwrap(), 1);
+    assert_eq!(s.cloud_push().unwrap(), 0);
+    let sent: Vec<String> = std::fs::read_dir(remote.join("inbox/pixel-9")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].starts_with(&cloud_hex(3)) && sent[0].ends_with("-none.xmp"), "{sent:?}");
+    assert_eq!(s.cloud_status().pending_uploads, 0);
+
+    // a new launch connects again by itself
+    drop(s);
+    let s = MobileSession::open(lib.to_string_lossy().to_string(), false).unwrap();
+    let st = s.cloud_status();
+    assert!(st.connected && st.remote == remote.to_string_lossy() && st.photos == 2, "{st:?}");
+    assert_eq!(s.cloud_push().unwrap(), 0);
+    s.cloud_disconnect().unwrap();
+    assert!(!s.cloud_status().connected);
+    drop(s);
+    let s = MobileSession::open(lib.to_string_lossy().to_string(), false).unwrap();
+    assert!(!s.cloud_status().connected, "disconnected stays disconnected");
+    let _ = std::fs::remove_dir_all(&base);
+}

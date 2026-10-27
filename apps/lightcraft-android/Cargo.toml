@@ -16,6 +16,8 @@ workspace = true
 
 [dependencies]
 lightcraft-engine = { workspace = true }
+# the cloud library: a PC's published photos on an rclone remote (rclone's own library, loaded at run time)
+lightcraft-cloud-client = { workspace = true }
 # the view ↔ photo mapping (an affine) for the tools that act on the photo
 lightcraft-geom = { workspace = true }
 # the point curves' spline, for the Curve tool to draw them as the engine applies them

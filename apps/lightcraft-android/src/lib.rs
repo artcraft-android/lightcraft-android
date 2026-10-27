@@ -40,6 +40,9 @@ pub enum MobileError {
     Library(String),
     #[error("no photo with id {0}")]
     NoPhoto(u64),
+    /// The cloud library could not be reached or used (offline, wrong login, not a LightCraft cloud…).
+    #[error("{0}")]
+    Cloud(String),
 }
 
 impl From<EngineError> for MobileError {
@@ -434,6 +437,87 @@ pub struct FolderSync {
     pub failed: Vec<String>,
 }
 
+/// What a cloud library refresh did.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct CloudRefresh {
+    /// Files in the library, partners of raw+JPEG pairs included.
+    pub total: u32,
+    pub added: u32,
+    pub updated: u32,
+    pub removed: u32,
+    /// Photo ids of the partners of raw+JPEG pairs: the grid shows the pair as one photo, so hide these.
+    pub hidden: Vec<u64>,
+    /// Photo ids whose published thumbnail was downloaded (draw them again).
+    pub thumbs: Vec<u64>,
+    /// Photo ids whose edits were taken from the PC's changed sidecar.
+    pub applied: Vec<u64>,
+    /// Photo ids with a PC change not taken because of an edit here not sent yet.
+    pub blocked: Vec<u64>,
+    /// What failed (a thumbnail, a sidecar); the rest went through and the next refresh tries again.
+    pub failures: Vec<String>,
+}
+
+/// The result of opening a cloud photo for editing.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct CloudOpen {
+    /// The smart preview was downloaded just now (the session already forgot the photo's old render:
+    /// render it again). False: it was on the phone already.
+    pub downloaded: bool,
+}
+
+/// The cloud library's state, for a settings screen.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct CloudStatus {
+    /// A cloud library is set up and its storage is loaded (a failed reconnect at launch is `false` with `last_error`).
+    pub connected: bool,
+    /// The rclone remote (`phone:`, `phone:LightCraft Cloud`), empty when none was ever set up.
+    pub remote: String,
+    pub device: String,
+    /// Photos shown (partners of pairs not counted).
+    pub photos: u32,
+    pub hidden: u32,
+    /// Edits not sent to the PC yet.
+    pub pending_uploads: u32,
+    /// Smart previews on the phone, bytes, and the cap they are trimmed to (least recently opened go first).
+    pub cache_bytes: u64,
+    pub cache_cap: u64,
+    /// UTC, `2026-10-27T09:42:15Z`.
+    pub last_refresh: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// The connection settings of the cloud library, kept in the library folder (`cloud.json`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudSettings {
+    config_path: String,
+    remote: String,
+    device: String,
+}
+
+/// The engine as the cloud client drives it: every command takes the session lock on its own, so a
+/// refresh or a download never holds the UI up.
+struct CloudEngine<'a>(&'a MobileSession);
+
+impl lightcraft_cloud_client::Engine for CloudEngine<'_> {
+    fn call(&mut self, command: &str, params: Value) -> Result<Value, String> {
+        self.0.lock().execute(command, &params).map_err(|e| e.to_string())
+    }
+}
+
+/// Where librclone is loaded from: `LIGHTCRAFT_LIBRCLONE`, else by name (the app's own libraries on
+/// Android); the host build for this crate's tests.
+fn librclone_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("LIGHTCRAFT_LIBRCLONE") {
+        return Some(p.into());
+    }
+    cfg!(test).then(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("librclone-host/librclone.so"))
+}
+
+fn cloud_err(e: lightcraft_cloud_client::Error) -> MobileError {
+    MobileError::Cloud(e.to_string())
+}
+
 /// The engine version (`0.4.0`).
 #[uniffi::export]
 pub fn engine_version() -> String {
@@ -464,6 +548,12 @@ pub struct MobileSession {
     /// did. Not the time of the last synchronization: a sync tool keeps the modified time of the
     /// device that wrote a file, so a sidecar can arrive "older" than the last synchronization.
     sidecars_seen: Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::SystemTime, u64)>>,
+    /// The cloud library, once connected (see [`MobileSession::cloud_connect`]).
+    cloud: Mutex<Option<Arc<lightcraft_cloud_client::CloudLibrary>>>,
+    /// Its settings, kept (and in `cloud.json`) while a connection is wanted, even when it failed to load.
+    cloud_settings: Mutex<Option<CloudSettings>>,
+    /// Why the settings could not be connected (at launch).
+    cloud_error: Mutex<Option<String>>,
 }
 
 struct ViewStages {
@@ -474,7 +564,66 @@ struct ViewStages {
 
 impl MobileSession {
     fn wrap(session: Session) -> Self {
-        MobileSession { session: Mutex::new(session), view_stages: Mutex::new(None), edit_floor: Mutex::new(None), sidecars_seen: Mutex::default() }
+        MobileSession {
+            session: Mutex::new(session),
+            view_stages: Mutex::new(None),
+            edit_floor: Mutex::new(None),
+            sidecars_seen: Mutex::default(),
+            cloud: Mutex::new(None),
+            cloud_settings: Mutex::new(None),
+            cloud_error: Mutex::new(None),
+        }
+    }
+
+    /// The library folder, when the library is on disk.
+    fn library_dir(&self) -> Option<std::path::PathBuf> {
+        self.lock().library.as_ref().filter(|l| l.on_disk).map(|l| l.dir.clone())
+    }
+
+    fn cloud_library(&self) -> Result<Arc<lightcraft_cloud_client::CloudLibrary>, MobileError> {
+        let c = self.cloud.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        c.ok_or_else(|| MobileError::Cloud(self.cloud_error.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or_else(|| "no cloud library is connected".into())))
+    }
+
+    /// Load the storage of `settings` and make it the cloud library (nothing is saved).
+    fn connect_cloud(&self, settings: &CloudSettings, check: bool) -> Result<(), MobileError> {
+        use lightcraft_cloud_client::Remote;
+        let dir = self.library_dir().ok_or_else(|| MobileError::Cloud("a cloud library needs the library on disk".into()))?;
+        let state = dir.join("cloud");
+        let remote = lightcraft_cloud_client::RcloneRemote::open(librclone_path().as_deref(), std::path::Path::new(&settings.config_path), &settings.remote, Some(&state.join("tmp"))).map_err(cloud_err)?;
+        if check {
+            // (reachable, and a LightCraft cloud)
+            remote.list("mobile", false).map_err(|e| match e {
+                lightcraft_cloud_client::Error::NotFound(_) => MobileError::Cloud(format!("{} is not a LightCraft cloud library (no mobile/ folder)", settings.remote)),
+                e => cloud_err(e),
+            })?;
+        }
+        let lib = lightcraft_cloud_client::CloudLibrary::open(&state, Arc::new(remote), &settings.remote, &settings.device).map_err(cloud_err)?;
+        // edits reach the PC through the sidecars the engine writes after each change
+        self.run("library.xmpPreferences", json!({"autoWrite": true}))?;
+        *self.cloud.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(lib));
+        *self.cloud_settings.lock().unwrap_or_else(PoisonError::into_inner) = Some(settings.clone());
+        *self.cloud_error.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        Ok(())
+    }
+
+    /// At launch: connect again if the library has cloud settings. A failure is kept for `cloud_status`;
+    /// the library opens regardless (it works offline from what was downloaded).
+    fn restore_cloud(&self) {
+        let Some(dir) = self.library_dir() else { return };
+        let Some(settings) = std::fs::read(dir.join("cloud.json")).ok().and_then(|b| serde_json::from_slice::<CloudSettings>(&b).ok()) else { return };
+        *self.cloud_settings.lock().unwrap_or_else(PoisonError::into_inner) = Some(settings.clone());
+        if let Err(e) = self.connect_cloud(&settings, false) {
+            *self.cloud_error.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
+        }
+    }
+
+    /// The renders and thumbnails the session holds of `ids` are out of date.
+    fn forget_renders(&self, ids: &[u64]) {
+        let mut s = self.lock();
+        for id in ids {
+            s.media.forget(PhotoId(*id));
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Session> {
@@ -553,7 +702,9 @@ impl MobileSession {
         // the phone's own time for imports, edits and versions (the engine's default is a fixed test date)
         let mut s = Session::new().with_fs().with_system_clock();
         s.open_library(&dir, seed_demo).map_err(|e| MobileError::Library(e.to_string()))?;
-        Ok(Arc::new(Self::wrap(s)))
+        let session = Arc::new(Self::wrap(s));
+        session.restore_cloud();
+        Ok(session)
     }
 
     /// Run command `command` with JSON parameters (`""` = none) and return its JSON result: the
@@ -1010,6 +1161,132 @@ impl MobileSession {
             .map(|a| a.iter().map(|e| format!("{}: {}", e["id"], e["error"].as_str().unwrap_or("unreadable"))).collect())
             .unwrap_or_default();
         Ok(report)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // cloud library: a PC's published photos on an rclone remote (see docs/cloud-library.md)
+
+    /// Connect the library to a cloud library and remember the settings (`cloud.json` in the library folder;
+    /// it connects again at every launch). `config_path` is an rclone config file that holds the remote (the
+    /// phone-only one the user imported), `remote` the rclone path of the library (`phone:LightCraft Cloud`,
+    /// or `phone:` when the remote's root is the library), `device_name` names this phone in the PC's inbox
+    /// (letters, digits, `_`, `-`, `.`; up to 64). Replaces an earlier connection. Checks that the storage can be
+    /// reached, so it blocks on the network: call it off the main thread. Also turns on the library's automatic
+    /// XMP sidecar writing (edits reach the PC through the sidecars).
+    pub fn cloud_connect(&self, config_path: String, remote: String, device_name: String) -> Result<(), MobileError> {
+        let dir = self.library_dir().ok_or_else(|| MobileError::Cloud("a cloud library needs the library on disk".into()))?;
+        let settings = CloudSettings { config_path, remote: remote.trim().to_string(), device: device_name.trim().to_string() };
+        if settings.remote.is_empty() {
+            return Err(MobileError::Cloud("name the rclone remote (like `phone:` or `phone:LightCraft Cloud`)".into()));
+        }
+        self.connect_cloud(&settings, true)?;
+        let json = serde_json::to_vec_pretty(&settings).map_err(|e| MobileError::Cloud(e.to_string()))?;
+        std::fs::write(dir.join("cloud.json"), json).map_err(|e| MobileError::Cloud(format!("cloud.json: {e}")))?;
+        Ok(())
+    }
+
+    /// Forget the connection (the settings file). Photos, thumbnails and previews already on the phone stay,
+    /// edits not sent yet stay in their sidecars; connecting to the same library again picks up from there.
+    pub fn cloud_disconnect(&self) -> Result<(), MobileError> {
+        *self.cloud.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.cloud_settings.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.cloud_error.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        if let Some(dir) = self.library_dir() {
+            match std::fs::remove_file(dir.join("cloud.json")) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(MobileError::Cloud(format!("cloud.json: {e}"))),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring the library up to date with the cloud: the photo list (with raw+JPEG pairs listed as two
+    /// photos, see `hidden`), thumbnails, and the edits the PC changed, unless an edit here is not sent yet.
+    /// Blocks on the network, a few seconds to minutes the first time: call it off the main thread.
+    pub fn cloud_refresh(&self) -> Result<CloudRefresh, MobileError> {
+        let lib = self.cloud_library()?;
+        let r = lib.refresh(&mut CloudEngine(self)).map_err(cloud_err)?;
+        let stale: Vec<u64> = r.thumbs.iter().chain(&r.applied).copied().collect();
+        self.forget_renders(&stale);
+        let n = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        Ok(CloudRefresh { total: n(r.total), added: n(r.added), updated: n(r.updated), removed: n(r.removed), hidden: r.hidden, thumbs: r.thumbs, applied: r.applied, blocked: r.blocked, failures: r.failures })
+    }
+
+    /// Make photo `photo_id` editable: download its smart preview unless the phone has it, then the editor can
+    /// render it (`downloaded`: render again). Blocks on the network. The previews are trimmed to the cache cap, the
+    /// least recently opened first.
+    pub fn cloud_open(&self, photo_id: u64) -> Result<CloudOpen, MobileError> {
+        let lib = self.cloud_library()?;
+        let downloaded = lib.ensure_preview(&mut CloudEngine(self), photo_id).map_err(|e| {
+            lib.note_error(&e);
+            cloud_err(e)
+        })?;
+        if downloaded {
+            self.forget_renders(&[photo_id]);
+        }
+        Ok(CloudOpen { downloaded })
+    }
+
+    /// Download the full-size original of photo `photo_id` (for a full-size export); returns where it is on
+    /// the phone. Blocks on the network.
+    pub fn cloud_download_original(&self, photo_id: u64) -> Result<String, MobileError> {
+        let lib = self.cloud_library()?;
+        let path = lib.ensure_original(photo_id).map_err(|e| {
+            lib.note_error(&e);
+            cloud_err(e)
+        })?;
+        self.forget_renders(&[photo_id]);
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Send the edits not sent yet to the PC's inbox; returns how many went. An edit that could not go (offline)
+    /// stays pending. Fails only when something was pending and nothing could be sent. Blocks on the network.
+    pub fn cloud_push(&self) -> Result<u32, MobileError> {
+        let lib = self.cloud_library()?;
+        let r = lib.push_edits(&mut CloudEngine(self)).map_err(cloud_err)?;
+        if r.sent == 0 && r.failed > 0 {
+            return Err(MobileError::Cloud(r.errors.first().cloned().unwrap_or_else(|| "could not send".into())));
+        }
+        Ok(u32::try_from(r.sent).unwrap_or(u32::MAX))
+    }
+
+    /// The cloud library's state; cheap (no network). Works when nothing is connected (`connected` false).
+    pub fn cloud_status(&self) -> CloudStatus {
+        let settings = self.cloud_settings.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let Ok(lib) = self.cloud_library() else {
+            return CloudStatus {
+                remote: settings.as_ref().map(|s| s.remote.clone()).unwrap_or_default(),
+                device: settings.map(|s| s.device).unwrap_or_default(),
+                cache_cap: lightcraft_cloud_client::DEFAULT_CACHE_CAP,
+                last_error: self.cloud_error.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+                ..Default::default()
+            };
+        };
+        let _ = lib.pending(&mut CloudEngine(self));
+        let st = lib.status();
+        let n = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        CloudStatus {
+            connected: true,
+            remote: st.remote,
+            device: st.device,
+            photos: n(st.photos),
+            hidden: n(st.hidden),
+            pending_uploads: n(st.pending),
+            cache_bytes: st.cache_bytes,
+            cache_cap: st.cache_cap,
+            last_refresh: st.last_refresh,
+            last_error: st.last_error,
+        }
+    }
+
+    /// Cap the downloaded smart previews at `bytes` (default 2 GiB) and trim to it now.
+    pub fn cloud_set_cache_cap(&self, bytes: u64) -> Result<(), MobileError> {
+        self.cloud_library()?.set_cache_cap(&mut CloudEngine(self), bytes).map_err(cloud_err)
+    }
+
+    /// Photo ids of the partners of raw+JPEG pairs, as of the last refresh: leave them out of the grid.
+    pub fn cloud_hidden_photos(&self) -> Vec<u64> {
+        self.cloud_library().map(|l| l.hidden_ids()).unwrap_or_default()
     }
 
     /// Take photo `id` out of the library for good, and delete its file when the library holds it

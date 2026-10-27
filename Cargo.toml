@@ -33,6 +33,7 @@ lightcraft-catalog = { path = "crates/catalog" }
 lightcraft-preview = { path = "crates/preview" }
 lightcraft-merge = { path = "crates/merge" }
 lightcraft-engine = { path = "crates/engine" }
+lightcraft-cloud-client = { path = "crates/cloud" }
 lightcraft-fetch = { path = "crates/fetch" }
 lightcraft-heif = { path = "crates/heif" }
 lightcraft-segment = { path = "crates/segment" }

@@ -2145,6 +2145,7 @@ name = "lightcraft-android"
 version = "0.14.0"
 dependencies = [
  "android_logger",
+ "lightcraft-cloud-client",
  "lightcraft-color",
  "lightcraft-engine",
  "lightcraft-geom",
