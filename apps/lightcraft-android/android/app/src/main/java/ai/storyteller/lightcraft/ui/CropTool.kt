@@ -217,6 +217,10 @@ fun CropStage(vm: AppViewModel, ed: EditorState, frame: CropFrame, image: ImageB
     // what a finger is doing to the crop before the engine has it back
     var liveRect by remember(frame) { mutableStateOf<DoubleArray?>(null) }
     var liveAngle by remember(frame) { mutableStateOf<Double?>(null) }
+    // the gesture below is started once per photo, so it writes through these: a new frame makes new live
+    // state, and a gesture holding the first frame's would draw nothing after the first drag (issue 8)
+    val setLiveRect by rememberUpdatedState<(DoubleArray?) -> Unit> { liveRect = it }
+    val setLiveAngle by rememberUpdatedState<(Double?) -> Unit> { liveAngle = it }
     // the view held still while a handle resizes the crop (it fits again on lifting)
     var held by remember { mutableStateOf<CropView?>(null) }
     var touching by remember { mutableStateOf(false) }
@@ -281,14 +285,14 @@ fun CropStage(vm: AppViewModel, ed: EditorState, frame: CropFrame, image: ImageB
                                     draggedCrop(start, handle, sx, sy, f.aspectW.toInt(), f.aspectH.toInt(), f.width, f.height)
                                 }
                                 next?.let {
-                                    liveRect = it
+                                    setLiveRect(it)
                                     vm.dragCrop(it)
                                 }
                             } else {
                                 val a1 = atan2(change.position.y - v.centre.y, change.position.x - v.centre.x)
                                 val turn = Math.toDegrees((a1 - a0).toDouble())
                                 val value = (f.angle + turn).coerceIn(-45.0, 45.0)
-                                liveAngle = value
+                                setLiveAngle(value)
                                 ed.control("crop.angle")?.let { vm.onControlChange(it, value) }
                             }
                         }
@@ -374,31 +378,34 @@ fun CropStage(vm: AppViewModel, ed: EditorState, frame: CropFrame, image: ImageB
             bar(Offset(box.center.x - len / 2, box.bottom + o), Offset(box.center.x + len / 2, box.bottom + o))
             bar(Offset(box.left - o, box.center.y - len / 2), Offset(box.left - o, box.center.y + len / 2))
             bar(Offset(box.right + o, box.center.y - len / 2), Offset(box.right + o, box.center.y + len / 2))
-            // the straighten dial under the crop: marks round an arc that turns with the photo, the angle over its middle
-            val dialTop = box.bottom + 1.dp.toPx()
-            val radius = 190.dp.toPx()
-            val c = Offset(box.center.x, dialTop + 29.dp.toPx() - radius)
-            val span = 32f
-            var mark = -span
-            while (mark <= span) {
-                val value = mark + angle.toFloat()
-                // a mark every 2 degrees of angle, a longer one every 10
-                val tick = Math.round(value / 2f) * 2f
-                val at = Math.toRadians((90f + tick - angle.toFloat()).toDouble())
-                val p = c + Offset(cos(at).toFloat(), sin(at).toFloat()) * radius
-                val big = Math.round(tick) % 10 == 0
-                if (big) {
-                    val q = c + Offset(cos(at).toFloat(), sin(at).toFloat()) * (radius - 6.dp.toPx())
-                    drawLine(Color.White, q, p, 1.5.dp.toPx())
-                } else {
-                    drawCircle(Color.White, 1.2.dp.toPx(), p)
+            // the straighten dial under the crop: marks round an arc that turns with the photo, the angle over its
+            // middle; hidden while a handle resizes the crop, as the reference's is
+            if (held == null) {
+                val dialTop = box.bottom + 1.dp.toPx()
+                val radius = 190.dp.toPx()
+                val c = Offset(box.center.x, dialTop + 29.dp.toPx() - radius)
+                val span = 32f
+                var mark = -span
+                while (mark <= span) {
+                    val value = mark + angle.toFloat()
+                    // a mark every 2 degrees of angle, a longer one every 10
+                    val tick = Math.round(value / 2f) * 2f
+                    val at = Math.toRadians((90f + tick - angle.toFloat()).toDouble())
+                    val p = c + Offset(cos(at).toFloat(), sin(at).toFloat()) * radius
+                    val big = Math.round(tick) % 10 == 0
+                    if (big) {
+                        val q = c + Offset(cos(at).toFloat(), sin(at).toFloat()) * (radius - 6.dp.toPx())
+                        drawLine(Color.White, q, p, 1.5.dp.toPx())
+                    } else {
+                        drawCircle(Color.White, 1.2.dp.toPx(), p)
+                    }
+                    mark += 2f
                 }
-                mark += 2f
+                drawLine(Color.White, Offset(c.x, dialTop + 33.dp.toPx()), Offset(c.x, dialTop + 43.dp.toPx()), 2.dp.toPx())
+                val label = dialLabel(angle)
+                val measured = text.measure(label, TextStyle(color = Color.White, fontFamily = Inter, fontSize = 12.sp))
+                drawText(measured, topLeft = Offset(c.x - measured.size.width / 2f, dialTop + 4.dp.toPx()))
             }
-            drawLine(Color.White, Offset(c.x, dialTop + 33.dp.toPx()), Offset(c.x, dialTop + 43.dp.toPx()), 2.dp.toPx())
-            val label = dialLabel(angle)
-            val measured = text.measure(label, TextStyle(color = Color.White, fontFamily = Inter, fontSize = 12.sp))
-            drawText(measured, topLeft = Offset(c.x - measured.size.width / 2f, dialTop + 4.dp.toPx()))
         }
         CropButtons(vm, ed, frame)
     }
@@ -434,7 +441,8 @@ private fun BoxScope.CropButtons(vm: AppViewModel, ed: EditorState, frame: CropF
     ) {
         RoundButton(LcIcon.SwapAspect, "Swap aspect") { vm.cropCommand("crop.rotateAspect") }
         RoundButton(if (locked) LcIcon.Lock else LcIcon.Unlock, if (locked) "Aspect locked" else "Aspect unlocked") {
-            vm.setCropAspect(if (locked) "free" else "original")
+            // lock the crop's present shape, where it is (the reference's): "original" would refit it
+            vm.setCropAspect(if (locked) "free" else "current")
         }
     }
     Column(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.5.dp), horizontalAlignment = Alignment.End) {
@@ -630,7 +638,7 @@ private fun CropAspect(vm: AppViewModel, ed: EditorState) {
     val upright = frame != null && frame.height > frame.width
     var open by remember { mutableStateOf<String?>(null) }
     val tiles: @Composable () -> Unit = {
-        CropTile("Original", selected = current == "original", onClick = { vm.setCropAspect("original") }) { LcIcon(LcIcon.Original, null, tint = it, size = 22.dp) }
+        CropTile("Original", selected = current == "original", onClick = { vm.setCropAspect("original", level = true) }) { LcIcon(LcIcon.Original, null, tint = it, size = 22.dp) }
         Box(Modifier.padding(horizontal = 4.dp).size(1.dp, 40.dp).background(Lc.toolDivider))
         Box {
             CropTile("Ratios", selected = open == "ratios" || ratios.any { ratioId(it) == current }, onClick = { open = "ratios" }) { LcIcon(LcIcon.Ratios, null, tint = it, size = 26.dp) }

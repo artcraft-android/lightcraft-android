@@ -511,18 +511,30 @@ pub fn specs() -> Vec<CommandSpec> {
             "Straighten",
             [],
             None,
-            "{angle: degrees -45..45} — keeps the largest crop of the current aspect",
+            "{angle: degrees -45..45, from?: [x0,y0,x1,y1], fromAngle?: degrees} — the photo turns about the crop's centre and the crop keeps its size, shrinking only when it no longer fits; the largest crop of its aspect stays the largest. A gesture passes the crop it started from (`from`, `fromAngle`) on every move so the crop can grow back",
             has_active,
             |s, p| {
                 let id = active(s, "crop.straighten")?;
                 let (w, h) = crop_dims(s, id);
                 let angle = f64_req(p, "angle", "crop.straighten")?.clamp(-45.0, 45.0);
+                let from = match p.get("from") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<_>>()).as_deref() {
+                        Some(&[x0, y0, x1, y1]) if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) && x1 > x0 && y1 > y0 => {
+                            let a = p.get("fromAngle").and_then(Value::as_f64).filter(|a| a.is_finite()).unwrap_or(0.0).clamp(-45.0, 45.0);
+                            Some(CropGeometry { rect: Rect::new(x0, y0, x1, y1), angle: a })
+                        }
+                        _ => return Err(bad("crop.straighten", "`from` needs [x0, y0, x1, y1] with x1 > x0 and y1 > y0")),
+                    },
+                };
                 edit(s, "crop.straighten", "Straighten", |d| {
-                    let r = d.crop.geometry.rect_px(w, h);
-                    let fit = crop_fit_angle(w, h, angle, Some(r.width() / r.height()));
-                    // keep the current crop size if it still fits, else shrink
-                    let cand = CropGeometry { rect: d.crop.geometry.rect, angle };
-                    d.crop.geometry = if cand.is_within_image(w, h) { cand } else { fit };
+                    let start = from.unwrap_or(d.crop.geometry);
+                    d.crop.geometry = if start.is_largest_fit(w, h) {
+                        let r = start.rect_px(w, h);
+                        crop_fit_angle(w, h, angle, Some(r.width() / r.height()))
+                    } else {
+                        start.straightened(w, h, angle)
+                    };
                     Ok(())
                 })
             }
@@ -554,7 +566,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Crop Aspect",
             [],
             None,
-            "{aspect: \"original\"|\"free\"|\"current\" (lock the crop's present shape)|\"toggle\" (lock ↔ free)|\"1x1\"|\"4x5\"|\"8.5x11\"|\"5x7\"|\"2x3\"|\"4x3\"|\"16x9\"|\"16x10\"|[w,h], asGiven?: bool (keep the aspect's own orientation instead of the photo's)}",
+            "{aspect: \"original\"|\"free\"|\"current\" (lock the crop's present shape)|\"toggle\" (lock ↔ free)|\"1x1\"|\"4x5\"|\"8.5x11\"|\"5x7\"|\"2x3\"|\"4x3\"|\"16x9\"|\"16x10\"|[w,h], asGiven?: bool (keep the aspect's own orientation instead of the photo's), level?: bool (also straighten back to 0°, as Original does)}",
             has_active,
             |s, p| {
                 let id = active(s, "crop.aspect")?;
@@ -590,7 +602,11 @@ pub fn specs() -> Vec<CommandSpec> {
                     _ => return Err(bad("crop.aspect", "missing aspect")),
                 };
                 let as_given = p.get("asGiven").and_then(Value::as_bool).unwrap_or(false);
+                let level = p.get("level").and_then(Value::as_bool).unwrap_or(false);
                 edit(s, "crop.aspect", "Crop Aspect", |d| {
+                    if level {
+                        d.crop.geometry.angle = 0.0;
+                    }
                     if aspect.is_none() {
                         d.crop.aspect = None;
                     } else {
@@ -604,11 +620,13 @@ pub fn specs() -> Vec<CommandSpec> {
             let id = active(s, "crop.rotateAspect")?;
             let (w, h) = crop_dims(s, id);
             edit(s, "crop.rotateAspect", "Rotate Crop", |d| {
-                let r = d.crop.geometry.rect_px(w, h);
-                let a = r.height() / r.width();
+                // width and height swap about the crop's own centre, so it stays on the same part of
+                // the photo (swapping back restores it); moved, then shrunk, only as far as it must
+                let g = d.crop.geometry;
+                let r = g.rect_px(w, h);
                 d.crop.aspect = d.crop.aspect.map(|(x, y)| (y, x));
-                let angle = d.crop.geometry.angle;
-                d.crop.geometry = crop_fit_angle(w, h, angle, Some(a));
+                let swapped = CropGeometry { rect: Rect::from_center(r.center(), r.height(), r.width()).scale(1.0 / w, 1.0 / h), angle: g.angle };
+                d.crop.geometry = swapped.shifted_to_fit(w, h);
                 Ok(())
             })
         }),

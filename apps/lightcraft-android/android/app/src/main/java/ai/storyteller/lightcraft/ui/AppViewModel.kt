@@ -287,6 +287,9 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     /** The control being dragged: an engine interaction is open for it (one undo step). */
     internal var adjusting: String? = null
 
+    /** The crop a straighten gesture started from (rect, angle): every move works from it (issue 8). */
+    internal var straightenFrom: Pair<DoubleArray, Double>? = null
+
     fun control(id: String): DevelopControl? = controls.firstOrNull { it.id == id }
 }
 
@@ -3056,9 +3059,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (ed.tool == MainTool.CROP) ed.crop = frame
     }
 
-    fun setCropAspect(aspect: String) {
+    /** [level]: straighten back to 0° too (the Original tile, as the reference's). */
+    fun setCropAspect(aspect: String, level: Boolean = false) {
         editor?.cropFormat = null
-        cropCommand("crop.aspect", JSONObject().put("aspect", aspect))
+        cropCommand("crop.aspect", JSONObject().put("aspect", aspect).put("level", level))
     }
 
     /** A social format's shape, the way round it has (a story is upright on any photo). */
@@ -3281,12 +3285,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val begin = ed.adjusting != control.id
         ed.adjusting = control.id
         val straighten = control.id == "crop.angle" && ed.tool == MainTool.CROP
+        // a turn is one gesture: each move goes from the crop it started with, so the crop keeps its place
+        // on the photo and grows back as the angle returns, instead of shrinking with every move
+        if (straighten && begin) ed.straightenFrom = ed.crop?.let { it.rect.toDoubleArray() to it.angle }
+        val from = if (straighten) ed.straightenFrom else null
         viewModelScope.launch {
             runCatching {
                 e.command {
                     if (begin) beginAdjustment(control.label)
                     if (straighten) {
-                        execute("crop.straighten", JSONObject().put("angle", value).toString())
+                        val params = JSONObject().put("angle", value)
+                        from?.let { (rect, angle) -> params.put("from", JSONArray(rect.toList())).put("fromAngle", angle) }
+                        execute("crop.straighten", params.toString())
                         cropFrame(ed.photoId)
                     } else {
                         setControl(control.id, value)

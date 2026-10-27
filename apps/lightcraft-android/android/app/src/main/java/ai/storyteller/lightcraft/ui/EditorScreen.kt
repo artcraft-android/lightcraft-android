@@ -294,7 +294,14 @@ private fun UprightEditor(vm: AppViewModel, ed: EditorState, createPreset: () ->
             val panel = (stack - rows).coerceAtLeast(0)
             val (w, h) = photoSize(ed) ?: (1f to 1f)
             val fitted = min(area.toFloat(), width * h / w).roundToInt()
-            val shrink = if (panel > 0) min(panel, max(area - fitted, with(density) { 68.dp.roundToPx() })) else 0
+            // Crop keeps clear of its whole panel, as sideways (its dial and round buttons sit at the photo's
+            // foot, and a tall photo or one just turned would otherwise have them under the panel: issue 8);
+            // elsewhere the panel may lie over a tall photo's foot
+            val shrink = when {
+                panel <= 0 -> 0
+                ed.tool == MainTool.CROP -> panel
+                else -> min(panel, max(area - fitted, with(density) { 68.dp.roundToPx() }))
+            }
             IntRect(0, status, width, status + area - shrink)
         }
         // as the reference's: the photo eases into the room a panel leaves it (350 ms, slowing)

@@ -79,6 +79,98 @@ impl CropGeometry {
         let _ = best;
         CropGeometry { rect: nr.scale(1.0 / w, 1.0 / h), angle: self.angle }
     }
+
+    /// The crop at `c` (rotated-frame pixels), `scale` times its size.
+    fn about(&self, c: Point, scale: f64, w: f64, h: f64) -> CropGeometry {
+        let r = self.rect_px(w, h);
+        CropGeometry { rect: Rect::from_center(c, r.width() * scale, r.height() * scale).scale(1.0 / w, 1.0 / h), angle: self.angle }
+    }
+
+    /// The crop shrunk about its own centre (keeping its aspect) until it fits inside the rotated
+    /// image. A centre outside the image is first pulled towards the image's centre, just far enough.
+    pub fn shrunk_to_fit(&self, w: f64, h: f64) -> CropGeometry {
+        if self.is_within_image(w, h) {
+            return *self;
+        }
+        let own = self.rect_px(w, h).center();
+        let image = Point::new(w / 2.0, h / 2.0);
+        let mut c = own;
+        if !self.about(c, 1e-3, w, h).is_within_image(w, h) {
+            let (mut lo, mut hi) = (0.0, 1.0);
+            for _ in 0..40 {
+                let t = (lo + hi) / 2.0;
+                if self.about(own.lerp(image, t), 1e-3, w, h).is_within_image(w, h) {
+                    hi = t;
+                } else {
+                    lo = t;
+                }
+            }
+            c = own.lerp(image, hi);
+        }
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..40 {
+            let s = (lo + hi) / 2.0;
+            if self.about(c, s, w, h).is_within_image(w, h) {
+                lo = s;
+            } else {
+                hi = s;
+            }
+        }
+        self.about(c, lo, w, h)
+    }
+
+    /// The crop moved towards the image's centre (keeping its size) just far enough to fit inside
+    /// the rotated image; a crop too big to fit anywhere is first shrunk to the largest that fits.
+    pub fn shifted_to_fit(&self, w: f64, h: f64) -> CropGeometry {
+        if self.is_within_image(w, h) {
+            return *self;
+        }
+        let r = self.rect_px(w, h);
+        let own = r.center();
+        let image = Point::new(w / 2.0, h / 2.0);
+        let s = max_inscribed_scale(w, h, self.angle, r.width(), r.height()).min(1.0);
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..40 {
+            let t = (lo + hi) / 2.0;
+            if self.about(own.lerp(image, t), s, w, h).is_within_image(w, h) {
+                hi = t;
+            } else {
+                lo = t;
+            }
+        }
+        self.about(own.lerp(image, hi), s, w, h)
+    }
+
+    /// The crop once the photo is straightened to `angle`: the photo point under the crop's centre
+    /// stays under it (the photo turns about the crop, as Lightroom's does), and the crop keeps its
+    /// size unless it no longer fits, when it shrinks about its own centre.
+    pub fn straightened(&self, w: f64, h: f64, angle: f64) -> CropGeometry {
+        let image = Point::new(w / 2.0, h / 2.0);
+        let r = self.rect_px(w, h);
+        let photo = Affine::rotate_about(-self.angle.to_radians(), image).apply(r.center());
+        let c = Affine::rotate_about(angle.to_radians(), image).apply(photo);
+        CropGeometry { rect: Rect::from_center(c, r.width(), r.height()).scale(1.0 / w, 1.0 / h), angle }.shrunk_to_fit(w, h)
+    }
+
+    /// Whether this is the largest crop of its own aspect at its angle (as [`crop_fit_angle`] makes
+    /// it): such a crop follows the angle at that largest size, growing back as the photo levels.
+    pub fn is_largest_fit(&self, w: f64, h: f64) -> bool {
+        let r = self.rect_px(w, h);
+        if r.height() <= 0.0 {
+            return false;
+        }
+        let fit = crop_fit_angle(w, h, self.angle, Some(r.width() / r.height())).rect;
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-4;
+        near(fit.x0, self.rect.x0) && near(fit.y0, self.rect.y0) && near(fit.x1, self.rect.x1) && near(fit.y1, self.rect.y1)
+    }
+
+    /// The crop after the photo turns a quarter (`cw`: clockwise): the same part of the photo,
+    /// in the turned photo's frame (width and height swap).
+    pub fn quarter_turned(&self, cw: bool) -> CropGeometry {
+        let Rect { x0, y0, x1, y1 } = self.rect;
+        let rect = if cw { Rect::new(1.0 - y1, x0, 1.0 - y0, x1) } else { Rect::new(y0, 1.0 - x1, y1, 1.0 - x0) };
+        CropGeometry { rect, angle: self.angle }
+    }
 }
 
 /// Largest scale `s` such that a centred `cw·s × ch·s` rectangle fits inside a `w × h` image rotated
@@ -139,5 +231,76 @@ mod tests {
         let t = c.output_to_source(100.0, 100.0, 50.0, 50.0);
         let p = t.apply(Point::new(0.0, 0.0));
         assert!((p.x - 25.0).abs() < 1e-9 && (p.y - 25.0).abs() < 1e-9);
+    }
+
+    fn photo_point_under_centre(c: &CropGeometry, w: f64, h: f64) -> Point {
+        let r = c.rect_px(w, h);
+        Affine::rotate_about(-c.angle.to_radians(), Point::new(w / 2.0, h / 2.0)).apply(r.center())
+    }
+
+    #[test]
+    fn straightening_keeps_the_photo_point_under_a_small_crop() {
+        // a small crop near the top: turning keeps it on the same part of the photo, at the same size
+        let (w, h) = (600.0, 400.0);
+        let c = CropGeometry { rect: Rect::new(0.40, 0.15, 0.55, 0.35), angle: 0.0 };
+        for ang in [6.6, -12.0, 30.0] {
+            let t = c.straightened(w, h, ang);
+            assert!(t.is_within_image(w, h), "{ang}");
+            assert!((t.angle - ang).abs() < 1e-12);
+            let (p0, p1) = (photo_point_under_centre(&c, w, h), photo_point_under_centre(&t, w, h));
+            assert!((p0.x - p1.x).abs() < 1e-6 && (p0.y - p1.y).abs() < 1e-6, "{ang}: {p0:?} vs {p1:?}");
+            assert!((t.rect.width() - c.rect.width()).abs() < 1e-9 && (t.rect.height() - c.rect.height()).abs() < 1e-9, "{ang}: size kept");
+        }
+    }
+
+    #[test]
+    fn straightening_shrinks_a_crop_that_no_longer_fits_about_its_centre() {
+        let (w, h) = (600.0, 400.0);
+        let c = CropGeometry { rect: Rect::new(0.05, 0.05, 0.6, 0.6), angle: 0.0 };
+        let t = c.straightened(w, h, 20.0);
+        assert!(t.is_within_image(w, h));
+        assert!(t.rect.width() < c.rect.width());
+        // the aspect is kept
+        let (a0, a1) = (c.rect_px(w, h), t.rect_px(w, h));
+        assert!((a0.width() / a0.height() - a1.width() / a1.height()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_largest_fit_is_recognised() {
+        assert!(crop_fit_angle(600.0, 400.0, 12.0, None).is_largest_fit(600.0, 400.0));
+        assert!(CropGeometry::default().is_largest_fit(600.0, 400.0));
+        assert!(!CropGeometry { rect: Rect::new(0.1, 0.1, 0.5, 0.5), angle: 0.0 }.is_largest_fit(600.0, 400.0));
+    }
+
+    #[test]
+    fn shifting_keeps_size_when_it_can() {
+        let (w, h) = (600.0, 400.0);
+        // a portrait crop sticking out past the right edge: moved in, same size
+        let c = CropGeometry { rect: Rect::new(0.8, 0.1, 1.1, 0.9), angle: 0.0 };
+        let s = c.shifted_to_fit(w, h);
+        assert!(s.is_within_image(w, h));
+        assert!((s.rect.width() - c.rect.width()).abs() < 1e-6 && (s.rect.height() - c.rect.height()).abs() < 1e-6);
+        // too tall to fit anywhere: shrunk to the largest that fits
+        let tall = CropGeometry { rect: Rect::new(0.1, -0.2, 0.3, 1.2), angle: 0.0 };
+        assert!(tall.shifted_to_fit(w, h).is_within_image(w, h));
+    }
+
+    #[test]
+    fn a_quarter_turn_keeps_the_same_part_of_the_photo() {
+        let c = CropGeometry { rect: Rect::new(0.1, 0.2, 0.4, 0.9), angle: 3.0 };
+        let cw = c.quarter_turned(true);
+        let want = Rect::new(0.1, 0.1, 0.8, 0.4);
+        assert!((cw.rect.x0 - want.x0).abs() < 1e-12 && (cw.rect.y0 - want.y0).abs() < 1e-12);
+        assert!((cw.rect.x1 - want.x1).abs() < 1e-12 && (cw.rect.y1 - want.y1).abs() < 1e-12);
+        // four turns either way come back; a turn and its opposite cancel
+        let mut r = c;
+        for _ in 0..4 {
+            r = r.quarter_turned(true);
+        }
+        assert!((r.rect.x0 - c.rect.x0).abs() < 1e-12 && (r.rect.y1 - c.rect.y1).abs() < 1e-12);
+        let back = cw.quarter_turned(false);
+        assert!((back.rect.x0 - c.rect.x0).abs() < 1e-12 && (back.rect.y0 - c.rect.y0).abs() < 1e-12);
+        assert!((back.rect.x1 - c.rect.x1).abs() < 1e-12 && (back.rect.y1 - c.rect.y1).abs() < 1e-12);
+        assert_eq!(cw.angle, 3.0);
     }
 }

@@ -509,6 +509,85 @@ fn crop_aspect_as_given_keeps_its_own_orientation() {
     assert!((r.aspect() - aw / ah).abs() < 0.01, "{} vs {}", r.aspect(), aw / ah);
 }
 
+fn oriented_dims(s: &Session) -> (f64, f64) {
+    let id = s.active().unwrap();
+    let d = active_dev(s);
+    let p = s.catalog.photo(id).unwrap();
+    if d.orientation.swaps_axes() { (p.height as f64, p.width as f64) } else { (p.width as f64, p.height as f64) }
+}
+
+// Issue 8 (Android): straightening a crop keeps it on the same part of the photo and at its size,
+// and every move of a gesture works from the crop it started with, so it grows back
+#[test]
+fn straightening_follows_the_photo_and_grows_back() {
+    let mut s = demo();
+    s.execute("crop.set", &json!({"rect": [0.40, 0.15, 0.55, 0.35]})).unwrap();
+    let start = active_dev(&s).crop.geometry;
+    s.execute("crop.straighten", &json!({"angle": 6.6})).unwrap();
+    let g = active_dev(&s).crop.geometry;
+    assert!((g.rect.width() - start.rect.width()).abs() < 1e-9, "the small crop keeps its size, not the largest fit");
+    // a gesture: out to 36° and back to 6°, each move from the start: the crop is the start's size again
+    let from = json!([start.rect.x0, start.rect.y0, start.rect.x1, start.rect.y1]);
+    s.execute("crop.straighten", &json!({"angle": 36.0, "from": from, "fromAngle": 0.0})).unwrap();
+    s.execute("crop.straighten", &json!({"angle": 6.0, "from": from, "fromAngle": 0.0})).unwrap();
+    assert!((active_dev(&s).crop.geometry.rect.width() - start.rect.width()).abs() < 1e-9);
+    // the largest fit stays the largest fit, growing back as the photo levels
+    s.execute("crop.reset", &json!({})).unwrap();
+    s.execute("crop.straighten", &json!({"angle": 30.0})).unwrap();
+    let small = active_dev(&s).crop.geometry.rect.width();
+    s.execute("crop.straighten", &json!({"angle": 0.0})).unwrap();
+    assert!(active_dev(&s).crop.geometry.rect.width() > small + 0.1);
+    assert!(s.execute("crop.straighten", &json!({"angle": 3.0, "from": [0.5, 0.5]})).is_err());
+}
+
+// Issue 8: swapping the aspect turns the crop about its own centre; swapping back restores it
+#[test]
+fn swapping_the_aspect_keeps_the_crops_place() {
+    let mut s = demo();
+    let (w, h) = oriented_dims(&s);
+    // a small portrait crop off the centre, with room to turn where it is
+    s.execute("crop.set", &json!({"rect": [0.30, 0.35, 0.42, 0.65]})).unwrap();
+    let before = active_dev(&s).crop.geometry;
+    s.execute("crop.rotateAspect", &json!({})).unwrap();
+    let swapped = active_dev(&s).crop.geometry;
+    let (a, b) = (before.rect_px(w, h), swapped.rect_px(w, h));
+    assert!((a.center().x - b.center().x).abs() < 1.0 && (a.center().y - b.center().y).abs() < 1.0, "same centre");
+    assert!((a.width() - b.height()).abs() < 1.0 && (a.height() - b.width()).abs() < 1.0, "sides swapped");
+    s.execute("crop.rotateAspect", &json!({})).unwrap();
+    let back = active_dev(&s).crop.geometry.rect;
+    assert!((back.x0 - before.rect.x0).abs() < 1e-6 && (back.y1 - before.rect.y1).abs() < 1e-6, "swapping back restores it");
+}
+
+// Issue 8: turning the photo a quarter keeps the crop on the same part of it
+#[test]
+fn rotating_the_photo_turns_the_crop_with_it() {
+    let mut s = demo();
+    s.execute("crop.set", &json!({"rect": [0.10, 0.20, 0.40, 0.90]})).unwrap();
+    s.execute("crop.aspect", &json!({"aspect": "current"})).unwrap();
+    let (aw, ah) = active_dev(&s).crop.aspect.unwrap();
+    s.execute("photo.rotateRight", &json!({})).unwrap();
+    let d = active_dev(&s);
+    let r = d.crop.geometry.rect;
+    assert!((r.x0 - 0.10).abs() < 1e-9 && (r.y0 - 0.10).abs() < 1e-9 && (r.x1 - 0.80).abs() < 1e-9 && (r.y1 - 0.40).abs() < 1e-9, "{r:?}");
+    assert_eq!(d.crop.aspect, Some((ah, aw)), "the lock's ratio turns too");
+    s.execute("photo.rotateLeft", &json!({})).unwrap();
+    let r = active_dev(&s).crop.geometry.rect;
+    assert!((r.x0 - 0.10).abs() < 1e-9 && (r.y0 - 0.20).abs() < 1e-9 && (r.x1 - 0.40).abs() < 1e-9 && (r.y1 - 0.90).abs() < 1e-9, "{r:?}");
+}
+
+// Issue 8: Original resets the straightening too (`level`)
+#[test]
+fn original_with_level_resets_the_angle() {
+    let mut s = demo();
+    s.execute("crop.straighten", &json!({"angle": 8.0})).unwrap();
+    s.execute("crop.aspect", &json!({"aspect": "original"})).unwrap();
+    assert_eq!(active_dev(&s).crop.geometry.angle, 8.0, "without level the angle stays");
+    s.execute("crop.aspect", &json!({"aspect": "original", "level": true})).unwrap();
+    let g = active_dev(&s).crop.geometry;
+    assert_eq!(g.angle, 0.0);
+    assert!(g.is_largest_fit(oriented_dims(&s).0, oriented_dims(&s).1));
+}
+
 // Feature: dragging crop handles (issue 295)
 #[test]
 fn crop_drag_stops_at_the_image_edge_and_keeps_the_anchor() {

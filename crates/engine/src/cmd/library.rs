@@ -182,6 +182,11 @@ fn rotate(s: &mut Session, p: &Value, cw: bool) -> Result<Value> {
         if let Some(d) = s.develop_of(id) {
             let mut d = (*d).clone();
             d.orientation = d.orientation.rotated(cw);
+            // the crop turns with the photo: the same part of it, in the turned frame, the lock's
+            // ratio turned too (it is stored in the frame's normalized coordinates, so left alone
+            // it would describe another part and shape)
+            d.crop.geometry = d.crop.geometry.quarter_turned(cw);
+            d.crop.aspect = d.crop.aspect.map(|(x, y)| (y, x));
             ops.extend(s.develop_op(id, d, "Rotate"));
         }
     }
