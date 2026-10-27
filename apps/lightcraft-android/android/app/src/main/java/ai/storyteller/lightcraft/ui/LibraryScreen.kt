@@ -739,6 +739,12 @@ private fun PhotoCell(photo: PhotoInfo, vm: AppViewModel, modifier: Modifier) {
                 modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).background(scrim, RoundedCornerShape(3.dp)).padding(horizontal = 4.dp, vertical = 1.dp),
             )
         }
+        // a cloud photo that is only a thumbnail so far: opening it downloads its preview
+        if (!vm.selecting && photo.id in vm.cloudIds && photo.id !in vm.cloudPreviews) {
+            Box(Modifier.align(Alignment.TopStart).padding(4.dp).size(18.dp).background(scrim, CircleShape), contentAlignment = Alignment.Center) {
+                MdIcon(MdIcon.CloudDownload, "Not downloaded", tint = Lc.text, size = 12.dp)
+            }
+        }
         if (vm.selecting) {
             if (selected) Box(Modifier.fillMaxSize().border(4.dp, Lc.primary))
             Box(

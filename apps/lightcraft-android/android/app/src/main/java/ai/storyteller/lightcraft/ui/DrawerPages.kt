@@ -1,6 +1,8 @@
 package ai.storyteller.lightcraft.ui
 
+import ai.storyteller.lightcraft.core.CloudStatus
 import ai.storyteller.lightcraft.core.engineVersion
+import ai.storyteller.lightcraft.engine.CloudConfig
 import ai.storyteller.lightcraft.engine.LibraryFolder
 import android.content.Context
 import android.content.Intent
@@ -35,12 +37,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -55,10 +62,12 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import java.util.Locale
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /** A page's row text and its notes under it, sampled from the reference's preferences. */
@@ -211,11 +220,16 @@ fun PreferencesPage(vm: AppViewModel, onBack: () -> Unit) {
         FolderLibraryPage(vm) { sub = null }
         return
     }
+    if (sub == "cloud") {
+        CloudLibraryPage(vm) { sub = null }
+        return
+    }
     DrawerPage("Preferences", onBack) {
         // the reference's rows that open pages come first
         PageGroup {
             PageRow("Photo import options", null) { sub = "import" }
             PageRow("Library folder", if (vm.folderLibrary.enabled) "On" else "Off") { sub = "folder" }
+            PageRow("Cloud library", if (vm.cloudConfigured) "On" else "Off") { sub = "cloud" }
         }
         gpu?.let { on ->
             PageGroup {
@@ -305,6 +319,183 @@ private fun FolderLibraryPage(vm: AppViewModel, onBack: () -> Unit) {
             Text(it, color = pageNote, fontFamily = Inter, fontSize = 13.sp, lineHeight = 16.sp, modifier = Modifier.padding(horizontal = 26.3.dp, vertical = 10.dp).widthIn(max = 474.dp))
         }
     }
+}
+
+private val pageError = Color(0xFFE57373)
+
+/** A row that does something (blue text, 45.2 dp), greyed while it can't. */
+@Composable
+private fun PageAction(label: String, enabled: Boolean = true, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().height(45.2.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(horizontal = 13.7.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = if (enabled) Lc.selected else pageValue, fontFamily = Inter, fontSize = 16.sp)
+    }
+}
+
+/** A fact and its value, side by side (the connected cloud library's page). */
+@Composable
+private fun PageFact(label: String, value: String) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 40.dp).padding(horizontal = 13.7.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = pageText, fontFamily = Inter, fontSize = 16.sp, modifier = Modifier.weight(1f))
+        Text(value, color = pageValue, fontFamily = Inter, fontSize = 16.sp, textAlign = TextAlign.End, modifier = Modifier.padding(start = 12.dp).widthIn(max = 240.dp))
+    }
+}
+
+@Composable
+private fun PageNote(text: String, color: Color = pageNote) {
+    Text(text, color = color, fontFamily = Inter, fontSize = 13.sp, lineHeight = 16.sp, modifier = Modifier.padding(horizontal = 26.3.dp, vertical = 10.dp).widthIn(max = 474.dp))
+}
+
+@Composable
+private fun PageBusy(text: String) {
+    Row(Modifier.padding(horizontal = 26.3.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        CircularProgressIndicator(Modifier.size(20.dp), color = Lc.highlight, trackColor = Lc.divider, strokeWidth = 2.dp)
+        Text(text, color = pageText, fontFamily = Inter, fontSize = 15.sp, modifier = Modifier.padding(start = 14.dp))
+    }
+}
+
+private val cacheChoices = listOf(1L, 2L, 5L, 10L)
+
+/**
+ * Cloud library: the photos a PC published to cloud storage (docs/cloud-library.md), edited here and
+ * sent back. Not connected: pick the rclone config file, the remote in it, the folder on it and this
+ * phone's name. Connected: what is there and what is waiting, the size of the preview cache,
+ * Refresh now and Disconnect.
+ */
+@Composable
+private fun CloudLibraryPage(vm: AppViewModel, onBack: () -> Unit) {
+    LaunchedEffect(Unit) { vm.refreshCloudStatus() }
+    val st = vm.cloud
+    DrawerPage("Cloud library", onBack) {
+        if (st != null && vm.cloudConfigured) CloudConnected(vm, st) else CloudConnect(vm)
+    }
+}
+
+@Composable
+private fun ColumnScope.CloudConnect(vm: AppViewModel) {
+    val scope = rememberCoroutineScope()
+    var remotes by remember { mutableStateOf<List<String>>(emptyList()) }
+    var remote by remember { mutableStateOf<String?>(null) }
+    var folder by remember { mutableStateOf("") }
+    var device by remember { mutableStateOf(CloudConfig.defaultDeviceName()) }
+    var problem by remember { mutableStateOf<String?>(null) }
+    val busy = vm.cloudBusy
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                runCatching { vm.importCloudConfig(uri) }
+                    .onSuccess {
+                        remotes = it
+                        remote = it.firstOrNull()
+                        problem = if (it.isEmpty()) "That file has no remote in it. Pick the rclone config file made for the phone." else null
+                    }
+                    .onFailure { problem = "Couldn't read that file: ${it.message}" }
+            }
+        }
+    }
+    PageGroup {
+        PageNote("Show the photos a PC published to cloud storage, edit them here and send the edits back. It needs an rclone config file for a phone-only remote; see the cloud library notes on how to make one.")
+        PageAction(if (remotes.isEmpty()) "Connect…" else "Choose another config file…", enabled = busy == null) {
+            runCatching { pick.launch(arrayOf("*/*")) }.onFailure { vm.tell("There's no app to pick files with.") }
+        }
+    }
+    if (remotes.isNotEmpty()) {
+        PageGroup {
+            if (remotes.size > 1) {
+                PageHeading("Remote")
+                remotes.forEach { OptionRow(it, selected = it == remote) { remote = it } }
+            } else {
+                PageFact("Remote", remotes.first())
+            }
+            Column(Modifier.padding(horizontal = 13.7.dp, vertical = 6.dp)) {
+                OutlinedTextField(
+                    folder,
+                    { folder = it },
+                    singleLine = true,
+                    enabled = busy == null,
+                    label = { Text("Folder on the remote", fontFamily = Inter) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "Leave empty if the remote is already limited to the library folder, else e.g. LightCraft Cloud.",
+                    color = pageNote, fontFamily = Inter, fontSize = 13.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+                )
+                OutlinedTextField(
+                    device,
+                    { device = it },
+                    singleLine = true,
+                    enabled = busy == null,
+                    isError = device.isNotEmpty() && !CloudConfig.validDevice(device.trim()),
+                    label = { Text("Name of this phone", fontFamily = Inter) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "The PC files this phone's edits under it: letters, digits, _ - and . (up to 64).",
+                    color = pageNote, fontFamily = Inter, fontSize = 13.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 4.dp, bottom = 6.dp),
+                )
+            }
+            PageAction("Connect", enabled = busy == null && remote != null && CloudConfig.validDevice(device.trim())) {
+                problem = null
+                vm.connectCloud(remote ?: return@PageAction, folder, device)
+            }
+        }
+    }
+    busy?.let { PageBusy(it) }
+    (problem ?: vm.cloudError)?.let { PageNote(it, pageError) }
+}
+
+@Composable
+private fun ColumnScope.CloudConnected(vm: AppViewModel, st: CloudStatus) {
+    var confirm by remember { mutableStateOf(false) }
+    val busy = vm.cloudBusy
+    PageGroup {
+        PageFact("Remote", st.remote)
+        PageFact("This phone", st.device)
+        PageFact("Photos", st.photos.toString())
+        PageFact("Edits waiting to be sent", st.pendingUploads.toString())
+        PageFact("Previews on the phone", "${gb(st.cacheBytes.toLong())} of ${gb(st.cacheCap.toLong())}")
+        PageFact("Last refresh", relativeTime(st.lastRefresh) ?: "Never")
+    }
+    st.lastError?.let { PageNote("Last error: $it", pageError) }
+    // (an automatic refresh that failed said nothing at the time)
+    vm.cloudAutoError?.takeIf { it != st.lastError }?.let { PageNote("Last refresh failed: $it", pageError) }
+    if (!st.connected) PageNote("The cloud library couldn't be reached when LightCraft started. Refresh now tries again; Disconnect lets you set it up again.", pageError)
+    PageGroup {
+        PageHeading("Preview cache size")
+        cacheChoices.forEach { g ->
+            val bytes = g shl 30
+            OptionRow("$g GB", selected = st.cacheCap.toLong() == bytes) { vm.setCloudCacheCap(bytes) }
+        }
+    }
+    PageNote("The least recently opened previews are deleted first and downloaded again when you open the photo.")
+    PageGroup {
+        PageAction(busy ?: "Refresh now", enabled = busy == null) { vm.cloudRefreshNow() }
+        PageAction("Disconnect", enabled = busy == null) { confirm = true }
+    }
+    if (confirm) {
+        AlertDialog(
+            onDismissRequest = { confirm = false },
+            containerColor = Lc.dialog,
+            shape = RoundedCornerShape(5.dp),
+            modifier = Modifier.width(320.dp),
+            title = { Text("Disconnect?", fontFamily = Inter, color = Lc.text) },
+            text = {
+                Text(
+                    "LightCraft stops syncing with the cloud library. The photos, their thumbnails, the downloaded previews and your edits stay on the phone, but edits not sent yet won't be sent (Refresh now first, to send them). Nothing on the cloud storage changes.",
+                    fontFamily = Inter, color = Lc.text, fontSize = 14.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirm = false; vm.disconnectCloud() }) { Text("Disconnect", fontFamily = Inter, color = Lc.selected) }
+            },
+            dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel", fontFamily = Inter, color = Lc.text) } },
+        )
+    }
+}
+
+/** "5 minutes ago" for a UTC time like `2026-10-27T09:42:15Z`; null when there is none or it can't be read. */
+private fun relativeTime(iso: String?): String? {
+    val at = iso?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull() } ?: return null
+    return DateUtils.getRelativeTimeSpanString(at, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS).toString()
 }
 
 /** The system's page where the person gives LightCraft "All files access" (this app's own page, else the list of apps). */

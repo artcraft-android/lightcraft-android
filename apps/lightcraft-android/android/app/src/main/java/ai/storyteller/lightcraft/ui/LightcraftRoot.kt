@@ -29,9 +29,11 @@ fun LightcraftRoot(vm: AppViewModel, onPickPhotos: () -> Unit, onPickFiles: () -
             if (result == SnackbarResult.ActionPerformed) m.action?.invoke()
         }
     }
-    // back in the app: the folder library's folder may have new photos, or edits another app saved to a sidecar
+    // back in the app: the folder library's folder may have new photos, or edits another app saved to a sidecar;
+    // the cloud library sends the edits and fetches what the PC changed (at most once a minute)
     LifecycleResumeEffect(vm) {
         vm.syncFolder()
+        vm.cloudSyncOnResume()
         onPauseOrDispose {}
     }
     val editor = vm.editor

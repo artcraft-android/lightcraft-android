@@ -308,6 +308,8 @@ private fun UprightEditor(vm: AppViewModel, ed: EditorState, createPreset: () ->
         val fitTop by animateIntAsState(fit.top, tween(350, easing = LinearOutSlowInEasing), label = "fit top")
         val fitHeight by animateIntAsState(fit.height, tween(350, easing = LinearOutSlowInEasing), label = "fit height")
         PhotoView(vm, ed, Modifier.offset { IntOffset(fit.left, fitTop) }.size(with(density) { DpSize(fit.width.toDp(), fitHeight.toDp()) }), sideways = false)
+        // a cloud photo's preview or original coming down
+        ed.downloading?.let { Pill(it, Modifier.align(Alignment.Center)) }
         if (!ed.immersive) {
             val before = ed.showingBefore
             Column(Modifier.fillMaxWidth().alpha(if (before) 0f else 1f)) {
@@ -377,6 +379,7 @@ private fun SidewaysEditor(vm: AppViewModel, ed: EditorState, createPreset: () -
         // the panel may lie over the photo view's right side: what's over it keeps clear of that
         val covered = with(density) { (fit.left + fitWidth - photoEnd).coerceAtLeast(0).toDp() }
         PhotoView(vm, ed, Modifier.offset { IntOffset(fit.left, fit.top) }.size(with(density) { DpSize(fitWidth.toDp(), fit.height.toDp()) }), sideways = true, coveredEnd = if (ed.immersive) 0.dp else covered)
+        ed.downloading?.let { Pill(it, Modifier.align(Alignment.Center)) }
         if (!ed.immersive) {
             val before = ed.showingBefore
             Column(Modifier.width(with(density) { photoEnd.toDp() }).alpha(if (before) 0f else 1f)) {

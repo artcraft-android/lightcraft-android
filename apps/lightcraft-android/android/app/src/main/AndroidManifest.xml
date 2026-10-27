@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- the cloud library (librclone) talks to the user's storage; nothing else uses the network -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- The Device tab: the phone's own photos (from Android 14, only the ones the person picks, if they choose) -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />

@@ -56,6 +56,8 @@ enum class MdIcon(private val paths: List<String>, private val scale: Float = 1f
     PhotoCamera(listOf("M12,12m-3.2,0a3.2,3.2 0,1 1,6.4 0a3.2,3.2 0,1 1,-6.4 0", "M9,2L7.17,4L4,4c-1.1,0 -2,0.9 -2,2v12c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2L22,6c0,-1.1 -0.9,-2 -2,-2h-3.17L15,2L9,2zM12,17c-2.76,0 -5,-2.24 -5,-5s2.24,-5 5,-5 5,2.24 5,5 -2.24,5 -5,5z")),
     /** `grid_view` (sharp). */
     GridView(listOf("M3,3h8v8h-8z", "M3,13h8v8h-8z", "M13,3h8v8h-8z", "M13,13h8v8h-8z"), 1.05f),
+    /** `cloud_download` (filled): a cloud photo whose preview isn't on the phone yet. */
+    CloudDownload(listOf("M19.35,10.04C18.67,6.59 15.64,4 12,4 9.11,4 6.6,5.64 5.35,8.04 2.34,8.36 0,10.91 0,14c0,3.31 2.69,6 6,6h13c2.76,0 5,-2.24 5,-5 0,-2.64 -2.05,-4.78 -4.65,-4.96zM17,13l-5,5 -5,-5h3V9h4v4h3z")),
     /** `arrow_back` (filled). */
     ArrowBack(listOf("M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z")),
     /** `close` (filled). */

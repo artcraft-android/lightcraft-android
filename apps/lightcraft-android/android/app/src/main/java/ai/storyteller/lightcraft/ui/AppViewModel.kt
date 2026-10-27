@@ -24,6 +24,8 @@ import ai.storyteller.lightcraft.core.ToneCurveInfo
 import ai.storyteller.lightcraft.core.ViewGeometry
 import ai.storyteller.lightcraft.core.engineVersion
 import ai.storyteller.lightcraft.core.whiteBalanceModes
+import ai.storyteller.lightcraft.core.CloudStatus
+import ai.storyteller.lightcraft.engine.CloudConfig
 import ai.storyteller.lightcraft.engine.DeviceAccess
 import ai.storyteller.lightcraft.engine.DeviceMedia
 import ai.storyteller.lightcraft.engine.DevicePhoto
@@ -33,7 +35,9 @@ import ai.storyteller.lightcraft.engine.PhotoFiles
 import ai.storyteller.lightcraft.engine.toImageBitmap
 import android.app.Application
 import android.net.Uri
+import android.os.SystemClock
 import android.os.StatFs
+import android.util.Log
 import android.util.LruCache
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
@@ -54,6 +58,8 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filterNotNull
@@ -276,6 +282,9 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     var immersive by mutableStateOf(false)
     var history by mutableStateOf(EditHistory(null, null))
     var exporting by mutableStateOf(false)
+
+    /** A cloud photo's preview or original is coming down: what the pill over the photo says (null: nothing is). */
+    var downloading by mutableStateOf<String?>(null)
     var rendering by mutableStateOf(false)
     internal var viewport = IntSize.Zero
     internal var zoom = 1f
@@ -337,6 +346,42 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val wbModes: List<Choice> = runCatching { whiteBalanceModes() }.getOrDefault(emptyList())
 
     private val prefs = app.getSharedPreferences("library", Application.MODE_PRIVATE)
+
+    /** The cloud library's state (Preferences ▸ Cloud library), as of the last [refreshCloudStatus]; null before it is read. */
+    var cloud by mutableStateOf<CloudStatus?>(null)
+        private set
+
+    /** What the cloud library is doing for the person ("Connecting…", "Refreshing…"), null when idle. */
+    var cloudBusy by mutableStateOf<String?>(null)
+        private set
+
+    /** Why the last Connect failed, for the page. */
+    var cloudError by mutableStateOf<String?>(null)
+        private set
+
+    /** The photos that are the cloud's, and those whose smart preview is on the phone (the others show their thumbnail until opened). */
+    var cloudIds by mutableStateOf<Set<ULong>>(emptySet())
+        private set
+    var cloudPreviews by mutableStateOf<Set<ULong>>(emptySet())
+        private set
+
+    /** What the phone shows of each cloud photo (thumbnail and applied sidecar versions, from the library's state): part of its thumbnail's key. */
+    private var cloudVersions by mutableStateOf<Map<ULong, String>>(emptyMap())
+
+    /** Cloud photos whose preview was downloaded since the grid last read the versions: part of their thumbnail's key. */
+    private var cloudThumbVersion by mutableStateOf<Map<ULong, Int>>(emptyMap())
+
+    /** Why the last automatic refresh failed (null: it didn't); shown on the Cloud library page, not as a toast. */
+    var cloudAutoError by mutableStateOf<String?>(null)
+        private set
+
+    /** The partners of raw+JPEG pairs, left out of [photos]. */
+    private var cloudHidden: Set<ULong> = prefs.getStringSet("cloudHidden", emptySet()).orEmpty().mapNotNullTo(HashSet()) { it.toULongOrNull() }
+    private var cloudSyncedAt = 0L
+    private var cloudPushJob: Job? = null
+
+    /** A cloud library is set up (even when it could not load at launch: the page then shows why). */
+    val cloudConfigured: Boolean get() = cloud?.let { it.connected || it.remote.isNotEmpty() } == true
 
     /** What the grid shows (the title's menu). */
     var view by mutableStateOf(LibraryView.ALL)
@@ -593,6 +638,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         sortKey = it.optString("key", "captureDate").takeIf { k -> sortKeys.any { (id, _) -> id == k } } ?: "captureDate"
                     }
                     refreshPhotos()
+                    refreshCloudStatus()
+                    cloudSync(manual = false)
                     runCatching { e.command { presets() to profiles() } }.onSuccess { (pr, pf) ->
                         presets = pr
                         profiles = pf
@@ -625,7 +672,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun refreshPhotos() {
         val e = engine ?: return
-        runCatching { e.command { photos() to libraryOverview() } }.onSuccess { (p, o) ->
+        runCatching { e.command { Triple(photos(), libraryOverview(), cloudHiddenPhotos() to cloudPhotos()) } }.onSuccess { (all, o, cloudNow) ->
+            val (hiddenNow, cloudPhotos) = cloudNow
+            // the partners of raw+JPEG pairs are not shown. Once disconnected the session no longer lists them: keep what it last said
+            if (cloudPhotos.ids.isNotEmpty()) {
+                cloudHidden = hiddenNow.toSet()
+                prefs.edit().putStringSet("cloudHidden", cloudHidden.mapTo(HashSet()) { it.toString() }).apply()
+            }
+            cloudIds = cloudPhotos.ids.toSet()
+            cloudPreviews = cloudPhotos.previews.toSet()
+            cloudVersions = cloudPhotos.versions
+            val p = if (cloudHidden.isEmpty()) all else all.filter { it.id !in cloudHidden }
             photos = p
             overview = o
             // photos that left the view leave the selection
@@ -645,7 +702,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return runCatching { e.command { photo(id) } }.getOrNull()
     }
 
-    fun thumbnailKey(p: PhotoInfo) = "${p.id}:${p.settingsHash}"
+    fun thumbnailKey(p: PhotoInfo) = "${p.id}:${p.settingsHash}" + (cloudVersions[p.id]?.let { ":v$it" } ?: "") + (cloudThumbVersion[p.id]?.let { ":c$it" } ?: "")
 
     suspend fun thumbnail(photo: PhotoInfo): ImageBitmap? {
         val e = engine ?: return null
@@ -1180,6 +1237,160 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         append(if (parts.isEmpty()) "Up to date" else parts.joinToString(", "))
         if (r.failed.isNotEmpty()) append(". Couldn't read ${r.failed.joinToString("; ")}")
     }
+
+    // ------------------------------------------------------------------ cloud library
+
+    suspend fun refreshCloudStatus() {
+        val e = engine ?: return
+        runCatching { e.command { cloudStatus() } }.onSuccess { cloud = it }
+    }
+
+    /** The picked rclone config file copied into the app; its remotes' names. Throws when it can't be read. */
+    suspend fun importCloudConfig(uri: Uri): List<String> = withContext(Dispatchers.IO) {
+        val file = CloudConfig.import(getApplication(), uri)
+        CloudConfig.remotes(file.readText())
+    }
+
+    /** Connect to the cloud library on [remote] (an rclone remote of the copied config) under [folder], then fetch its photos. */
+    fun connectCloud(remote: String, folder: String, device: String) {
+        val e = engine ?: return
+        if (cloudBusy != null) return
+        cloudBusy = "Connecting…"
+        cloudError = null
+        viewModelScope.launch {
+            val config = CloudConfig.file(getApplication()).absolutePath
+            val connected = runCatching { withContext(Dispatchers.IO) { e.session.cloudConnect(config, CloudConfig.remotePath(remote, folder), device.trim()) } }
+            connected.onFailure { cloudError = it.message ?: it.toString() }
+            if (connected.isSuccess) {
+                cloudBusy = "Loading the photos…"
+                cloudSyncedAt = SystemClock.elapsedRealtime()
+                val refreshed = runCatching { withContext(Dispatchers.IO) { e.session.cloudRefresh() } }
+                refreshed.onFailure { say("Connected, but the photos couldn't be loaded: ${it.message}") }
+                refreshed.onSuccess { cloudRefreshed(it, manual = true) }
+                refreshPhotos()
+            }
+            cloudBusy = null
+            refreshCloudStatus()
+        }
+    }
+
+    /**
+     * Forget the connection. The photos stay in the library (and their thumbnails and downloaded previews
+     * on the phone), edits not sent yet stay in their sidecars; nothing on the remote changes.
+     */
+    fun disconnectCloud() {
+        val e = engine ?: return
+        if (cloudBusy != null) return
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { e.session.cloudDisconnect() } }.onFailure { say("Couldn't disconnect: ${it.message}") }
+            refreshPhotos()
+            refreshCloudStatus()
+        }
+    }
+
+    fun setCloudCacheCap(bytes: Long) {
+        val e = engine ?: return
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { e.session.cloudSetCacheCap(bytes.toULong()) } }.onFailure { say("Couldn't change the cache size: ${it.message}") }
+            refreshCloudStatus()
+        }
+    }
+
+    /** Back in the app: send the edits and fetch what changed, at most once every 15 seconds. */
+    fun cloudSyncOnResume() = cloudSync(manual = false)
+
+    /** Refresh now (Preferences): send, fetch and tell what came of it. */
+    fun cloudRefreshNow() = cloudSync(manual = true)
+
+    private fun cloudSync(manual: Boolean) {
+        val e = engine ?: return
+        if (cloudBusy != null || (!manual && !cloudConfigured && cloud != null)) return
+        val now = SystemClock.elapsedRealtime()
+        if (!manual && cloudSyncedAt != 0L && now - cloudSyncedAt < CLOUD_SYNC_EVERY) return
+        cloudSyncedAt = now
+        cloudBusy = "Refreshing…"
+        viewModelScope.launch {
+            // (the status is read first when this is the launch's: nothing is connected, nothing to do)
+            if (cloud == null) refreshCloudStatus()
+            if (!cloudConfigured) {
+                cloudBusy = null
+                return@launch
+            }
+            val pushed = runCatching { withContext(Dispatchers.IO) { e.session.cloudPush() } }
+            val refreshed = runCatching { withContext(Dispatchers.IO) { e.session.cloudRefresh() } }
+            try {
+                refreshed.onSuccess { cloudRefreshed(it, manual) }
+            } finally {
+                // whatever the refresh did before it stopped (thumbnails, sidecars) is in the library's state: the grid reads it
+                refreshPhotos()
+            }
+            val failure = refreshed.exceptionOrNull() ?: pushed.exceptionOrNull()
+            if (manual) {
+                if (failure != null) say("Couldn't sync: ${failure.message}")
+            } else if (failure != null) {
+                Log.w(TAG, "cloud sync failed: ${failure.message}", failure)
+            }
+            cloudAutoError = if (!manual) refreshed.exceptionOrNull()?.let { it.message ?: it.toString() } else null
+            cloudBusy = null
+            refreshCloudStatus()
+        }
+    }
+
+    /** A refresh's changes into the grid (and the open photo). */
+    private suspend fun cloudRefreshed(r: ai.storyteller.lightcraft.core.CloudRefresh, manual: Boolean) {
+        // (the grid is read by the caller, success or not: its thumbnail keys come from the library's versions)
+        // the open photo's edits came from the PC: show them
+        if (editor?.photoId in r.applied) edit(after = ::refreshToolState) {}
+        if (manual) {
+            val parts = listOfNotNull(
+                r.added.takeIf { it > 0u }?.let { "$it new" },
+                r.updated.takeIf { it > 0u }?.let { "$it updated" },
+                r.removed.takeIf { it > 0u }?.let { "$it removed" },
+                r.applied.size.takeIf { it > 0 }?.let { "$it edit${if (it == 1) "" else "s"} from the PC" },
+            )
+            val blocked = if (r.blocked.isEmpty()) "" else ". ${r.blocked.size} PC change${if (r.blocked.size == 1) "" else "s"} wait for your edits to be sent"
+            val failed = if (r.failures.isEmpty()) "" else ". ${r.failures.size} couldn't be updated: ${r.failures.first()}"
+            say((if (parts.isEmpty()) "Up to date" else parts.joinToString(", ")) + blocked + failed)
+        }
+    }
+
+    /** After leaving a photo: send the edits, a few seconds later (a swipe through photos sends once). */
+    private fun cloudPushSoon() {
+        val e = engine ?: return
+        if (!cloudConfigured) return
+        cloudPushJob?.cancel()
+        cloudPushJob = viewModelScope.launch {
+            delay(CLOUD_PUSH_DELAY)
+            runCatching { withContext(Dispatchers.IO) { e.session.cloudPush() } }
+            refreshCloudStatus()
+        }
+    }
+
+    /** Download the preview of the cloud photo [ed] shows (if it isn't on the phone), then draw the photo from it. */
+    private fun openCloudPhoto(ed: EditorState) {
+        val e = engine ?: return
+        val id = ed.photoId
+        val waiting = id !in cloudPreviews
+        if (waiting) ed.downloading = "Downloading…"
+        viewModelScope.launch {
+            val result = runCatching { withContext(Dispatchers.IO) { e.session.cloudOpen(id) } }
+            ed.downloading = null
+            result.onSuccess {
+                if (it.downloaded || waiting) {
+                    cloudPreviews = cloudPreviews + id
+                    cloudThumbVersion = cloudThumbVersion + (id to (cloudThumbVersion[id] ?: 0) + 1)
+                    if (editor === ed) requestView()
+                }
+            }.onFailure {
+                // (an old preview that is there already never fails: this is about a download)
+                if (editor === ed) say("Couldn't download the preview: ${it.message}. The thumbnail stays; your edits are kept.", "Retry") { if (editor === ed) openCloudPhoto(ed) }
+            }
+        }
+    }
+
+    /** A full-size (or raw, or original-file) export of a cloud photo renders from the original; smaller ones from the preview. */
+    private fun needsCloudOriginal(id: ULong, choice: ExportChoice): Boolean =
+        id in cloudIds && (choice.format == "original" || choice.format == "dng" || choice.longEdge == 0 || choice.longEdge > CLOUD_PREVIEW_EDGE)
 
     // ------------------------------------------------------------------ slideshow
 
@@ -1763,11 +1974,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val ids = selected.toList()
         if (ids.isEmpty() || sharingSelected) return
         sharingSelected = true
-        val options = exportChoice.json()
+        val choice = exportChoice
+        val options = choice.json()
         viewModelScope.launch {
             val app = getApplication<Application>()
             val result = runCatching {
-                withContext(Dispatchers.IO) { ids.map { id -> e.session.export(id, options).let { f -> PhotoFiles.shareable(app, f) to f.mimeType } } }
+                withContext(Dispatchers.IO) { ids.map { id -> if (needsCloudOriginal(id, choice)) e.session.cloudDownloadOriginal(id); e.session.export(id, options).let { f -> PhotoFiles.shareable(app, f) to f.mimeType } } }
             }
             sharingSelected = false
             result
@@ -1954,7 +2166,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val ed = EditorState(p.id, p, device)
         // stepping from photo to photo: same view, same tool and section
         editor?.let {
-            if (it.photoId != p.id) viewModelScope.launch { discardUntouched(it) }
+            if (it.photoId != p.id) {
+                viewModelScope.launch { discardUntouched(it) }
+                cloudPushSoon()
+            }
             ed.viewport = it.viewport
             ed.tool = it.tool.takeIf { t -> t != MainTool.CROP }
             ed.section = it.section.takeIf { s -> s != EditSection.PROFILES }
@@ -1975,6 +2190,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 ed.histogram = quick.first.histogram
             }
         }
+        if (p.id in cloudIds) openCloudPhoto(ed)
         viewModelScope.launch {
             runCatching {
                 e.command {
@@ -2034,6 +2250,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             discardUntouched(ed)
             refreshPhotos()
         }
+        cloudPushSoon()
     }
 
     fun onViewport(size: IntSize) {
@@ -2152,7 +2369,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     .onFailure {
                         takePendingCrop(ed, req.seq)
-                        if (!req.draft) say("Can't show ${ed.info.fileName}: ${it.message}")
+                        // a cloud photo shows its thumbnail until the preview is down (the download says if it fails)
+                        val waiting = ed.photoId in cloudIds && ed.photoId !in cloudPreviews
+                        if (!req.draft && !waiting) say("Can't show ${ed.info.fileName}: ${it.message}")
                     }
                 ed.rendering = false
             }
@@ -3630,6 +3849,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
+                    if (needsCloudOriginal(ed.photoId, choice)) {
+                        ed.downloading = "Downloading the original…"
+                        try {
+                            e.session.cloudDownloadOriginal(ed.photoId)
+                        } finally {
+                            ed.downloading = null
+                        }
+                    }
                     val file = e.session.export(ed.photoId, options)
                     val app = getApplication<Application>()
                     (if (share) PhotoFiles.shareable(app, file) else PhotoFiles.saveToPictures(app, file)) to file
@@ -3651,6 +3878,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        /** The app's log tag. */
+        const val TAG = "Lightcraft"
+
         /** Long edge the grid asks for (the engine caches thumbnails at 128, 256, 384 and 512 px). */
         const val THUMB_EDGE = 384
 
@@ -3659,6 +3889,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
         /** The most photos the system is asked to delete at once. */
         const val DELETE_BATCH = 500
+
+        /** The most often the app syncs with the cloud on its own (ms). */
+        const val CLOUD_SYNC_EVERY = 15_000L
+
+        /** How long after leaving a photo its edits are sent (ms). */
+        const val CLOUD_PUSH_DELAY = 5_000L
+
+        /** The long side of a smart preview (px): exports up to this size need no original. */
+        const val CLOUD_PREVIEW_EDGE = 2048
 
         /** Long edge of preset and profile previews. */
         const val LOOK_EDGE = 256
