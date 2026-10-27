@@ -53,6 +53,22 @@ profile: a debug engine is too slow for photos), then generates the Kotlin bindi
 it built. The first build compiles the engine for each ABI (several minutes each). After that cargo
 rebuilds only what changed. Gradle finds `cargo` in `~/.cargo/bin` (or `$CARGO`).
 
+### librclone (the cloud library)
+
+The cloud library reaches a PC's published photos through rclone's C library, which is not built by
+Gradle. Build it once with [Go](https://go.dev) installed (`scripts/build-librclone.sh`: pinned to rclone
+v1.75.2, a reduced backend set; add `LIBRCLONE_FULL=1` for all of them):
+
+```sh
+apps/lightcraft-android/scripts/build-librclone.sh                  # arm64-v8a, armeabi-v7a and the host
+apps/lightcraft-android/scripts/build-librclone.sh arm64-v8a x86_64 # chosen ABIs
+```
+
+The Android libraries land in `android/app/src/main/jniLibs/<abi>/` (Gradle packages them as they
+are), the host one in `librclone-host/` (used by `cargo test -p lightcraft-cloud-client`). Nothing
+built is committed. Without them the app still builds; connecting to a cloud library fails with
+"librclone.so not found". See [docs/cloud-library.md](docs/cloud-library.md).
+
 ## How it works
 
 - **One session per process.** `LightcraftApplication` opens the library in the app's private files

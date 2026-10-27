@@ -1,0 +1,3 @@
+# built by scripts/build-librclone.sh
+/librclone-host/
+/android/app/src/main/jniLibs/
