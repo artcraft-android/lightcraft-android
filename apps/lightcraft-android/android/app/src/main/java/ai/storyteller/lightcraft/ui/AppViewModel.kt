@@ -7,6 +7,7 @@ import ai.storyteller.lightcraft.core.CropFrame
 import ai.storyteller.lightcraft.core.DevelopControl
 import ai.storyteller.lightcraft.core.DevelopState
 import ai.storyteller.lightcraft.core.EditHistory
+import ai.storyteller.lightcraft.core.FolderSync
 import ai.storyteller.lightcraft.core.ImageHistogram
 import ai.storyteller.lightcraft.core.ImageSize
 import ai.storyteller.lightcraft.core.ImportReport
@@ -27,6 +28,7 @@ import ai.storyteller.lightcraft.engine.DeviceAccess
 import ai.storyteller.lightcraft.engine.DeviceMedia
 import ai.storyteller.lightcraft.engine.DevicePhoto
 import ai.storyteller.lightcraft.engine.Engine
+import ai.storyteller.lightcraft.engine.LibraryFolder
 import ai.storyteller.lightcraft.engine.PhotoFiles
 import ai.storyteller.lightcraft.engine.toImageBitmap
 import android.app.Application
@@ -1034,6 +1036,149 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 say(importSummary(r) + (name?.let { " into $it" } ?: ""))
             }.onFailure { say("Import failed: ${it.message}") }
         }
+    }
+
+    // ------------------------------------------------------------------ folder library
+
+    /**
+     * The folder library (Preferences ▸ Library folder): while [enabled], the photos of [folder] are
+     * edited where they are and the edits go to XMP sidecars next to them, so other apps and sync
+     * tools see them. [folder] is kept when it is turned off (and the photos stay in the library).
+     * [syncedAt] (epoch ms, 0: never) and [result] are of the last synchronization; [writesXmp]
+     * says that we turned the library's automatic sidecar writing on, so turning this off turns it
+     * off again (and leaves it alone where the person had it on already).
+     */
+    class FolderLibrary(val enabled: Boolean, val folder: String?, val syncedAt: Long, val result: String?, val writesXmp: Boolean)
+
+    var folderLibrary by mutableStateOf(
+        FolderLibrary(
+            prefs.getBoolean("folderLibrary", false),
+            prefs.getString("folderLibraryPath", null),
+            prefs.getLong("folderSyncedAt", 0L),
+            prefs.getString("folderSyncResult", null),
+            prefs.getBoolean("folderWritesXmp", false),
+        ),
+    )
+        private set
+
+    /** A synchronization of the folder is running. */
+    var folderSyncing by mutableStateOf(false)
+        private set
+
+    private fun saveFolderLibrary(f: FolderLibrary) {
+        folderLibrary = f
+        prefs.edit()
+            .putBoolean("folderLibrary", f.enabled)
+            .putString("folderLibraryPath", f.folder)
+            .putLong("folderSyncedAt", f.syncedAt)
+            .putString("folderSyncResult", f.result)
+            .putBoolean("folderWritesXmp", f.writesXmp)
+            .apply()
+    }
+
+    /** The folder a tree [uri] from the system's picker is becomes the library folder (and, if the folder library is on, is switched to). */
+    fun chooseLibraryFolder(uri: Uri): Boolean {
+        val path = LibraryFolder.pathOf(getApplication(), uri)
+        if (path == null) {
+            say("LightCraft can only use a folder on the phone's storage or an SD card")
+            return false
+        }
+        if (folderLibrary.enabled) startFolderLibrary(path) else saveFolderLibrary(FolderLibrary(false, path, 0L, null, folderLibrary.writesXmp))
+        return true
+    }
+
+    /** Turn the folder library on (for the chosen folder) or off (the photos stay in the library, nothing on disk is deleted). */
+    fun setFolderLibrary(on: Boolean) {
+        val f = folderLibrary
+        if (!on) return stopFolderLibrary()
+        val folder = f.folder ?: return
+        if (!f.enabled) startFolderLibrary(folder)
+    }
+
+    /**
+     * Add the photos of [folder] (and below it) where they are, watch it for new ones and write the
+     * edits into sidecars from now on. The sidecars come after the import: it is not an edit, and
+     * the photos it adds should not each get one.
+     */
+    private fun startFolderLibrary(folder: String) {
+        viewModelScope.launch {
+            val e = lightcraft.engine.await().getOrNull() ?: return@launch
+            if (!LibraryFolder.allowed()) return@launch say("LightCraft needs All files access to edit photos in place")
+            importing = true
+            val result = runCatching {
+                e.command {
+                    execute("library.autoImport", JSONObject().put("folder", folder).put("copy", false).toString())
+                    val report = `import`(listOf(folder), false, false)
+                    val wasOn = JSONObject(execute("library.xmpPreferences", "")).optBoolean("autoWrite")
+                    if (!wasOn) execute("library.xmpPreferences", JSONObject().put("autoWrite", true).toString())
+                    report to !wasOn
+                }
+            }
+            importing = false
+            refreshPhotos()
+            result.onSuccess { (report, turnedOn) ->
+                // a switch from one folder to another keeps what the first one turned on
+                val summary = importSummary(report)
+                saveFolderLibrary(FolderLibrary(true, folder, System.currentTimeMillis(), summary, turnedOn || folderLibrary.writesXmp))
+                say(summary)
+            }.onFailure { say("Couldn't use the folder: ${it.message}") }
+        }
+    }
+
+    private fun stopFolderLibrary() {
+        val f = folderLibrary
+        saveFolderLibrary(FolderLibrary(false, f.folder, f.syncedAt, f.result, false))
+        viewModelScope.launch {
+            val e = lightcraft.engine.await().getOrNull() ?: return@launch
+            runCatching {
+                e.command {
+                    execute("library.autoImport", JSONObject().put("folder", JSONObject.NULL).toString())
+                    if (f.writesXmp) execute("library.xmpPreferences", JSONObject().put("autoWrite", false).toString())
+                }
+            }.onFailure { say(it.message) }
+        }
+    }
+
+    /**
+     * Bring the library up to date with its folder: new photos are added and edits another app or a
+     * sync tool wrote to sidecars are read. Run when the app comes back to the front, and from
+     * Preferences ([manual]: then it tells the result even when nothing changed).
+     */
+    fun syncFolder(manual: Boolean = false) {
+        val f = folderLibrary
+        val folder = f.folder?.takeIf { f.enabled } ?: return
+        if (folderSyncing || importing) return
+        viewModelScope.launch {
+            val e = lightcraft.engine.await().getOrNull() ?: return@launch
+            if (!LibraryFolder.allowed()) {
+                if (manual) say("LightCraft needs All files access to read the folder")
+                return@launch
+            }
+            folderSyncing = true
+            val result = runCatching { e.command { syncFolder(folder) } }
+            folderSyncing = false
+            result.onSuccess { r ->
+                refreshPhotos()
+                // the open photo's edits came from the sidecar: show them
+                if (editor?.photoId in r.updated) edit(after = ::refreshToolState) {}
+                val summary = syncSummary(r)
+                saveFolderLibrary(FolderLibrary(true, folder, System.currentTimeMillis(), summary, folderLibrary.writesXmp))
+                if (manual || r.added.isNotEmpty() || r.updated.isNotEmpty() || r.failed.isNotEmpty()) say(summary)
+            }.onFailure {
+                val why = "Couldn't synchronize: ${it.message}"
+                saveFolderLibrary(FolderLibrary(true, folder, folderLibrary.syncedAt, why, folderLibrary.writesXmp))
+                if (manual) say(why)
+            }
+        }
+    }
+
+    private fun syncSummary(r: FolderSync): String = buildString {
+        val parts = listOfNotNull(
+            r.added.size.takeIf { it > 0 }?.let { "$it new" },
+            r.updated.size.takeIf { it > 0 }?.let { if (it == 1) "1 edit updated" else "$it edits updated" },
+        )
+        append(if (parts.isEmpty()) "Up to date" else parts.joinToString(", "))
+        if (r.failed.isNotEmpty()) append(". Couldn't read ${r.failed.joinToString("; ")}")
     }
 
     // ------------------------------------------------------------------ slideshow

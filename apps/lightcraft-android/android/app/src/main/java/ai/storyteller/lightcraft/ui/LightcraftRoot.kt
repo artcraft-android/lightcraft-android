@@ -10,6 +10,7 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.lifecycle.compose.LifecycleResumeEffect
 
 /** The library grid, or the editor when a photo is open; snackbars for both. */
 @Composable
@@ -27,6 +28,11 @@ fun LightcraftRoot(vm: AppViewModel, onPickPhotos: () -> Unit, onPickFiles: () -
             )
             if (result == SnackbarResult.ActionPerformed) m.action?.invoke()
         }
+    }
+    // back in the app: the folder library's folder may have new photos, or edits another app saved to a sidecar
+    LifecycleResumeEffect(vm) {
+        vm.syncFolder()
+        onPauseOrDispose {}
     }
     val editor = vm.editor
     // the library's message (and its Undo) stays with the library
