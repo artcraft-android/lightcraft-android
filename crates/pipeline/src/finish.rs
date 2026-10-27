@@ -452,9 +452,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let mut delta = 0.0f32;
             let (hh, ss) = (hl + l_hl, sh + l_sh);
             if hh != 0.0 || ss != 0.0 {
-                let ws = 1.0 - smooth(-4.8, 0.3, base);
-                let wh = smooth(-1.0, 2.8, base);
-                delta += ss * 1.7 * ws * ws.sqrt() + hh * 1.7 * wh;
+                // EV at ±100, fitted (issue 7) to how far Lightroom moves each step of our grey chart:
+                // both reach well into the mid-tones (Shadows +100 lifts grey ~0.7 EV, Highlights moves it
+                // ~0.4 EV) and keep a little effect at the far end
+                let ws = 2.01 * (1.0 - smooth(-4.46, 1.66, base)) + 0.49 * (1.0 - smooth(-6.0, 8.48, base));
+                let wh = 0.436 * smooth(-7.6, 0.8, base) + 0.878 * smooth(0.2, 2.8, base);
+                delta += ss * ws + hh * wh;
             }
             if l_wh != 0.0 {
                 delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
