@@ -68,11 +68,25 @@ impl Scene {
         paint::render(self.kind, self.seed, w, h)
     }
 
-    /// Render fitting within `max_edge` on the long side.
+    /// Render fitting within `max_edge` on the long side (at most the scene's own size).
     pub fn render_fit(&self, max_edge: usize) -> Rgb32f {
+        let (w, h) = self.fit(max_edge);
+        self.render(w, h)
+    }
+
+    /// [`Scene::render_fit`] on the calling thread alone, without rayon (the same pixels).
+    pub fn render_fit_serial(&self, max_edge: usize) -> Rgb32f {
+        let (w, h) = self.fit(max_edge);
+        paint::render_serial(self.kind, self.seed, w, h)
+    }
+
+    fn fit(&self, max_edge: usize) -> (usize, usize) {
+        // never past the scene's own size: that is a demo photo's full resolution, and a size
+        // from a damaged catalog (a width of 4294967295) asked for more memory than exists
+        let max_edge = max_edge.min(self.width.max(self.height).max(1) as usize);
         let a = self.aspect();
         let (w, h) = if a >= 1.0 { (max_edge, (max_edge as f32 / a).round() as usize) } else { ((max_edge as f32 * a).round() as usize, max_edge) };
-        self.render(w.max(1), h.max(1))
+        (w.max(1), h.max(1))
     }
 }
 
@@ -194,6 +208,18 @@ mod tests {
         }
     }
 
+    /// Found by fuzzing catalog snapshots: a demo photo whose width read 4294967295 asked its scene
+    /// for a render that size, and the pixel buffer's size overflowed (a panic on the render
+    /// thread). A scene renders at most at its own size, which is the photo's full resolution.
+    #[test]
+    fn a_scene_renders_at_most_at_its_own_size() {
+        let mut s = demo_library().remove(0);
+        (s.width, s.height) = (40, 30);
+        let img = s.render_fit(usize::MAX);
+        assert_eq!((img.width, img.height), (40, 30));
+        assert_eq!(s.fit(20), (20, 15), "smaller sizes as asked");
+    }
+
     #[test]
     fn sunsets_have_highlight_headroom() {
         let lib = demo_library();
@@ -201,6 +227,19 @@ mod tests {
         let img = s.render_fit(200);
         let max = img.data.iter().map(|p| p[0]).fold(0.0f32, f32::max);
         assert!(max > 2.0, "{max}");
+    }
+
+    /// The serial render is the parallel one, pixel for pixel (both with and without supersampling), and
+    /// an empty size is an empty image.
+    #[test]
+    fn the_serial_render_is_the_same_picture() {
+        for s in demo_library().iter().take(3) {
+            for edge in [40, 700] {
+                assert_eq!(s.render_fit_serial(edge), s.render_fit(edge), "{} at {edge}", s.name);
+            }
+        }
+        assert!(paint::render_serial(Kind::Dunes, 1, 0, 5).data.is_empty());
+        assert!(demo_library()[0].render(0, 0).data.is_empty());
     }
 
     #[test]

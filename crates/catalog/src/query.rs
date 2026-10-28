@@ -1,5 +1,7 @@
 //! Filtering, search and sorting.
 
+use std::cmp::Ordering::Equal;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{AlbumId, Catalog, ColorLabel, Flag, MediaKind, Photo, PhotoId};
@@ -27,6 +29,10 @@ pub struct Filter {
     /// Only these photos (Find Similar results…); empty = no constraint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub only: Vec<PhotoId>,
+    /// Show nothing: an explicit empty result (Find Similar with no matches), since an empty
+    /// `only` means "no constraint".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub only_none: bool,
     /// Any of these labels (the filter bar's multi-select); empty = no constraint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<ColorLabel>,
@@ -94,6 +100,27 @@ pub struct Sort {
     pub seed: u64,
 }
 
+impl Sort {
+    /// Which of two photos comes first in this order (never `Equal` for two photos: the id decides last).
+    pub fn order(&self, a: &Photo, b: &Photo) -> std::cmp::Ordering {
+        let o = match self.key {
+            SortKey::CaptureDate => a.captured.cmp(&b.captured).then_with(|| a.imported.cmp(&b.imported)),
+            SortKey::ImportDate => a.imported.cmp(&b.imported),
+            SortKey::EditDate => a.edited.cmp(&b.edited),
+            SortKey::FileName => cmp_name(&a.file_name, &b.file_name),
+            SortKey::Rating => a.rating.cmp(&b.rating),
+            SortKey::FileSize => a.file_size.cmp(&b.file_size),
+            SortKey::Random => shuffle_rank(self.seed, a.id).cmp(&shuffle_rank(self.seed, b.id)),
+        }
+        // Ties (one import batch, a burst within a second, equal ratings) sort by file name, the
+        // order cameras number frames, so the order doesn't depend on how ids were allocated;
+        // the id only keeps it stable.
+        .then_with(|| if self.key == SortKey::FileName { Equal } else { cmp_name(&a.file_name, &b.file_name) })
+        .then(a.id.cmp(&b.id));
+        if self.ascending { o } else { o.reverse() }
+    }
+}
+
 impl Default for Sort {
     fn default() -> Self {
         Sort { key: SortKey::CaptureDate, ascending: false, group: crate::GroupBy::Auto, seed: 0 }
@@ -114,9 +141,46 @@ fn shuffle_rank(seed: u64, id: PhotoId) -> u64 {
     mix64(mix64(seed) ^ id.0)
 }
 
+/// What [`Filter::prepare`] works out once for a pass over many photos.
+pub(crate) struct Prepared {
+    root: Option<String>,
+    only: Option<std::collections::HashSet<PhotoId>>,
+}
+
+/// The tokens of a search text: split at whitespace, except inside double quotes, so
+/// `person:"Jane Doe"` is one token (issue #1449). An unclosed quote runs to the end of the text; a
+/// backslash is an ordinary character. One pass over the text, nothing allocated.
+fn search_tokens(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        let mut quoted = false;
+        let end = rest
+            .char_indices()
+            .find(|&(_, c)| {
+                quoted ^= c == '"';
+                !quoted && c.is_whitespace()
+            })
+            .map_or(rest.len(), |(i, _)| i);
+        let (tok, tail) = rest.split_at(end);
+        rest = tail;
+        Some(tok)
+    })
+}
+
+/// `s` without the double quotes around it (a missing closing quote is allowed).
+fn unquote(s: &str) -> &str {
+    s.strip_prefix('"').map_or(s, |inner| inner.strip_suffix('"').unwrap_or(inner))
+}
+
 fn token_matches(p: &Photo, tok: &str) -> bool {
     let t = tok.to_lowercase();
-    if let Some((field, val)) = t.split_once(':') {
+    // a token that starts with a quote is a phrase, even with a colon in it
+    if let Some((field, quoted)) = t.split_once(':').filter(|_| !t.starts_with('"')) {
+        let val = unquote(quoted);
         let num = |s: &str| -> Option<(char, f64)> {
             let (op, rest) = match s.chars().next()? {
                 c @ ('>' | '<' | '=') => (c, &s[1..]),
@@ -130,38 +194,76 @@ fn token_matches(p: &Photo, tok: &str) -> bool {
             Some((_, v)) => (x - v).abs() < 1e-9,
             None => false,
         };
+        // Fields stored as `f32` compare at f32 precision: 2.8f32 widened to f64 is not 2.8.
+        let cmp32 = |x: f32, s: &str| match num(s) {
+            Some(('>', v)) => x > v as f32,
+            Some(('<', v)) => x < v as f32,
+            Some((_, v)) => x == v as f32,
+            None => false,
+        };
         return match field {
             "rating" | "stars" => cmp(p.rating as f64, val),
             "flag" => Flag::parse(val) == Some(p.flag),
             "label" | "color" => p.label.is_some_and(|l| format!("{l:?}").eq_ignore_ascii_case(val)),
             "iso" => p.meta.iso.is_some_and(|i| cmp(i as f64, val)),
-            "f" | "aperture" => p.meta.aperture.is_some_and(|a| cmp(a as f64, val)),
-            "focal" => p.meta.focal_mm.is_some_and(|a| cmp(a as f64, val)),
+            "f" | "aperture" => p.meta.aperture.is_some_and(|a| cmp32(a, val)),
+            "focal" => p.meta.focal_mm.is_some_and(|a| cmp32(a, val)),
             "camera" => p.meta.camera.to_lowercase().contains(val),
             "lens" => p.meta.lens.to_lowercase().contains(val),
             "keyword" | "kw" => p.meta.keywords.iter().any(|k| crate::keywords::is_under(k, val)),
             "person" | "who" => has_person(p, val),
             "type" | "kind" => format!("{:?}", p.kind).eq_ignore_ascii_case(val),
             "edited" => (val == "true" || val == "yes") == p.is_edited(),
-            "date" => p.date().starts_with(val),
+            "date" => p.captured.as_deref().is_some_and(|c| c.starts_with(val)),
             "copy" | "virtual" => (val == "true" || val == "yes") == p.copy_of.is_some(),
             "name" | "file" => p.file_name.to_lowercase().contains(val),
-            _ => false,
+            // Not a known field: the colon is part of a plain word ("10:30", "Re:"), its value unquoted
+            // (`re:"a b"` is the text `re:a b`).
+            _ if val.len() != quoted.len() => text_matches(p, &format!("{field}:{val}")),
+            _ => text_matches(p, &t),
         };
     }
+    text_matches(p, unquote(&t))
+}
+
+/// Whether the lower-cased word `t` is in the file name, title, caption, camera, lens, location,
+/// format, a keyword or the name of a person (a named face) of `p`.
+fn text_matches(p: &Photo, t: &str) -> bool {
     let hay = [&p.file_name, &p.meta.title, &p.meta.caption, &p.meta.camera, &p.meta.lens, &p.meta.location, &p.format];
-    hay.iter().any(|h| h.to_lowercase().contains(&t)) || p.meta.keywords.iter().any(|k| k.to_lowercase().contains(&t))
+    hay.iter().any(|h| h.to_lowercase().contains(t))
+        || p.meta.keywords.iter().any(|k| k.to_lowercase().contains(t))
+        || p.people().iter().any(|n| n.to_lowercase().contains(t))
 }
 
 /// Whether `p` has a named face region called `name` (case-insensitive).
 fn has_person(p: &Photo, name: &str) -> bool {
     let name = name.trim().to_lowercase();
-    p.meta.regions.iter().any(|r| r.kind == lightcraft_meta::RegionKind::Face && r.name.as_deref().is_some_and(|n| n.to_lowercase() == name))
+    p.people().iter().any(|n| n.to_lowercase() == name)
 }
 
 impl Filter {
+    /// The labels that `label` and `labels` let through together (they AND), in `labels`' order;
+    /// `None` when neither is set, empty when they exclude each other. The chip and the filter
+    /// bar's buttons show this, so they match what is filtered.
+    pub fn labels_shown(&self) -> Option<Vec<ColorLabel>> {
+        match (self.label, self.labels.is_empty()) {
+            (None, true) => None,
+            (Some(l), true) => Some(vec![l]),
+            (l, false) => Some(self.labels.iter().copied().filter(|x| l.is_none_or(|l| l == *x)).collect()),
+        }
+    }
+
     /// Human-readable summary of the active rules (smart album tooltips, `album.list`).
     pub fn describe(&self) -> String {
+        self.describe_in(None)
+    }
+
+    /// [`Filter::describe`] naming the albums its rules test (`RuleSet::describe_with`).
+    pub fn describe_with(&self, cat: &crate::Catalog) -> String {
+        self.describe_in(Some(cat))
+    }
+
+    fn describe_in(&self, cat: Option<&crate::Catalog>) -> String {
         let mut v: Vec<String> = Vec::new();
         if self.rating > 0 {
             let op = match self.rating_op {
@@ -210,9 +312,16 @@ impl Filter {
             v.push(format!("“{}”", self.text.trim()));
         }
         if let Some(rs) = self.rule_set.as_ref().filter(|r| !r.rules.is_empty()) {
-            v.push(rs.describe());
+            v.push(cat.map_or_else(|| rs.describe(), |c| rs.describe_with(c)));
         }
         if v.is_empty() { "all photos".into() } else { v.join(", ") }
+    }
+
+    /// The albums this filter tests: its album field and its rules' Album rules.
+    pub fn albums_tested(&self) -> Vec<crate::AlbumId> {
+        let mut out: Vec<crate::AlbumId> = self.album.into_iter().collect();
+        out.extend(self.rule_set.as_ref().map(crate::RuleSet::albums_tested).unwrap_or_default());
+        out
     }
 
     /// Whether matches depend on the clock (only "in the last…" rules do).
@@ -221,7 +330,18 @@ impl Filter {
     }
 
     pub fn matches(&self, p: &Photo, cat: &Catalog) -> bool {
-        self.matches_in(p, cat, self.library_root().as_deref())
+        self.matches_in(p, cat, &self.prepare_one())
+    }
+
+    /// [`Filter::prepare`] for testing one photo (the `only` ids are looked through, not hashed).
+    pub(crate) fn prepare_one(&self) -> Prepared {
+        Prepared { root: self.library_root(), only: None }
+    }
+
+    /// What [`Filter::matches_in`] needs worked out once for a pass over many photos rather than
+    /// once per photo: the library folder's identity and the `only` ids as a set.
+    pub(crate) fn prepare(&self) -> Prepared {
+        Prepared { root: self.library_root(), only: (!self.only.is_empty()).then(|| self.only.iter().copied().collect()) }
     }
 
     /// [`Filter::library_folder`] as a folder identity ([`folder_key`]); `None` without a choice.
@@ -231,15 +351,15 @@ impl Filter {
         self.library_folder.as_deref().filter(|d| !d.trim().is_empty()).map(folder_key)
     }
 
-    /// [`Filter::matches`] with the library folder already turned into its identity, so a query
-    /// over a big library does that once, not once per photo.
-    fn matches_in(&self, p: &Photo, cat: &Catalog, root: Option<&str>) -> bool {
+    /// [`Filter::matches`] with what [`Filter::prepare`] works out done already, so a query over a
+    /// big library does that once, not once per photo.
+    pub(crate) fn matches_in(&self, p: &Photo, cat: &Catalog, prepared: &Prepared) -> bool {
         if p.deleted != self.deleted {
             return false;
         }
         match &self.folder {
-            // browsed photos only show in folder views
-            None if p.local => return false,
+            // browsed photos only show in folder views, and in Recently Deleted once deleted (#1430)
+            None if p.local && !p.deleted => return false,
             None => {}
             Some(dir) => {
                 let crate::Source::File { path } = &p.source else { return false };
@@ -272,7 +392,10 @@ impl Filter {
         if !self.labels.is_empty() && !p.label.is_some_and(|l| self.labels.contains(&l)) {
             return false;
         }
-        if !self.only.is_empty() && !self.only.contains(&p.id) {
+        if self.only_none {
+            return false;
+        }
+        if !self.only.is_empty() && !prepared.only.as_ref().map_or_else(|| self.only.contains(&p.id), |only| only.contains(&p.id)) {
             return false;
         }
         if let Some(want) = &self.merged {
@@ -287,12 +410,18 @@ impl Filter {
             return false;
         }
         if let Some(from) = &self.date_from
-            && p.date() < from.as_str()
+            && match p.captured.as_deref() {
+                Some(c) => c < from.as_str(),
+                None => true,
+            }
         {
             return false;
         }
         if let Some(to) = &self.date_to
-            && p.date().get(..to.len()).unwrap_or(p.date()) > to.as_str()
+            && match p.captured.as_deref() {
+                Some(c) => c.get(..to.len()).unwrap_or(c) > to.as_str(),
+                None => true,
+            }
         {
             return false;
         }
@@ -302,11 +431,11 @@ impl Filter {
             return false;
         }
         if let Some(d) = &self.date
-            && !p.date().starts_with(d.as_str())
+            && !p.captured.as_deref().is_some_and(|c| c.starts_with(d.as_str()))
         {
             return false;
         }
-        if let Some(root) = root
+        if let Some(root) = prepared.root.as_deref()
             && !photo_in_root(p, root)
         {
             return false;
@@ -341,7 +470,7 @@ impl Filter {
         {
             return false;
         }
-        self.text.split_whitespace().all(|tok| token_matches(p, tok))
+        search_tokens(&self.text).all(|tok| token_matches(p, tok))
     }
 }
 
@@ -352,25 +481,59 @@ pub fn place_of(p: &Photo) -> &str {
     [&m.city, &m.state, &m.country, &m.location].into_iter().map(|s| s.trim()).find(|s| !s.is_empty()).unwrap_or("")
 }
 
+/// Case-insensitive file name order without allocating (compares per-character lowercase via `char::to_lowercase`).
+pub fn cmp_name(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 impl Catalog {
-    /// Photos matching `filter`, in `sort` order (ties broken by id for stability).
+    /// Photos matching `filter`, in `sort` order (ties broken by file name, then id).
     pub fn query(&self, filter: &Filter, sort: &Sort) -> Vec<PhotoId> {
-        let root = filter.library_root();
-        let mut v: Vec<&Photo> = self.photos().map(|p| p.as_ref()).filter(|p| filter.matches_in(p, self, root.as_deref())).collect();
-        v.sort_by(|a, b| {
-            let o = match sort.key {
-                SortKey::CaptureDate => a.date().cmp(b.date()),
-                SortKey::ImportDate => a.imported.cmp(&b.imported),
-                SortKey::EditDate => a.edited.cmp(&b.edited),
-                SortKey::FileName => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
-                SortKey::Rating => a.rating.cmp(&b.rating),
-                SortKey::FileSize => a.file_size.cmp(&b.file_size),
-                SortKey::Random => shuffle_rank(sort.seed, a.id).cmp(&shuffle_rank(sort.seed, b.id)),
-            }
-            .then(a.id.cmp(&b.id));
-            if sort.ascending { o } else { o.reverse() }
-        });
+        self.query_keeping(filter, sort, &std::collections::HashSet::new(), filter)
+    }
+
+    /// [`Catalog::query`], and with them the photos of `keep` that still match `within`, each at its place in `sort`
+    /// order: a view that holds the photos it showed when an edit makes them stop matching `filter` (a smart
+    /// album's rules, the filter bar), as long as they are still where the view looks (`within`: in the library,
+    /// the album, the folder; not deleted).
+    pub fn query_keeping(&self, filter: &Filter, sort: &Sort, keep: &std::collections::HashSet<PhotoId>, within: &Filter) -> Vec<PhotoId> {
+        let prepared = filter.prepare();
+        // `within` only decides for the few kept photos: worked out per photo, not hashed
+        let within_prepared = within.prepare_one();
+        let mut v: Vec<&Photo> = self
+            .photos()
+            .map(|p| p.as_ref())
+            .filter(|p| filter.matches_in(p, self, &prepared) || (keep.contains(&p.id) && within.matches_in(p, self, &within_prepared)))
+            .collect();
+        v.sort_by(|a, b| sort.order(a, b));
         v.into_iter().map(|p| p.id).collect()
+    }
+
+    /// The list `was` (a [`Catalog::query`] of `filter` in `sort` order, or a [`Catalog::query_keeping`]), after ops
+    /// that touched only the photos `touched` (sorted by id, each once: [`Catalog::touched_since`]): those photos
+    /// taken out, and the ones that match `filter` now put back at their place in the order. With `within`, a
+    /// touched photo that was in the list and still matches `within` stays, as `query_keeping` would keep it. What
+    /// the query would give, without asking every photo again.
+    pub fn follow(&self, was: &[PhotoId], touched: &[PhotoId], filter: &Filter, sort: &Sort, within: Option<&Filter>) -> Vec<PhotoId> {
+        let listed: std::collections::HashSet<PhotoId> = was.iter().copied().filter(|id| touched.binary_search(id).is_ok()).collect();
+        let mut ids: Vec<PhotoId> = was.iter().copied().filter(|id| !listed.contains(id)).collect();
+        let (prepared, within_prepared) = (filter.prepare_one(), within.map(Filter::prepare_one));
+        for id in touched {
+            let Some(p) = self.photo(*id) else { continue };
+            let kept = within.zip(within_prepared.as_ref()).is_some_and(|(w, wp)| listed.contains(id) && w.matches_in(p, self, wp));
+            if filter.matches_in(p, self, &prepared) || kept {
+                // (the list is in order without the touched photos, and stays so as each is put back)
+                let at = ids.partition_point(|other| self.photo(*other).is_some_and(|o| sort.order(o, p).is_lt()));
+                ids.insert(at, *id);
+            }
+        }
+        ids
+    }
+
+    /// How many photos match `filter`: [`Catalog::query`]'s length without its sorting.
+    pub fn count(&self, filter: &Filter) -> usize {
+        let prepared = filter.prepare();
+        self.photos().filter(|p| filter.matches_in(p, self, &prepared)).count()
     }
 
     /// Year → month → day counts for the "By Date" section (newest first).
@@ -378,11 +541,14 @@ impl Catalog {
         use std::collections::BTreeMap;
         let mut years: BTreeMap<&str, (BTreeMap<&str, usize>, BTreeMap<&str, usize>)> = BTreeMap::new();
         for p in self.photos().filter(|p| p.in_library()) {
-            let d = p.date();
-            if d.len() >= 10 {
-                let (months, days) = years.entry(&d[..4]).or_default();
-                *months.entry(&d[..7]).or_default() += 1;
-                *days.entry(&d[..10]).or_default() += 1;
+            let Some(d) = p.captured.as_deref() else { continue };
+            // `get`, not `[..]`: a corrupt or foreign `captured` (a Lightroom catalog's
+            // captureTime is copied verbatim) may not be ASCII, and slicing it on a byte index
+            // would panic — the same rule as `dates::group_label`.
+            if let (Some(year), Some(month), Some(day)) = (d.get(..4), d.get(..7), d.get(..10)) {
+                let (months, days) = years.entry(year).or_default();
+                *months.entry(month).or_default() += 1;
+                *days.entry(day).or_default() += 1;
             }
         }
         let newest_first = |m: BTreeMap<&str, usize>| m.into_iter().rev().map(|(k, n)| (k.to_string(), n)).collect::<Vec<_>>();
@@ -436,8 +602,8 @@ impl Catalog {
     pub fn people_in(&self, filter: &Filter) -> Vec<Person> {
         let filter = Filter { person: None, ..filter.clone() };
         let mut m: std::collections::HashMap<String, (Person, f64)> = Default::default();
-        let root = filter.library_root();
-        for p in self.photos().filter(|p| filter.matches_in(p, self, root.as_deref())) {
+        let prepared = filter.prepare();
+        for p in self.photos().filter(|p| filter.matches_in(p, self, &prepared)) {
             let mut seen: Vec<String> = Vec::new();
             for r in p.meta.regions.iter().filter(|r| r.kind == lightcraft_meta::RegionKind::Face) {
                 let Some(name) = r.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else { continue };

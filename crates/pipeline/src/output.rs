@@ -1,13 +1,14 @@
 //! Output encoding: the colour space (primaries + transfer curve) and sample format a render is
-//! delivered in. Previews are always 8-bit sRGB; exports may ask for a wide-gamut space and/or
-//! 16-bit or linear float samples.
+//! delivered in. Previews are 8-bit sRGB, or 8-bit in a monitor's own primaries when the frontend
+//! has a display profile ([`DisplaySpace`]); exports may ask for a wide-gamut space and/or 16-bit or
+//! linear float samples.
 //!
 //! The per-pixel stage works in scene-linear Rec.2020 and ends by converting to the target's
 //! primaries, gamut mapping into the *target* gamut, and encoding. Tone curves and grain operate on
 //! sRGB-curve-encoded values of the target primaries (identical to the sRGB path when the target is
 //! sRGB); afterwards the values are re-encoded with the target's own curve.
 
-use lightcraft_color::{ADOBE_RGB, DISPLAY_P3, PROPHOTO, REC2020, RgbSpace, SRGB};
+use lightcraft_color::{ADOBE_RGB, DISPLAY_P3, Mat3, PROPHOTO, REC2020, RgbSpace, SRGB};
 use serde::{Deserialize, Serialize};
 
 /// The RGB space an image is rendered into.
@@ -138,6 +139,48 @@ impl OutputSpace {
     }
 }
 
+/// A monitor's RGB as a preview target (from its ICC display profile): previews render into the
+/// display's own primaries, gamut mapped into the display's gamut, encoded with the sRGB curve.
+/// The frontend then takes that encoding to the display's real device values
+/// (`lightcraft_codecs::display`). Exports never use it.
+#[derive(Clone, Copy, Debug)]
+pub struct DisplaySpace {
+    /// Linear Rec.2020 → linear display RGB, and back.
+    pub from_working: [[f32; 3]; 3],
+    pub to_working: [[f32; 3]; 3],
+    /// Luminance weights of the display's linear RGB (gamut mapping).
+    pub luma: [f32; 3],
+    /// Identifies the display profile (part of render keys).
+    pub id: u64,
+}
+
+impl DisplaySpace {
+    /// From the display's linear RGB → linear Rec.2020 matrix (display white → (1, 1, 1)).
+    /// `None` for a singular or non-finite matrix.
+    pub fn new(to_working: Mat3, id: u64) -> Option<DisplaySpace> {
+        let from = to_working.inverse()?;
+        let luma = REC2020.to_xyz().mul(&to_working).0[1];
+        let all = to_working.0.iter().chain(from.0.iter()).flatten().chain(luma.iter());
+        if all.clone().any(|v| !v.is_finite()) || (luma.iter().sum::<f64>() - 1.0).abs() > 1e-3 {
+            return None;
+        }
+        Some(DisplaySpace { from_working: from.to_f32(), to_working: to_working.to_f32(), luma: luma.map(|v| v as f32), id })
+    }
+
+    /// A display that is exactly `space`'s primaries (tests, and the sRGB identity).
+    pub fn of(space: OutputSpace, id: u64) -> Option<DisplaySpace> {
+        DisplaySpace::new(space.rgb_space().to_space(&REC2020), id)
+    }
+}
+
+impl PartialEq for DisplaySpace {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id
+    }
+}
+
+impl Eq for DisplaySpace {}
+
 /// Soft proofing: render as if the result were converted to `space` (colours outside its gamut
 /// are mapped into it, then shown in the render's own space), optionally painting what the
 /// destination can't hold (`dest_warning`, red) and what the display can't show
@@ -148,6 +191,81 @@ pub struct Proof {
     pub space: OutputSpace,
     pub dest_warning: bool,
     pub display_warning: bool,
+    /// An output-device profile to proof against instead of `space` (a printer / paper profile):
+    /// the id [`register_proof_profile`] gave its table; 0 = none. An id with no table is ignored.
+    #[serde(skip_serializing_if = "is_zero_id")]
+    pub profile: u64,
+}
+
+fn is_zero_id(v: &u64) -> bool {
+    *v == 0
+}
+
+/// A soft-proof table for an output-device profile, built by the caller's CMS: `n³` entries over
+/// working-space (linear Rec.2020) RGB encoded with the sRGB curve, index `(r * n + g) * n + b`,
+/// each the colour the device reproduces (linear Rec.2020, paper white already applied when the
+/// proof simulates paper and ink) and, in `[3]`, how far outside the device gamut the colour is
+/// (0 inside; above [`PROOF_GAMUT_TOLERANCE`] counts as outside).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProofLut {
+    n: usize,
+    data: Vec<[f32; 4]>,
+}
+
+/// Gamut distance (sRGB-curve code values, 0..1) above which a colour is out of the proof gamut.
+pub const PROOF_GAMUT_TOLERANCE: f32 = 0.02;
+
+impl ProofLut {
+    /// `None` unless `data` holds `n³` finite entries with `2 ≤ n ≤ 129`.
+    pub fn new(n: usize, data: Vec<[f32; 4]>) -> Option<ProofLut> {
+        let ok = (2..=129).contains(&n) && data.len() == n * n * n && data.iter().flatten().all(|v| v.is_finite());
+        ok.then_some(ProofLut { n, data })
+    }
+
+    /// The proofed colour and gamut distance of working-space `rgb` (trilinear).
+    pub fn sample(&self, rgb: [f32; 3]) -> ([f32; 3], f32) {
+        let m = (self.n - 1) as f32;
+        let f = rgb.map(|v| lightcraft_color::transfer::linear_to_srgb(v.clamp(0.0, 1.0)) * m);
+        let i0 = f.map(|v| (v.floor() as usize).min(self.n - 2));
+        let t = [f[0] - i0[0] as f32, f[1] - i0[1] as f32, f[2] - i0[2] as f32];
+        let mut acc = [0.0f32; 4];
+        for corner in 0..8usize {
+            let b = [corner >> 2 & 1, corner >> 1 & 1, corner & 1];
+            let w: f32 = (0..3).map(|k| if b[k] == 1 { t[k] } else { 1.0 - t[k] }).product();
+            let idx = ((i0[0] + b[0]) * self.n + i0[1] + b[1]) * self.n + i0[2] + b[2];
+            if let Some(e) = self.data.get(idx) {
+                for k in 0..4 {
+                    acc[k] += e[k] * w;
+                }
+            }
+        }
+        ([acc[0], acc[1], acc[2]], acc[3])
+    }
+}
+
+/// Proof tables by id (a few: the profiles a session proofs against).
+static PROOF_PROFILES: std::sync::Mutex<Vec<(u64, std::sync::Arc<ProofLut>)>> = std::sync::Mutex::new(Vec::new());
+const PROOF_PROFILES_KEPT: usize = 8;
+
+/// Make `lut` available to renders as [`Proof::profile`] `id` (any nonzero number that identifies
+/// the profile and its options, e.g. a hash). Returns `id` (`1` for `0`).
+pub fn register_proof_profile(id: u64, lut: ProofLut) -> u64 {
+    let id = id.max(1);
+    let mut v = PROOF_PROFILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    v.retain(|(k, _)| *k != id);
+    v.push((id, std::sync::Arc::new(lut)));
+    let extra = v.len().saturating_sub(PROOF_PROFILES_KEPT);
+    v.drain(..extra);
+    id
+}
+
+/// The table registered as `id`.
+pub fn proof_profile(id: u64) -> Option<std::sync::Arc<ProofLut>> {
+    if id == 0 {
+        return None;
+    }
+    let v = PROOF_PROFILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    v.iter().find(|(k, _)| *k == id).map(|(_, l)| l.clone())
 }
 
 /// Warning colours (sRGB-encoded): destination gamut red, display gamut blue.
@@ -155,8 +273,10 @@ pub const PROOF_DEST_WARNING: [f32; 3] = [1.0, 0.0, 0.0];
 pub const PROOF_DISPLAY_WARNING: [f32; 3] = [0.0, 0.25, 1.0];
 
 /// [`Proof`] as the per-pixel stage uses it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ProofParams {
+    /// The output-device table (replaces `to_proof` / `proof_to_out` when present).
+    pub table: Option<std::sync::Arc<ProofLut>>,
     /// Linear Rec.2020 → linear proof RGB, its luminance weights, linear proof → linear output RGB.
     pub to_proof: [[f32; 3]; 3],
     pub luma: [f32; 3],
@@ -167,11 +287,12 @@ pub struct ProofParams {
 
 impl Proof {
     pub fn key(self) -> u64 {
-        (self.space as u64 + 1) | (self.dest_warning as u64) << 8 | (self.display_warning as u64) << 9
+        ((self.space as u64 + 1) | (self.dest_warning as u64) << 8 | (self.display_warning as u64) << 9) ^ self.profile.rotate_left(16)
     }
 
     pub fn params(self, out: OutputSpace) -> ProofParams {
         ProofParams {
+            table: proof_profile(self.profile),
             to_proof: self.space.from_working(),
             luma: self.space.luma(),
             proof_to_out: self.space.rgb_space().to_space(&out.rgb_space()).to_f32(),
@@ -179,6 +300,17 @@ impl Proof {
             display_warning: self.display_warning,
         }
     }
+
+    /// [`Self::params`] for a render into a display's primaries: the display warning then shows
+    /// what *this* display can't show.
+    pub fn params_display(self, d: &DisplaySpace) -> ProofParams {
+        let proof_to_working = self.space.rgb_space().to_space(&REC2020).to_f32();
+        ProofParams { proof_to_out: mul33(&d.from_working, &proof_to_working), ..self.params(OutputSpace::Srgb) }
+    }
+}
+
+fn mul33(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
 }
 
 /// Sample format of a render.
@@ -192,6 +324,9 @@ pub enum OutputDepth {
     U16,
     /// 32-bit float *linear* RGB (target primaries, 0..1) in [`crate::Rendered::deep`].
     F32Linear,
+    /// 32-bit float linear RGB (target primaries) of the HDR render: SDR white = 1, highlights up
+    /// to [`lightcraft_develop::Hdr::peak`]. With HDR off this is [`OutputDepth::F32Linear`].
+    F32Hdr,
 }
 
 /// High-bit-depth RGB samples (3 per pixel, interleaved, row-major).

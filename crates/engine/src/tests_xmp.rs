@@ -7,6 +7,26 @@ use lightcraft_catalog::{ColorLabel, Flag, PhotoId};
 use serde_json::json;
 
 use crate::Session;
+use crate::rename::{MoveFs, RealFs};
+
+/// Whether `dir` is on a case-insensitive volume (the default on macOS and Windows): its path in upper case still resolves.
+pub(crate) fn case_insensitive(dir: &Path) -> bool {
+    Path::new(&dir.to_string_lossy().to_uppercase()).exists()
+}
+
+/// The same path, or the same file under another spelling (`a.XMP` and `a.xmp` on a case-insensitive volume). Fault
+/// injectors match this way, so an injected failure fires whichever spelling the code under test uses for a file; on a
+/// case-sensitive volume only identical paths match.
+pub(crate) fn same_path_or_file(a: &Path, b: &Path) -> bool {
+    a == b || RealFs.same_file(a, b)
+}
+
+/// The same path, or on a case-insensitive volume a path that differs only in ASCII case: the code under test may spell
+/// a sidecar `.XMP` for a file stored as `.xmp` there, while on a case-sensitive volume it offers only the spelling that
+/// exists.
+pub(crate) fn same_path_for_volume(a: &Path, b: &Path) -> bool {
+    a == b || (a.parent().is_some_and(case_insensitive) && a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()))
+}
 
 pub(crate) fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("lc-xmp-{tag}-{}", std::process::id()));
@@ -21,6 +41,34 @@ fn write_png(path: &Path, seed: u8) {
     let img = lightcraft_raster::Rgba8 { width: w, height: h, data };
     let bytes = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
     std::fs::write(path, bytes).unwrap();
+}
+
+pub(crate) fn synthetic_psd_with_metadata(metadata: &lightcraft_meta::Metadata) -> Vec<u8> {
+    let exif = lightcraft_meta::write_exif(metadata);
+    let xmp = lightcraft_meta::write_xmp(metadata, None);
+    let pixels = [40, 80, 120];
+    let image = lightcraft_codecs::EncodeImage::new(1, 1, 3, lightcraft_codecs::Samples::U8(&pixels));
+    let embedded = lightcraft_codecs::EncodeMeta { exif: Some(&exif), xmp: Some(&xmp), ..Default::default() };
+    lightcraft_codecs::encode_psd(&image, &embedded).unwrap()
+}
+
+pub(crate) fn synthetic_psb_with_metadata(metadata: &lightcraft_meta::Metadata) -> Vec<u8> {
+    let exif = lightcraft_meta::write_exif(metadata);
+    let xmp = lightcraft_meta::write_xmp(metadata, None);
+    let pixels = [1024u16, 2048, 3072];
+    let image = lightcraft_codecs::EncodeImage::new(1, 1, 3, lightcraft_codecs::Samples::U16(&pixels));
+    let embedded = lightcraft_codecs::EncodeMeta { exif: Some(&exif), xmp: Some(&xmp), ..Default::default() };
+    let psd = lightcraft_codecs::encode_psd(&image, &embedded).unwrap();
+    let colour_length = usize::try_from(u32::from_be_bytes(psd[26..30].try_into().unwrap())).unwrap();
+    let resource_length_offset = 30 + colour_length;
+    let resource_length = usize::try_from(u32::from_be_bytes(psd[resource_length_offset..resource_length_offset + 4].try_into().unwrap())).unwrap();
+    let resource_end = resource_length_offset + 4 + resource_length;
+
+    let mut psb = psd[..resource_end].to_vec();
+    psb[4..6].copy_from_slice(&2u16.to_be_bytes());
+    psb.extend_from_slice(&0u64.to_be_bytes()); // PSB layer and mask information length
+    psb.extend_from_slice(&psd[resource_end + 4..]); // compression and uncompressed 16-bit pixel planes
+    psb
 }
 
 fn only(s: &Session) -> PhotoId {
@@ -94,7 +142,8 @@ fn auto_write_and_naming_preference() {
     // a slider drag writes once, at the end
     s.execute("develop.beginInteraction", &json!({"label": "Exposure"})).unwrap();
     s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.5})).unwrap();
-    let exposure = |p: &Path| match crate::sidecar::parse_sidecar(&std::fs::read_to_string(p).unwrap(), false).unwrap().develop {
+    let exposure = |p: &Path| match crate::sidecar::parse_sidecar(&std::fs::read_to_string(p).unwrap(), crate::crs::Target::Rendered).unwrap().develop
+    {
         Some(crate::sidecar::DevelopPatch::Full(d)) => d.light.exposure,
         other => panic!("{other:?}"),
     };
@@ -170,6 +219,201 @@ fn foreign_crs_sidecar_on_import_and_read_from_file() {
     std::fs::remove_file(src.join("harbour.xmp")).unwrap();
     let r = s.execute("photo.readMetadataFromFile", &json!({})).unwrap();
     assert_eq!(r["failed"].as_array().unwrap().len(), 1);
+    assert!(r.get("warnings").is_none(), "{r}");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A sidecar with only `crs:` develop settings, as LRTimelapse writes them (issue #934).
+fn crs_exposure_sidecar(exposure: &str) -> String {
+    format!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Version="15.0" crs:Exposure2012="{exposure}"/></rdf:RDF></x:xmpmeta>"#
+    )
+}
+
+/// Issue #934: with auto-write on, Read Metadata from File wrote what it had just read straight back
+/// into the sidecar, adding our `lc:settings`. Reading leaves the file byte for byte; an edit made
+/// after it is still written.
+#[test]
+fn reading_metadata_leaves_the_sidecar_alone_with_auto_write_on() {
+    let src = temp_dir("read-no-autowrite");
+    write_png(&src.join("frame.png"), 6);
+    let sidecar = src.join("frame.xmp");
+    std::fs::write(&sidecar, crs_exposure_sidecar("0.5")).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    assert_eq!(s.catalog.photo(id).unwrap().develop.light.exposure, 0.5);
+    // something for the read to change back (auto-write is still off, so the file stays as it is)
+    s.execute("develop.reset", &json!({"ids": [id.0]})).unwrap();
+    s.execute("library.xmpPreferences", &json!({"autoWrite": true})).unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+    let r = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(r["read"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(s.catalog.photo(id).unwrap().develop.light.exposure, 0.5, "the sidecar was read");
+    let now = std::fs::read(&sidecar).unwrap();
+    assert!(now == before, "reading leaves the sidecar byte for byte, but it is now:\n{}", String::from_utf8_lossy(&now));
+    // a develop edit afterwards is still written (only the read is exempt)
+    s.execute("develop.set", &json!({"ids": [id.0], "control": "light.exposure", "value": 0.9})).unwrap();
+    let after = std::fs::read_to_string(&sidecar).unwrap();
+    match crate::sidecar::parse_sidecar(&after, crate::crs::Target::Rendered).unwrap().develop {
+        Some(crate::sidecar::DevelopPatch::Full(d)) => assert_eq!(d.light.exposure, 0.9),
+        other => panic!("the edit wasn't auto-written: {other:?}\n{after}"),
+    }
+    assert!(after.contains(r#"crs:Exposure2012="0.5""#), "the other app's settings are kept: {after}");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Issue #934, the round trip the write-back broke: after a read with auto-write on, another app
+/// changes `crs:Exposure2012` from 0.5 to 1.2 (keeping the rest of the file), and the next read
+/// takes 1.2.
+#[test]
+fn a_crs_change_after_a_read_is_taken_with_auto_write_on() {
+    let src = temp_dir("read-then-crs-change");
+    write_png(&src.join("frame.png"), 7);
+    let sidecar = src.join("frame.xmp");
+    std::fs::write(&sidecar, crs_exposure_sidecar("0.5")).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    s.execute("library.xmpPreferences", &json!({"autoWrite": true})).unwrap();
+    s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().develop.light.exposure, 0.5);
+    // the other app edits the file as it is now
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let changed = text.replace(r#"crs:Exposure2012="0.5""#, r#"crs:Exposure2012="1.2""#);
+    assert_ne!(changed, text);
+    std::fs::write(&sidecar, changed).unwrap();
+    s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().develop.light.exposure, 1.2, "the second read takes the other app's exposure");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Lightroom's default profiles (`Adobe Standard`, `Adobe Color`) are named by nearly every sidecar
+/// and our own starting look stands in for them: importing one gives no camera-profile warning.
+#[test]
+fn default_lightroom_profiles_are_not_reported() {
+    let src = temp_dir("xmp-default-profile");
+    for (i, name) in ["Adobe Standard", "Adobe Color"].into_iter().enumerate() {
+        let photo = src.join(format!("p{i}.png"));
+        write_png(&photo, 6);
+        let xmp = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+        crs:CameraProfile="{name}" crs:Exposure2012="0.5"/>
+    </rdf:RDF></x:xmpmeta>"#
+        );
+        std::fs::write(src.join(format!("p{i}.xmp")), xmp).unwrap();
+        let mut s = Session::new().with_fs();
+        let r = s.execute("library.import", &json!({"paths": [photo.to_string_lossy()]})).unwrap();
+        let none = Vec::new();
+        let warnings = r["warnings"].as_array().unwrap_or(&none);
+        assert!(!warnings.iter().any(|w| w["code"] == "cameraProfile"), "{name}: {r}");
+        assert_eq!(s.catalog.photos().next().unwrap().develop.light.exposure, 0.5, "{name}: the edits still import");
+    }
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Foreign profile names and saved Upright matrices stay visible without pretending their
+/// proprietary colour or coordinate data was imported. Diagnostics are per-photo report data;
+/// importing a file without XMP remains quiet, and the source packet is never rewritten.
+#[test]
+fn foreign_profile_and_upright_import_diagnostics_are_actionable() {
+    let src = temp_dir("xmp-diagnostics");
+    let photo = src.join("faithful.png");
+    write_png(&photo, 6);
+    let xmp = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+        crs:CameraProfile="Camera Faithful" crs:Exposure2012="1.68" crs:PerspectiveUpright="1"
+        crs:UprightVersion="151388160" crs:UprightTransformCount="6"
+        crs:UprightCenterNormX="0.554156" crs:UprightCenterNormY="0.529745"
+        crs:UprightTransform_1="0.897233402,-0.013204641,-0.030578613,-0.096087436,0.953621255,0.003270197,-0.157075841,-0.043520282,1.000000000"/>
+    </rdf:RDF></x:xmpmeta>"#;
+    let sidecar = src.join("faithful.xmp");
+    std::fs::write(&sidecar, xmp).unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+    let photo_path = photo.to_string_lossy().to_string();
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [photo.to_string_lossy()]})).unwrap();
+    let warnings = r["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|w| w["code"] == "cameraProfile" && w["profile"] == "Camera Faithful"), "{r}");
+    assert!(warnings.iter().any(|w| w["code"] == "uprightGeometry" && w["mode"] == "auto"), "{r}");
+    assert!(warnings.iter().all(|w| w.get("fields").is_none()), "{r}");
+    let import_warnings: Vec<crate::import::ImportWarning> =
+        warnings.iter().cloned().map(serde_json::from_value).collect::<std::result::Result<_, _>>().unwrap();
+    let import_profile = import_warnings.iter().find(|w| w.code == crate::import::ImportWarningCode::CameraProfile).unwrap();
+    assert_eq!(import_profile.path, photo_path);
+    assert_eq!(import_profile.profile.as_deref(), Some("Camera Faithful"));
+    assert!(import_profile.fields.is_empty());
+    let import_upright = import_warnings.iter().find(|w| w.code == crate::import::ImportWarningCode::UprightGeometry).unwrap();
+    assert_eq!(import_upright.path, photo_path);
+    assert_eq!(import_upright.mode, Some(crate::import::ImportUprightMode::Auto));
+    assert!(import_upright.fields.is_empty());
+    let p = s.catalog.photos().next().unwrap().clone();
+    assert_eq!(p.develop.profile.id, "lc.color");
+    assert_eq!(p.develop.light.exposure, 1.68);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), before, "import never rewrites foreign XMP");
+
+    // Metadata reread carries same structured diagnostics, with each saved Upright mode typed.
+    let reread = s.execute("photo.readMetadataFromFile", &json!({"ids": [p.id.0]})).unwrap();
+    let reread_wires = reread["warnings"].as_array().unwrap();
+    assert!(reread_wires.iter().all(|w| w.get("fields").is_none()), "{reread}");
+    let reread_warnings: Vec<crate::import::ImportWarning> =
+        reread_wires.iter().cloned().map(serde_json::from_value).collect::<std::result::Result<_, _>>().unwrap();
+    let reread_profile = reread_warnings.iter().find(|w| w.code == crate::import::ImportWarningCode::CameraProfile).unwrap();
+    assert_eq!(reread_profile.path, photo_path);
+    assert_eq!(reread_profile.profile.as_deref(), Some("Camera Faithful"));
+    assert!(reread_profile.fields.is_empty());
+    let reread_upright = reread_warnings.iter().find(|w| w.code == crate::import::ImportWarningCode::UprightGeometry).unwrap();
+    assert_eq!(reread_upright.path, photo_path);
+    assert_eq!(reread_upright.mode, Some(crate::import::ImportUprightMode::Auto));
+    assert!(reread_upright.fields.is_empty());
+    assert!(
+        reread["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "cameraProfile" && w["profile"] == "Camera Faithful" && w["path"] == photo_path),
+        "{reread}"
+    );
+    assert!(reread["warnings"].as_array().unwrap().iter().any(|w| w["code"] == "uprightGeometry" && w["mode"] == "auto"), "{reread}");
+    for (source, mode) in [("0", "off"), ("2", "level"), ("3", "vertical"), ("4", "full"), ("5", "guided"), ("9", "unknown")] {
+        let mode_xmp = xmp.replace("crs:PerspectiveUpright=\"1\"", &format!("crs:PerspectiveUpright=\"{source}\""));
+        std::fs::write(&sidecar, mode_xmp).unwrap();
+        let reread = s.execute("photo.readMetadataFromFile", &json!({"ids": [p.id.0]})).unwrap();
+        assert!(reread["warnings"].as_array().unwrap().iter().any(|w| w["code"] == "uprightGeometry" && w["mode"] == mode), "{source}: {reread}");
+    }
+
+    // A foreign name colliding with a built-in profile label remains warning metadata only.
+    let collision = src.join("collision.png");
+    write_png(&collision, 8);
+    std::fs::write(src.join("collision.xmp"), xmp.replace("Camera Faithful", "Color")).unwrap();
+    let collision_report = s.execute("library.import", &json!({"paths": [collision.to_string_lossy()]})).unwrap();
+    assert!(
+        collision_report["warnings"].as_array().unwrap().iter().any(|w| w["code"] == "cameraProfile" && w["profile"] == "Color"),
+        "{collision_report}"
+    );
+    let collision_photo = s.catalog.photos().find(|photo| photo.file_name == "collision.png").unwrap();
+    assert_eq!(collision_photo.develop.profile.id, "lc.color");
+
+    let unmapped = crate::import::ImportWarning {
+        path: photo_path.clone(),
+        code: crate::import::ImportWarningCode::UnmappedXmp,
+        profile: None,
+        mode: None,
+        fields: vec!["Tint".into()],
+    };
+    let unmapped_wire = serde_json::to_value(&unmapped).unwrap();
+    assert_eq!(serde_json::from_value::<crate::import::ImportWarning>(unmapped_wire).unwrap(), unmapped);
+
+    // A second import still diagnoses the untouched foreign packet, while an XMP-free photo does not.
+    drop(s);
+    let clean = src.join("clean.png");
+    write_png(&clean, 7);
+    let mut s = Session::new().with_fs();
+    let clean_report = s.execute("library.import", &json!({"paths": [clean.to_string_lossy()]})).unwrap();
+    assert!(clean_report.get("warnings").is_none(), "{clean_report}");
+    let repeat = s.execute("library.import", &json!({"paths": [photo.to_string_lossy()]})).unwrap();
+    assert_eq!(repeat["warnings"].as_array().unwrap().len(), 2, "{repeat}");
     let _ = std::fs::remove_dir_all(&src);
 }
 
@@ -368,8 +612,10 @@ pub(crate) fn synthetic_dng_of(w: usize, h: usize, cfa: &str, data: Vec<u16>, xm
         },
         wb_multipliers: None,
         linearized: false,
+        pixel_aspect: 1.0,
         opcodes: OpcodeLists::default(),
         metadata,
+        lens_metadata: Default::default(),
     };
     write_dng(&raw, &DngWriteOptions { xmp: xmp.map(str::to_string), ..Default::default() }).unwrap()
 }
@@ -400,6 +646,214 @@ fn dng_embedded_crs_settings_are_read_on_import() {
     let mut s2 = Session::new().with_fs();
     s2.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
     assert_eq!(s2.catalog.photos().next().unwrap().develop.light.contrast, -10.0);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+fn jpeg_xmp_packet(rating: i8, title: &str) -> String {
+    lightcraft_meta::write_xmp(&lightcraft_meta::Metadata { rating: Some(rating), title: Some(title.into()), ..Default::default() }, None)
+}
+
+fn write_jpeg_xmp(path: &Path, packet: &str) -> Vec<u8> {
+    let img = lightcraft_raster::Rgba8::from_fn(32, 24, |x, y| [(x * 7) as u8, (y * 9) as u8, 90, 255]);
+    let meta = lightcraft_codecs::EncodeMeta { xmp: Some(packet), ..Default::default() };
+    let bytes = lightcraft_codecs::encode_jpeg(&lightcraft_codecs::EncodeImage::rgba8(&img), 90, Default::default(), &meta).unwrap();
+    assert_eq!(lightcraft_meta::embedded(&bytes).xmp.as_deref(), Some(packet), "the procedural JPEG carries the requested packet");
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn embedded_jpeg_xmp_reread_refreshes_metadata_and_undoes_once() {
+    let src = temp_dir("jpeg-xmp-refresh");
+    let file = src.join("photo.jpg");
+    let initial = write_jpeg_xmp(&file, &jpeg_xmp_packet(1, "Initial embedded title"));
+    let mut s = Session::new().with_fs();
+    let imported = s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
+    assert_eq!(imported["imported"].as_array().unwrap().len(), 1, "{imported}");
+    let id = only(&s);
+    assert_eq!(s.catalog.photo(id).unwrap().kind, lightcraft_catalog::MediaKind::Image);
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 2})).unwrap();
+    s.execute("photo.setMeta", &json!({"title": "Catalog title"})).unwrap();
+    let before = s.catalog.photo(id).unwrap().clone();
+    assert!(!s.xmp.auto_write);
+
+    // Change the packet after import: rereading must use the file, not the imported metadata.
+    let changed = write_jpeg_xmp(&file, &jpeg_xmp_packet(4, "Changed embedded title"));
+    assert_ne!(initial, changed);
+    assert!(!src.join("photo.xmp").exists() && !src.join("photo.jpg.xmp").exists());
+    let read = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(read["read"], json!([{"id": id.0, "from": file.to_string_lossy()}]), "embedded JPEG XMP must be reread: {read}");
+    assert_eq!(read["failed"], json!([]), "{read}");
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, photo.meta.title.as_str()), (4, "Changed embedded title"));
+    assert_eq!(photo.develop, before.develop);
+
+    s.execute("edit.undo", &json!({})).unwrap();
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, &photo.meta.title), (before.rating, &before.meta.title), "one undo restores both fields");
+    assert_eq!(std::fs::read(&file).unwrap(), changed, "reading and undo never rewrite the original");
+    assert!(!src.join("photo.xmp").exists() && !src.join("photo.jpg.xmp").exists());
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn embedded_jpeg_xmp_reread_keeps_sidecar_precedence() {
+    let src = temp_dir("jpeg-xmp-sidecar");
+    let file = src.join("photo.jpg");
+    let original = write_jpeg_xmp(&file, &jpeg_xmp_packet(4, "Embedded title"));
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    let sidecar = src.join("photo.xmp");
+    let packet = jpeg_xmp_packet(5, "Sidecar title");
+    std::fs::write(&sidecar, &packet).unwrap();
+    let read = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(read["read"], json!([{"id": id.0, "from": sidecar.to_string_lossy()}]), "{read}");
+    assert_eq!(read["failed"], json!([]), "{read}");
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, photo.meta.title.as_str()), (5, "Sidecar title"));
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), packet);
+
+    // A malformed sidecar must report its failure, not fall back to the valid embedded packet.
+    let malformed = "<a>".repeat(1000);
+    assert!(lightcraft_meta::parse_xmp(&malformed).is_err());
+    std::fs::write(&sidecar, &malformed).unwrap();
+    let read = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(read["read"], json!([]), "{read}");
+    assert_eq!(read["failed"].as_array().unwrap().len(), 1, "{read}");
+    assert_eq!(read["failed"][0]["id"], id.0);
+    assert!(!read["failed"][0]["error"].as_str().unwrap().is_empty());
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, photo.meta.title.as_str()), (5, "Sidecar title"));
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), malformed);
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn embedded_jpeg_xmp_reread_malformed_input_preserves_state_and_undo() {
+    let src = temp_dir("jpeg-xmp-malformed");
+    let file = src.join("photo.jpg");
+    write_jpeg_xmp(&file, &jpeg_xmp_packet(1, "Original title"));
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 2})).unwrap();
+    let previous_title = s.catalog.photo(id).unwrap().meta.title.clone();
+    s.execute("photo.setMeta", &json!({"title": "Catalog title"})).unwrap();
+    let before = s.catalog.photo(id).unwrap().clone();
+    let malformed = "<a>".repeat(1000);
+    assert!(lightcraft_meta::parse_xmp(&malformed).is_err());
+    let broken_packet = write_jpeg_xmp(&file, &malformed);
+    let truncated_container = vec![0xff, 0xd8, 0xff, 0xe1, 0, 40, b'x'];
+    for bytes in [broken_packet, truncated_container] {
+        std::fs::write(&file, &bytes).unwrap();
+        let read = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+        assert_eq!(read["read"], json!([]), "{read}");
+        assert_eq!(read["failed"].as_array().unwrap().len(), 1, "{read}");
+        assert_eq!(read["failed"][0]["id"], id.0);
+        assert!(!read["failed"][0]["error"].as_str().unwrap().is_empty());
+        let photo = s.catalog.photo(id).unwrap();
+        assert_eq!((photo.rating, &photo.meta.title), (before.rating, &before.meta.title));
+        assert_eq!(photo.develop, before.develop);
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert!(!src.join("photo.xmp").exists() && !src.join("photo.jpg.xmp").exists());
+    }
+    // Failed reads do not add an undo entry: the last successful title edit is still next.
+    s.execute("edit.undo", &json!({})).unwrap();
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, &photo.meta.title), (2, &previous_title));
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn embedded_jpeg_xmp_reread_non_utf8_sidecar_preserves_state_and_undo() {
+    let src = temp_dir("jpeg-xmp-non-utf8-sidecar");
+    let file = src.join("photo.jpg");
+    let original = write_jpeg_xmp(&file, &jpeg_xmp_packet(4, "Embedded title"));
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    assert!(!s.xmp.auto_write);
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 2})).unwrap();
+    let previous_title = s.catalog.photo(id).unwrap().meta.title.clone();
+    s.execute("photo.setMeta", &json!({"title": "Catalog title"})).unwrap();
+    let before = s.catalog.photo(id).unwrap().clone();
+    let sidecar = src.join("photo.xmp");
+    let invalid = [0xff, 0xfe, 0x80];
+    std::fs::write(&sidecar, invalid).unwrap();
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(crate::sidecar::find_sidecar(file.to_str().unwrap(), s.sidecar_naming(id)), Some(sidecar.clone()));
+
+    let read = s.execute("photo.readMetadataFromFile", &json!({"ids": [id.0]})).unwrap();
+    assert_eq!(read["read"], json!([]), "an existing non-UTF-8 sidecar must not fall back to embedded JPEG XMP: {read}");
+    assert_eq!(read["failed"].as_array().unwrap().len(), 1, "{read}");
+    assert_eq!(read["failed"][0]["id"], id.0);
+    assert!(!read["failed"][0]["error"].as_str().unwrap().is_empty());
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, &photo.meta.title), (before.rating, &before.meta.title));
+    assert_eq!(photo.develop, before.develop);
+
+    s.execute("edit.undo", &json!({})).unwrap();
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, &photo.meta.title), (2, &previous_title), "failed reads must not add an undo entry");
+    assert_eq!(photo.develop, before.develop);
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), invalid);
+    assert!(!src.join("photo.jpg.xmp").exists());
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn embedded_jpeg_xmp_reread_all_metadata_uses_supplied_bytes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let src = temp_dir("jpeg-xmp-all-metadata");
+    let file = src.join("photo.jpg");
+    let original = write_jpeg_xmp(&file, &jpeg_xmp_packet(1, "On-disk title"));
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [file.to_string_lossy()]})).unwrap();
+    let id = only(&s);
+    assert!(!s.xmp.auto_write);
+    let before = s.catalog.photo(id).unwrap().clone();
+    let supplied = write_jpeg_xmp(&src.join("supplied.jpg"), &jpeg_xmp_packet(4, "Supplied title"));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let expected_path = file.to_string_lossy().into_owned();
+    s.media.file_bytes = Some(Arc::new(move |path| {
+        assert_eq!(path, expected_path);
+        counted.fetch_add(1, Ordering::SeqCst);
+        Ok(supplied.clone())
+    }));
+
+    let query = s.execute("photo.allMetadata", &json!({"id": id.0})).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    let xmp = query["xmp"].as_array().unwrap();
+    assert!(
+        xmp.iter().any(|x| x["name"] == "dc:title" && x["value"] == "Supplied title"),
+        "All Metadata must use the bytes already supplied: {query}"
+    );
+    assert!(xmp.iter().any(|x| x["name"] == "xmp:Rating" && x["value"] == "4"), "{query}");
+    assert!(!xmp.iter().any(|x| x["value"] == "On-disk title"), "{query}");
+
+    let sidecar = src.join("photo.xmp");
+    let packet = jpeg_xmp_packet(5, "Sidecar title");
+    std::fs::write(&sidecar, &packet).unwrap();
+    let query = s.execute("photo.allMetadata", &json!({"id": id.0})).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let xmp = query["xmp"].as_array().unwrap();
+    assert!(xmp.iter().any(|x| x["name"] == "dc:title" && x["value"] == "Sidecar title"), "{query}");
+    assert!(xmp.iter().any(|x| x["name"] == "xmp:Rating" && x["value"] == "5"), "{query}");
+    assert!(!xmp.iter().any(|x| x["value"] == "Supplied title"), "{query}");
+    let photo = s.catalog.photo(id).unwrap();
+    assert_eq!((photo.rating, &photo.meta.title), (before.rating, &before.meta.title));
+    assert_eq!(photo.develop, before.develop);
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), packet);
     let _ = std::fs::remove_dir_all(&src);
 }
 
@@ -450,7 +904,7 @@ fn convert_raw_to_dng() {
     let r = s.execute("photo.convertToDng", &json!({})).unwrap();
     assert_eq!((r["converted"].as_array().unwrap().len(), r["skipped"].as_array().unwrap().len()), (0, 1));
     if !corpus.exists() {
-        eprintln!("skip: {} absent", corpus.display());
+        lightcraft_testkit::skip!(Corpus, "{} absent", corpus.display());
         return;
     }
     let nef = dir.join("shot.nef");
@@ -565,6 +1019,129 @@ fn external_edit_copy_is_stacked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #920: with several photos selected, each gets its own `-Edit` copy stacked on its
+/// original, the copies end up selected and are all reported; `ids` picks photos explicitly.
+#[test]
+fn external_edit_copies_every_selected_photo() {
+    let dir = temp_dir("extedit-many");
+    let paths: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .zip(9u8..)
+        .map(|(n, seed)| {
+            let p = dir.join(format!("{n}.png"));
+            // different bytes: the import keeps one of identical files
+            write_png(&p, seed);
+            p.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut s = Session::new().with_fs();
+    let imported = s.execute("library.import", &json!({"paths": paths})).unwrap();
+    let originals: Vec<u64> = imported["imported"].as_array().unwrap().iter().filter_map(serde_json::Value::as_u64).collect();
+    assert_eq!(originals.len(), 3);
+    s.execute("library.select", &json!({"ids": originals})).unwrap();
+    let r = s.execute("photo.editExternal", &json!({})).unwrap();
+    let copies = r["copies"].as_array().unwrap();
+    assert_eq!(copies.len(), 3, "{r}");
+    for (copy, orig) in copies.iter().zip(&originals) {
+        assert_eq!(copy["original"].as_u64(), Some(*orig));
+        assert!(copy["path"].as_str().unwrap().ends_with("-Edit.tif"), "{copy}");
+        let new = lightcraft_catalog::PhotoId(copy["id"].as_u64().unwrap());
+        let st = s.catalog.stack_of(new).expect("stacked");
+        assert_eq!((st.top(), st.photos.contains(&lightcraft_catalog::PhotoId(*orig))), (new, true));
+        assert!(s.selection.contains(new), "the copies are selected");
+    }
+    assert_eq!(r["path"], copies[0]["path"], "the single-copy fields name the first copy");
+    // an edit since the first copy: identical bytes would be skipped as a duplicate import
+    s.execute("develop.set", &json!({"ids": [originals[1]], "control": "light.exposure", "value": 0.5})).unwrap();
+    let one = s.execute("photo.editExternal", &json!({"ids": [originals[1]]})).unwrap();
+    assert_eq!(one["copies"].as_array().map(Vec::len), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Edit in PhotoCraft (engine half): a flat 16-bit PSD `-Edit` copy, which PhotoCraft saves back
+/// to in place (it writes a TIFF only through Save As); its saved pixels come back on Reload.
+#[test]
+fn external_edit_copy_as_psd_round_trips() {
+    let dir = temp_dir("extedit-psd");
+    let src = dir.join("pier.png");
+    let capture = lightcraft_meta::DateTime::parse_iso("2023-05-14T14:40:39").unwrap();
+    let source_meta = lightcraft_meta::Metadata { capture_time: Some(capture), title: Some("Dated original".into()), ..Default::default() };
+    let exif = lightcraft_meta::write_exif(&source_meta);
+    let xmp = lightcraft_meta::write_xmp(&source_meta, None);
+    let rgba = lightcraft_raster::Rgba8::from_fn(40, 24, |x, y| [(x * 6) as u8, (y * 9) as u8, 40, 255]);
+    let png = lightcraft_codecs::encode_png(
+        &lightcraft_codecs::EncodeImage::rgba8(&rgba),
+        &lightcraft_codecs::EncodeMeta { exif: Some(&exif), xmp: Some(&xmp), ..Default::default() },
+    )
+    .unwrap();
+    std::fs::write(&src, png).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let orig = s.active().unwrap();
+    assert_eq!(s.catalog.photo(orig).unwrap().captured.as_deref(), Some("2023-05-14T14:40:39"));
+    s.execute("develop.set", &json!({"control": "light.exposure", "value": 0.5})).unwrap();
+    let r = s.execute("photo.editExternal", &json!({"format": "psd", "bitDepth": 16})).unwrap();
+    let path = r["path"].as_str().unwrap().to_string();
+    assert!(path.ends_with("pier-Edit.psd"), "{path}");
+    let d = lightcraft_codecs::decode(&std::fs::read(&path).unwrap(), Default::default()).unwrap();
+    assert_eq!(d.bit_depth, 16);
+    assert!(d.icc.is_some(), "the colour space travels with the file");
+    let new = lightcraft_catalog::PhotoId(r["id"].as_u64().unwrap());
+    assert_eq!(s.catalog.photo(new).unwrap().captured.as_deref(), Some("2023-05-14T14:40:39"));
+    let all_metadata = s.execute("photo.allMetadata", &json!({"id": new.0})).unwrap();
+    assert!(all_metadata["exif"].as_array().unwrap().iter().any(|row| row["tag"] == json!(0x9003)), "{all_metadata}");
+    assert!(
+        all_metadata["xmp"].as_array().unwrap().iter().any(|row| row["name"] == "dc:title" && row["value"] == "Dated original"),
+        "{all_metadata}"
+    );
+    assert_eq!(s.catalog.stack_of(new).map(|st| (st.top(), st.photos.contains(&orig))), Some((new, true)));
+    // the editor saves the document back over the same file: Reload shows its pixels
+    let before = s.render_now(new, 16, 16).unwrap().image.data;
+    let (w, h) = (d.width as u32, d.height as u32);
+    let px = vec![1000u16; (w * h * 3) as usize];
+    let saved =
+        lightcraft_codecs::encode_psd(&lightcraft_codecs::EncodeImage::new(w, h, 3, lightcraft_codecs::Samples::U16(&px)), &Default::default())
+            .unwrap();
+    std::fs::write(&path, saved).unwrap();
+    assert_eq!(s.execute("photo.reload", &json!({"ids": [new.0]})).unwrap()["reloaded"], json!([new.0]));
+    assert_ne!(s.render_now(new, 16, 16).unwrap().image.data, before);
+    // 8-bit, and what it can't do
+    s.execute("library.select", &json!({"ids": [orig.0]})).unwrap();
+    let r8 = s.execute("photo.editExternal", &json!({"format": "psd", "bitDepth": 8})).unwrap();
+    let d8 = lightcraft_codecs::decode(&std::fs::read(r8["path"].as_str().unwrap()).unwrap(), Default::default()).unwrap();
+    assert_eq!(d8.bit_depth, 8);
+    assert!(s.execute("photo.editExternal", &json!({"format": "jpeg"})).is_err());
+    assert!(s.execute("photo.editExternal", &json!({"bitDepth": 32})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn psb_import_retains_capture_time_and_all_metadata() {
+    let dir = temp_dir("import-psb-metadata");
+    let path = dir.join("dated.psb");
+    let capture = lightcraft_meta::DateTime::parse_exif("2023:05:14 14:40:39");
+    let metadata = lightcraft_meta::Metadata {
+        capture_time: capture,
+        gps: Some(lightcraft_meta::Gps { latitude: 45.0, longitude: 7.0, altitude: None }),
+        title: Some("PSB original".into()),
+        ..Default::default()
+    };
+    let bytes = synthetic_psb_with_metadata(&metadata);
+    assert_eq!(lightcraft_meta::extract(&bytes).capture_time, capture);
+    assert_eq!(lightcraft_meta::extract(&bytes).gps, metadata.gps);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut session = Session::new().with_fs();
+    let imported = session.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+    assert_eq!(imported["imported"].as_array().map(Vec::len), Some(1), "{imported}");
+    let id = session.catalog.photos().next().unwrap().id;
+    assert_eq!(session.catalog.photo(id).unwrap().captured.as_deref(), Some("2023-05-14T14:40:39"));
+    let all_metadata = session.execute("photo.allMetadata", &json!({"id": id.0})).unwrap();
+    assert!(all_metadata["exif"].as_array().unwrap().iter().any(|row| row["tag"] == json!(0x9003)), "{all_metadata}");
+    assert!(all_metadata["xmp"].as_array().unwrap().iter().any(|row| row["name"] == "dc:title" && row["value"] == "PSB original"), "{all_metadata}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reload: a file changed on disk (an external editor saved it) gets its new size / hash, the
 /// cached source is dropped and renders change; unchanged files are left alone.
 #[test]
@@ -634,14 +1211,14 @@ fn dng_export_compression_choices() {
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus"))
         .join("raw/nef-nikon-d5100-uncompressed.nef");
     if !corpus.exists() {
-        eprintln!("skip: {} absent", corpus.display());
+        lightcraft_testkit::skip!(Corpus, "{} absent", corpus.display());
         return;
     }
     let mut s = Session::new().with_fs();
     s.execute("library.import", &json!({"paths": [corpus.to_string_lossy()]})).unwrap();
     let id = s.active().unwrap();
     let mut sizes = Vec::new();
-    for c in ["lossless", "deflate", "uncompressed"] {
+    for c in ["lossless", "deflate", "uncompressed", "lossy"] {
         let o = crate::export::ExportOptions::from_json(&json!({"format": "dng", "dngCompression": c}));
         let mut out = Vec::new();
         let mut write = |_: &str, b: &[u8]| {
@@ -654,6 +1231,57 @@ fn dng_export_compression_choices() {
         sizes.push((c, out.len()));
     }
     assert!(sizes[2].1 > sizes[0].1 && sizes[2].1 > sizes[1].1, "uncompressed is the biggest: {sizes:?}");
+    assert!(sizes[3].1 < sizes[0].1 / 2, "lossy is much smaller than lossless: {sizes:?}");
+}
+
+/// Issue #1745: the DNG of a raw without colour matrices of its own (a Nikon Z 9 NEF) had no `ColorMatrix1`, and
+/// other raw converters refused it. Export as DNG and Convert / Copy as DNG now write the colour the raw opens with:
+/// the measured matrices of a camera that has them (Z f), the neutral fallback of one that doesn't (Z 9, whose
+/// look is fitted to its JPEG when there is one).
+#[test]
+fn dngs_of_raws_without_colour_matrices_carry_the_colour_they_open_with() {
+    use lightcraft_raw::color::{as_shot_white_xy, camera_transform, has_matrix};
+    let dir = temp_dir("dng-colour");
+    let samples = [[0.2, 0.3, 0.1], [0.05, 0.02, 0.4], [0.6, 0.6, 0.6], [0.01, 0.5, 0.03]];
+    let render = |t: &lightcraft_raw::color::CameraTransform, c: [f64; 3]| {
+        t.matrix.apply(std::array::from_fn(|i| c[i] * t.wb[i] as f64)).map(|v| v * t.baseline_exposure.exp2())
+    };
+    for (model, measured) in [("NIKON Z f", true), ("NIKON Z 9", false)] {
+        let metadata = lightcraft_meta::Metadata { make: Some("NIKON CORPORATION".into()), model: Some(model.into()), ..Default::default() };
+        let mut raw = lightcraft_raw::decode(&synthetic_dng_with(None, metadata)).unwrap();
+        // a vendor raw's colour: a white balance, no matrices
+        raw.color = lightcraft_raw::ColorData { as_shot_neutral: Some([0.5, 1.0, 0.7]), ..Default::default() };
+        let bytes = lightcraft_raw::write_dng(&raw, &Default::default()).unwrap();
+        let path = dir.join(format!("{model}.dng"));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut opened = lightcraft_raw::decode(&bytes).unwrap();
+        assert!(!has_matrix(&opened.color));
+        let (_, want, look) = crate::camera_preview::starting_colour(&mut opened, &bytes, None, None);
+        assert_eq!((want.matrix_is_fallback, look.is_none()), (!measured, true), "{model}");
+
+        let mut s = Session::new().with_fs();
+        s.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+        let id = s.active().unwrap();
+        let o = crate::export::ExportOptions::from_json(&json!({"format": "dng"}));
+        let mut exported = Vec::new();
+        let mut write = |_: &str, b: &[u8]| {
+            exported = b.to_vec();
+            Ok(())
+        };
+        crate::export::export_batch(&mut s, &[id], &o, &crate::export::Destination { dir: "x".into(), exact: None }, &mut write, &|_| false).unwrap();
+        let converted = crate::cmd::convert::write_dng_with(None, &path.to_string_lossy(), String::new()).unwrap();
+        for (how, dng) in [("export", exported), ("convert", std::fs::read(&converted).unwrap())] {
+            let back = lightcraft_raw::decode(&dng).unwrap();
+            assert!(back.color.color_matrix[0].is_some() && back.color.illuminant[0] != 0, "{model} {how}: {:?}", back.color);
+            let got = camera_transform(&back, as_shot_white_xy(&back));
+            for c in samples {
+                let (a, b) = (render(&want, c), render(&got, c));
+                assert!(a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3), "{model} {how} {c:?}: {a:?} vs {b:?}");
+            }
+        }
+        std::fs::remove_file(&converted).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn write_jpeg(path: &Path, capture: Option<&str>) {
@@ -820,6 +1448,38 @@ const OTHER_APP_SIDECAR: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTc
 </x:xmpmeta>
 <?xpacket end="w"?>"#;
 
+/// A foreign namespace may use a familiar prefix without becoming LightCraft-owned metadata.
+#[test]
+fn saving_preserves_foreign_namespace_prefix_collisions() {
+    let src = temp_dir("namespace-src");
+    let lib = temp_dir("namespace-lib");
+    write_png(&src.join("shot.png"), 1);
+    let foreign = r#"<rdf:Description xmlns:lc="https://example.org/vendor/" xmlns:xmp="https://example.org/vendor/"
+        lc:Secret="keep-me" xmp:Rating="2"><lc:Other>also keep</lc:Other></rdf:Description>"#;
+    let packet = format!(r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">{foreign}</rdf:RDF>"#);
+    let path = src.join("shot.xmp");
+    std::fs::write(&path, packet).unwrap();
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    s.execute("library.import", &json!({"paths": [src.join("shot.png")]})).unwrap();
+    let id = only(&s);
+    assert_eq!(s.catalog.photo(id).unwrap().rating, 0, "a foreign rating must not become catalog metadata");
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 5})).unwrap();
+    for _ in 0..2 {
+        let result = s.execute("photo.saveMetadataToFile", &json!({})).unwrap();
+        assert_eq!(result["failed"], json!([]), "{result}");
+        assert_eq!(result["backups"], json!([]), "a valid packet must merge: {result}");
+        assert_eq!(result["merged"], json!([path.to_string_lossy()]), "{result}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(foreign), "lost foreign bytes: {saved}");
+        assert_eq!(lightcraft_meta::parse_xmp(&saved).unwrap().metadata.rating, Some(5));
+    }
+    drop(s);
+    std::fs::remove_dir_all(src).unwrap();
+    std::fs::remove_dir_all(lib).unwrap();
+}
+
 /// Issue #92: saving merges into another app's sidecar instead of replacing it.
 #[test]
 fn saving_merges_into_another_apps_sidecar() {
@@ -914,4 +1574,70 @@ fn files_sharing_a_stem_get_their_own_sidecars() {
     assert_eq!((s.catalog.photo(j).unwrap().rating, s.catalog.photo(p).unwrap().rating), (2, 5));
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&lib);
+}
+
+/// Lossy DNG export: demosaiced JPEG tiles at the resize long edge, smaller than lossless, colour tags kept.
+#[test]
+fn lossy_dng_export_scales_and_shrinks() {
+    let src = temp_dir("lossydng");
+    std::fs::write(src.join("synth.dng"), synthetic_dng_with(None, Default::default())).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.catalog.photos().next().unwrap().id;
+    let mut export = |p: serde_json::Value| {
+        let o = crate::export::ExportOptions::from_json(&p);
+        let mut out = Vec::new();
+        let mut write = |_: &str, b: &[u8]| {
+            out = b.to_vec();
+            Ok(())
+        };
+        crate::export::export_batch(&mut s, &[id], &o, &crate::export::Destination { dir: "x".into(), exact: None }, &mut write, &|_| false).unwrap();
+        out
+    };
+    let lossless = export(json!({"format": "dng"}));
+    let lossy = export(json!({"format": "dng", "dngCompression": "lossy", "quality": 80, "longEdge": 32}));
+    let raw = lightcraft_raw::decode(&lossy).unwrap();
+    assert_eq!((raw.cpp, raw.cfa.is_none(), raw.width.max(raw.height)), (3, true, 32));
+    assert_eq!(raw.color.as_shot_neutral, Some([0.5, 1.0, 0.7]));
+    assert!(lossy.len() < lossless.len(), "{} vs {}", lossy.len(), lossless.len());
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// An automatic sidecar write that fails (here the folder is read-only, as a network share that dropped out or went
+/// read-only) waits instead of being forgotten, and `library.retrySidecars` writes it once the folder takes writes
+/// again.
+#[cfg(unix)]
+#[test]
+fn a_failed_auto_write_waits_and_is_written_on_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let src = temp_dir("auto-retry");
+    write_png(&src.join("a.png"), 4);
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    s.execute("library.xmpPreferences", &json!({"autoWrite": true})).unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // (root writes anyway: nothing to test there)
+    if std::fs::write(src.join(".probe"), b"x").is_ok() {
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    s.execute("photo.rate", &json!({"rating": 4})).unwrap();
+    let sidecar = src.join("a.xmp");
+    assert!(!sidecar.exists());
+    assert_eq!(s.unsaved_sidecars(), 1, "the failed write waits");
+    let r = s.execute("library.retrySidecars", &json!({})).unwrap();
+    assert_eq!(r, json!({"written": 0, "waiting": 1}), "still read-only");
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = s.execute("library.retrySidecars", &json!({})).unwrap();
+    assert_eq!(r, json!({"written": 1, "waiting": 0}));
+    assert!(std::fs::read_to_string(&sidecar).unwrap().contains("<xmp:Rating>4</xmp:Rating>"));
+    // a later edit that writes fine leaves nothing waiting; turning auto-write off drops what still waits
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
+    s.execute("photo.rate", &json!({"rating": 3})).unwrap();
+    assert_eq!(s.unsaved_sidecars(), 1);
+    s.execute("library.xmpPreferences", &json!({"autoWrite": false})).unwrap();
+    s.execute("library.retrySidecars", &json!({})).unwrap();
+    assert_eq!(s.unsaved_sidecars(), 0);
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_dir_all(&src);
 }

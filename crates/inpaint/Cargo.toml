@@ -1,0 +1,14 @@
+[package]
+name = "lightcraft-inpaint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-aware hole filling: PatchMatch-based patch completion and membrane fill (L1). Ported from PhotoCraft"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }

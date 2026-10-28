@@ -63,8 +63,16 @@ fn dev() -> Result<&'static Dev, String> {
     if let Some(why) = crate::switched_off() {
         return Err(why);
     }
+    // creating the device is GPU work too: not once the process is ending (issue #620)
+    let _work = match DEV.get() {
+        Some(_) => None,
+        None => Some(crate::exit::enter().ok_or(CLOSING)?),
+    };
     DEV.get_or_init(create_device).as_ref().map_err(|e| e.clone())
 }
+
+/// Why nothing runs on the GPU once [`crate::begin_shutdown`] was called.
+const CLOSING: &str = "LightCraft is closing";
 
 fn create_device() -> Result<Dev, String> {
     let Some(backends) = crate::backend::compute_backends() else { return Err("disabled by LIGHTCRAFT_GPU_BACKEND=off".into()) };
@@ -76,6 +84,10 @@ fn create_device() -> Result<Dev, String> {
 fn make_device(backends: wgpu::Backends) -> Result<Dev, String> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = backends;
+    // DX12 shaders compile with FXC (issue #471)
+    desc.backend_options = crate::backend::backend_options();
+    // no indirect-call validation pipeline: Intel Metal fails to compile it (#250)
+    desc.flags = crate::backend::instance_flags_from_env(desc.flags);
     let instance = wgpu::Instance::new(desc);
     let wanted = std::env::var("LIGHTCRAFT_GPU_ADAPTER").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
     let adapter = match &wanted {
@@ -149,7 +161,8 @@ struct ConvParams {
     cout: u32,
     leaky: u32,
     alpha: f32,
-    pad: u32,
+    /// Always 0: the kernel steps its output stores by `1 + zero`, so FXC cannot merge them (`nn_conv.wgsl`).
+    zero: u32,
 }
 
 #[repr(C)]
@@ -337,7 +350,7 @@ fn plan(net: &Net, tile: usize, max_binding: u64) -> Result<(Layout, Vec<Layer>)
                     cout: c.cout as u32,
                     leaky: u32::from(c.leaky.is_some()),
                     alpha: c.leaky.unwrap_or(0.0),
-                    pad: 0,
+                    zero: 0,
                 };
                 let src = get(&place, c.src)?;
                 let src2 = c.src2.map(|t| get(&place, t)).transpose()?;
@@ -404,7 +417,7 @@ fn plan(net: &Net, tile: usize, max_binding: u64) -> Result<(Layout, Vec<Layer>)
                     cout: c.cout as u32,
                     leaky: u32::from(c.leaky.is_some()),
                     alpha: c.leaky.unwrap_or(0.0),
-                    pad: 0,
+                    zero: 0,
                 };
                 let src = get(&place, c.src)?;
                 let slot = alloc((4 * m * c.cout * 4) as u64, &mut slots, &mut free);
@@ -509,7 +522,6 @@ fn conv_source(bm: u32, bn: u32, bk: u32) -> String {
         .replace("{{BM}}", &bm.to_string())
         .replace("{{BN}}", &bn.to_string())
         .replace("{{BK}}", &bk.to_string())
-        .replace("{{A_VECS}}", &(bk * bm / 4).to_string())
         .replace("{{B_VECS}}", &(bk * bn / 4).to_string())
 }
 
@@ -652,6 +664,7 @@ pub struct NetRunner {
 /// Put `net` on the GPU for `tile × tile` input cells, or say why it cannot be (no GPU, a layer or a size the kernels
 /// do not do, the device refusing the buffers). Creates the device on first use and compiles the kernels.
 pub fn runner(net: &Net, tile: usize) -> Result<NetRunner, String> {
+    let _work = crate::exit::enter().ok_or(CLOSING)?;
     let d = dev()?;
     let max_binding = d.limits.max_storage_buffer_binding_size.min(d.limits.max_buffer_size).min(MAX_BUFFER);
     let (layout, layers) = plan(net, tile, max_binding)?;
@@ -660,7 +673,8 @@ pub fn runner(net: &Net, tile: usize) -> Result<NetRunner, String> {
         d.device.push_error_scope(wgpu::ErrorFilter::Validation),
         d.device.push_error_scope(wgpu::ErrorFilter::Internal),
     ];
-    let pipes = build_pipelines(d, &layout);
+    // the driver compiles the kernels here: a crash in it is reported at the next launch (issue #250)
+    let pipes = crate::backend::with_marker("denoise kernel compilation", || build_pipelines(d, &layout));
     let weights: Vec<(wgpu::Buffer, wgpu::Buffer)> = layers
         .iter()
         .map(|l| {
@@ -838,6 +852,8 @@ impl TileRunner for NetRunner {
         if input.len() != self.shared.layout.in_floats {
             return Err(Error::Input("the tile is not the size the model wants".into()));
         }
+        // one tile is one piece of GPU work: a photo's worth would outlast any wait at exit
+        let Some(_work) = crate::exit::enter() else { return Err(Error::Runtime(CLOSING.into())) };
         let w = self.take()?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.execute(&w, input)));
         match r {
@@ -892,7 +908,7 @@ mod tests {
         match runner(net, tile) {
             Ok(r) => Some(r),
             Err(e) => {
-                eprintln!("skipped: no GPU runner here ({e})");
+                lightcraft_testkit::skip!(Gpu, "no GPU runner here ({e})");
                 None
             }
         }
@@ -900,8 +916,47 @@ mod tests {
 
     fn worst(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
+        assert!(a.iter().chain(b).all(|v| v.is_finite()), "non-finite denoise output");
         let scale = b.iter().fold(1e-3f32, |m, v| m.max(v.abs()));
         a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+    }
+
+    /// A 1 × 1 convolution from 4 channels to `cout` that copies input channel `co % 4` to each output channel `co`.
+    fn copy(src: usize, cout: usize) -> Op {
+        let mut weight = vec![0f32; cout * 4];
+        for co in 0..cout {
+            weight[co * 4 + co % 4] = 1.0;
+        }
+        Op::Conv(lightcraft_denoise::net::Conv { src, src2: None, cin: 4, cout, k: 1, weight, bias: vec![0.0; cout], leaky: None })
+    }
+
+    /// Two 1 × 1 layers that only copy channels, so the right answer is exact: the first layer's stores (mode 0) went
+    /// wrong on DX12 with FXC on an NVIDIA GTX 1070, where every second pixel came out with its channels shifted.
+    #[test]
+    fn a_layer_stores_every_pixels_channels_where_the_next_reads_them() {
+        let n = Net::new(4, vec![copy(0, 4), copy(1, 12), Op::DepthToSpace2 { src: 2 }]).unwrap();
+        let Some(g) = gpu(&n, 3) else { return };
+        let x: Vec<f32> = (1..=36).map(|i| i as f32).collect();
+        assert_eq!(g.run(&x).unwrap(), reference::run(&n, 3, &x).unwrap());
+    }
+
+    /// The same for a transposed convolution's stores (mode 1): a max-pool halves the tile, and the 2 × 2 transposed
+    /// convolution copies each pooled pixel's channels to the four pixels it becomes.
+    #[test]
+    fn a_transposed_convolution_stores_every_pixels_channels_where_the_next_reads_them() {
+        use lightcraft_denoise::net::ConvT2;
+        // [cin][cout][2][2]: channel c to channel c at all four places
+        let mut weight = vec![0f32; 4 * 4 * 4];
+        for c in 0..4 {
+            for q in 0..4 {
+                weight[(c * 4 + c) * 4 + q] = 1.0;
+            }
+        }
+        let up = Op::ConvT2(ConvT2 { src: 1, cin: 4, cout: 4, weight, bias: vec![0.0; 4], leaky: None });
+        let n = Net::new(4, vec![Op::MaxPool2 { src: 0 }, up, copy(2, 12), Op::DepthToSpace2 { src: 3 }]).unwrap();
+        let Some(g) = gpu(&n, 6) else { return };
+        let x: Vec<f32> = (1..=144).map(|i| i as f32).collect();
+        assert_eq!(g.run(&x).unwrap(), reference::run(&n, 6, &x).unwrap());
     }
 
     #[test]
@@ -920,6 +975,21 @@ mod tests {
             let e = worst(&got, &want);
             eprintln!("{}: tile {tile}, {ch} channels, depth {depth}: off by {e:e} of the output's size", g.adapter());
             assert!(e < 2e-4, "tile {tile}, {ch} channels, depth {depth}: the GPU is off by {e:e} of the output's size");
+        }
+    }
+
+    // Issue #479: several pixels loaded by different invocations shared a vec4,
+    // so lane writes raced on Metal. Exercise a partial block repeatedly with new
+    // inputs; stale shared-memory values must never leak into the next dispatch.
+    #[test]
+    fn partial_tiles_remain_correct_when_reusing_a_runner() {
+        let n = net(3, 4, 0, 8);
+        let Some(g) = gpu(&n, 3) else { return };
+        for seed in 100..112 {
+            let x = picture(4 * 3 * 3, seed);
+            let want = reference::run(&n, 3, &x).unwrap();
+            let e = worst(&g.run(&x).unwrap(), &want);
+            assert!(e < 2e-4, "seed {seed}: off by {e:e}");
         }
     }
 
@@ -1020,7 +1090,6 @@ mod tests {
             .replace("{{BM}}", &bm.to_string())
             .replace("{{BN}}", &bn.to_string())
             .replace("{{BK}}", &bk.to_string())
-            .replace("{{A_VECS}}", &(bk * bm / 4).to_string())
             .replace("{{B_VECS}}", &(bk * bn / 4).to_string());
         let d = dev().unwrap();
         let layout = conv_bgl(d);

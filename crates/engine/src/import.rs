@@ -6,6 +6,8 @@
 //! 3. Probe the rest — dimensions, metadata, and the **content hash** of the bytes — in parallel
 //!    on native targets.
 //! 4. Skip **duplicates by content** (same bytes already in the library, or twice in this batch).
+//!    A duplicate (by path or content) of a photo in Recently Deleted is restored instead, with
+//!    its edits, unless the import says otherwise ([`OnDeleted`]).
 //! 5. *Add* in place (the photo points at the original file), *copy* into the library's
 //!    `Originals/YYYY/YYYY-MM-DD/` folder (names made unique) and point at the copy, or *move*
 //!    there: placed like a copy (with its XMP sidecars), and the original removed only once its
@@ -30,11 +32,15 @@ use serde::{Deserialize, Serialize};
 use crate::Session;
 use crate::media::ProbeInfo;
 
-/// File extensions LightCraft imports (lower case).
+/// File extensions offered by import discovery and file pickers (lower case).
+/// This includes preview-only raws; the file probe decides whether sensor decoding is available.
 pub const EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "tif", "tiff", "webp", "dng", "cr2", "cr3", "nef", "nrw", "arw", "raf", "orf", "rw2", "rwl", "raw", "pef", "psd", "jxl",
-    "gif", "bmp", "heic", "avif", // containers LightCraft cannot decode but imports as preview only (their embedded JPEG)
-    "iiq", "crw", "mrw", "x3f", "kdc", "mos", "erf",
+    "jpg", "jpeg", "png", "tif", "tiff", "webp", "dng", "cr2", "cr3", "nef", "nrw", "arw", "sr2", "srf", "raf", "orf", "rw2", "rwl", "raw", "pef",
+    "srw", "psd", "psb", "jxl", "gif", "bmp",
+    // Decoded when built with the codecs' `heif` feature; otherwise the import reports them as
+    // failed with the reason ("HEIC/HEIF support isn't included in this build").
+    "heic", "heif", "avif", // no AV1 decoder yet: reported as failed, like a HEIC without the feature
+    "iiq", "crw", "mrw", "x3f", "kdc", "mos", "erf", "3fr", "fff", "mef",
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,12 +56,19 @@ pub enum ImportMode {
 }
 
 /// What an import does with a file the library already has in Recently Deleted.
+///
+/// Someone who imports such a file wants the photo in the library again, so the default brings
+/// it back (issues #298, #706: before, the import skipped it as "already in the library" while
+/// the grid showed it deleted, and the user was stuck). Restoring loses nothing — the edits,
+/// rating and albums come back with the photo and Reset Edits gives a clean start — where
+/// importing afresh would silently drop them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OnDeleted {
     /// Leave it there; the report says so ([`Duplicate::existing_deleted`]).
-    #[default]
     Skip,
-    /// Bring the trashed photo back, with its edits ([`ImportReport::restored`]).
+    /// Bring the trashed photo back, with its edits ([`ImportReport::restored`]); a photo whose
+    /// file is no longer where the library had it is relinked to the imported file.
+    #[default]
     Restore,
     /// Delete the trashed record permanently and import the file as a new photo.
     Fresh,
@@ -75,7 +88,7 @@ impl OnDeleted {
 /// What an import does besides adding the photos.
 #[derive(Clone, Debug, Default)]
 pub struct ImportOptions {
-    /// A file that is in Recently Deleted: skip (default), restore, or import afresh.
+    /// A file that is in Recently Deleted: restore (default), skip, or import afresh.
     pub on_deleted: OnDeleted,
     pub mode: ImportMode,
     /// Applied to every imported photo (one History entry).
@@ -202,6 +215,48 @@ pub struct ImportReport {
     pub scanned: usize,
     /// Photos whose metadata/develop settings were read from an XMP sidecar (or embedded XMP).
     pub sidecars: usize,
+    /// Per-photo diagnostics from foreign XMP develop settings that could not be fully carried over.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ImportWarning>,
+}
+
+/// A structured diagnostic from foreign XMP develop settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportWarningCode {
+    /// A named camera profile was found but cannot be applied as Lightroom does.
+    CameraProfile,
+    /// Lightroom geometry data was found but its saved transform is not retained.
+    UprightGeometry,
+    /// One or more other XMP develop fields have no LightCraft mapping.
+    UnmappedXmp,
+}
+
+/// The saved Lightroom Upright mode associated with a foreign geometry transform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportUprightMode {
+    Off,
+    Auto,
+    Level,
+    Vertical,
+    Full,
+    Guided,
+    Unknown,
+}
+
+/// One actionable XMP import diagnostic. `path` is filled when its photo is committed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportWarning {
+    pub path: String,
+    pub code: ImportWarningCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ImportUprightMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
 }
 
 /// A file moved by an import.
@@ -260,6 +315,8 @@ pub struct ImportDefaults {
     pub auto_folder: Option<String>,
     pub auto_copy: bool,
     pub auto_album: Option<String>,
+    /// Open the import review when a camera or memory card is connected.
+    pub show_on_card: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -321,6 +378,42 @@ pub fn is_supported(path: &Path) -> bool {
     path.extension().is_some_and(|e| EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
 
+/// The web file picker's accept list, derived from [`EXTENSIONS`]. Each extension
+/// is listed in both cases: browsers' `accept` matching is case-insensitive per
+/// spec, but some implementations (e.g. Windows/Edge) match case-sensitively and
+/// rejected uppercase `.NEF` files, so a lowercase-only list silently hid raws
+/// such as CR3, NRW, RAF, ORF, RW2, RWL, RAW, PEF and SRW from the picker.
+///
+/// The picker only offers files this build can actually import: `.avif` has no
+/// AV1 decoder in any build, and `.heic`/`.heif` decode only when the codecs'
+/// `heif` feature is enabled ([`lightcraft_codecs::Format::Heif::can_decode`]).
+/// [`EXTENSIONS`] itself stays complete — files on disk are still recognised,
+/// and import reports them as failed, saying why.
+pub fn accept_list() -> String {
+    let heif_decodable = lightcraft_codecs::Format::Heif.can_decode();
+    let mut out = String::new();
+    for &ext in EXTENSIONS {
+        // Skip extensions a web user could pick but this build could not import.
+        let pickable = match ext {
+            "avif" => false,
+            "heic" | "heif" => heif_decodable,
+            _ => true,
+        };
+        if !pickable {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push('.');
+        out.push_str(ext);
+        out.push(',');
+        out.push('.');
+        out.push_str(&ext.to_uppercase());
+    }
+    out
+}
+
 /// Expand files and folders (recursively) into supported files. `skip` (e.g. the library folder)
 /// is never descended into. Each folder's walk is bounded ([`crate::walk::Limits::default`]); a
 /// walk that stops at a bound is logged.
@@ -330,6 +423,17 @@ pub fn expand(paths: &[String], skip: Option<&Path>) -> Vec<String> {
 
 /// [`expand`] with the walk bounded by `limits` → (files, whether a walk stopped at a bound).
 pub fn expand_within(paths: &[String], skip: Option<&Path>, limits: crate::walk::Limits) -> (Vec<String>, bool) {
+    expand_noting(paths, skip, limits, None)
+}
+
+/// [`expand_within`], handing the listing of every folder that is walked to `note`
+/// ([`crate::walk::files_in_noting`]).
+pub(crate) fn expand_noting(
+    paths: &[String],
+    skip: Option<&Path>,
+    limits: crate::walk::Limits,
+    mut note: Option<crate::walk::NoteFolder>,
+) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let mut truncated = false;
     for p in paths {
@@ -338,7 +442,10 @@ pub fn expand_within(paths: &[String], skip: Option<&Path>, limits: crate::walk:
             continue;
         }
         if p.is_dir() {
-            let w = crate::walk::files_in(p, skip, limits, is_supported);
+            let w = match note.as_mut() {
+                Some(note) => crate::walk::files_in_noting(p, skip, limits, is_supported, &mut **note),
+                None => crate::walk::files_in(p, skip, limits, is_supported),
+            };
             if w.truncated {
                 log::warn!(
                     "import: stopped looking in {} after {} entries (limits: {} entries, {} folder levels)",
@@ -416,10 +523,24 @@ pub fn launch_path(arg: &str, cwd: Option<&Path>, home: Option<&Path>, dcim: imp
 
 /// Probe files (headers + content hash) as an import would.
 pub(crate) fn probe_paths(s: &Session, paths: &[String]) -> Vec<Result<ProbeInfo, String>> {
-    probe_all(s.media.file_probe.as_ref(), paths, &ScanProgress::default())
+    let progress = ScanProgress::default();
+    probe_all(s.media.file_probe.as_ref(), paths, &progress.done, &progress.cancel)
 }
 
-fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress: &ScanProgress) -> Vec<Result<ProbeInfo, String>> {
+/// Probe files with `probe` (a clone of the session's file probe), off the session: on a worker thread.
+pub(crate) fn probe_with(probe: &crate::media::FileProbe, paths: &[String]) -> Vec<Result<ProbeInfo, String>> {
+    let progress = ScanProgress::default();
+    probe_all(Some(probe), paths, &progress.done, &progress.cancel)
+}
+
+/// Probe `paths` (several at once), counting each in `done`. Stops before the next file once
+/// `cancel` is set: the files not reached come back as errors.
+pub(crate) fn probe_all(
+    probe: Option<&crate::media::FileProbe>,
+    paths: &[String],
+    done: &std::sync::atomic::AtomicUsize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<Result<ProbeInfo, String>> {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(probe) = probe.cloned() else {
         return paths
@@ -447,11 +568,11 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
                             if i >= paths.len() {
                                 break;
                             }
-                            if progress.cancel.load(Relaxed) {
+                            if cancel.load(Relaxed) {
                                 break;
                             }
                             let r = probe(&paths[i]);
-                            progress.done.fetch_add(1, Relaxed);
+                            done.fetch_add(1, Relaxed);
                             out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
                         }
                     });
@@ -463,11 +584,11 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
     paths
         .iter()
         .map(|p| {
-            if progress.cancel.load(Relaxed) {
+            if cancel.load(Relaxed) {
                 return Err("cancelled".into());
             }
             let r = probe(p);
-            progress.done.fetch_add(1, Relaxed);
+            done.fetch_add(1, Relaxed);
             r
         })
         .collect()
@@ -490,10 +611,60 @@ fn copy_into(dir: &Path, src: &str, name: Option<&str>, probe_hash: Option<&str>
 pub struct ScanInput {
     probe: Option<crate::media::FileProbe>,
     skip: Option<PathBuf>,
-    /// path → (photo, its summary) for files already in the library.
-    by_path: HashMap<PathBuf, (PhotoId, ImportCandidate)>,
-    by_hash: HashMap<String, PhotoId>,
+    /// The library as it is now (photos are shared with the session, not copied): looked up for
+    /// the files the scan finds ([`library_files`]) and the contents it probes
+    /// ([`library_hashes`]), on the scan's thread.
+    library: std::sync::Arc<lightcraft_catalog::Catalog>,
     cache: HashMap<String, ProbeInfo>,
+}
+
+/// The library's photos of `files`: path → (photo, its summary as a candidate that is there
+/// already). One pass over the library, and a record only for a file that was found: a folder of
+/// a hundred files in a library of millions costs a hundred records.
+fn library_files(library: &lightcraft_catalog::Catalog, files: &[String]) -> HashMap<PathBuf, (PhotoId, ImportCandidate)> {
+    let found: std::collections::HashSet<&Path> = files.iter().map(Path::new).collect();
+    let mut by_path = HashMap::new();
+    if found.is_empty() {
+        return by_path;
+    }
+    for p in library.photos() {
+        if let Source::File { path } = &p.source
+            && found.contains(Path::new(path))
+        {
+            let c = ImportCandidate {
+                path: path.clone(),
+                format: p.format.clone(),
+                kind: p.kind,
+                width: p.width,
+                height: p.height,
+                file_size: p.file_size,
+                captured: p.captured.clone(),
+                duplicate: Some("path".into()),
+                existing: Some(p.id.0),
+                ..Default::default()
+            };
+            by_path.insert(PathBuf::from(path), (p.id, c));
+        }
+    }
+    by_path
+}
+
+/// Which photo of the library has each of the contents `hashes` (the later one where several
+/// have it). One pass over the library, and an entry only for a content that was asked about.
+fn library_hashes<'a>(library: &lightcraft_catalog::Catalog, hashes: impl Iterator<Item = &'a str>) -> HashMap<String, PhotoId> {
+    let wanted: std::collections::HashSet<&str> = hashes.collect();
+    let mut by_hash = HashMap::new();
+    if wanted.is_empty() {
+        return by_hash;
+    }
+    for p in library.photos() {
+        if let Some(h) = &p.content_hash
+            && wanted.contains(h.as_str())
+        {
+            by_hash.insert(h.clone(), p.id);
+        }
+    }
+    by_hash
 }
 
 /// Progress and cancellation of a running [`scan_with`].
@@ -502,7 +673,8 @@ pub struct ScanProgress {
     /// Files to probe, set once the folders are expanded.
     pub total: std::sync::atomic::AtomicUsize,
     pub done: std::sync::atomic::AtomicUsize,
-    pub cancel: std::sync::atomic::AtomicBool,
+    /// Shared with the scan's row in the activity stack (its ✕ sets it).
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The result of [`scan_with`]: the candidates, and the probes to keep for the import that follows.
@@ -514,30 +686,21 @@ pub struct ScanOutput {
 impl ScanInput {
     pub fn new(s: &mut Session, paths: &[String]) -> (Self, Vec<String>) {
         let skip = s.library.as_ref().filter(|l| l.on_disk).map(|l| l.dir.clone());
-        let mut by_path = HashMap::new();
-        let mut by_hash = HashMap::new();
-        for p in s.catalog.photos() {
-            if let Source::File { path } = &p.source {
-                let c = ImportCandidate {
-                    path: path.clone(),
-                    format: p.format.clone(),
-                    kind: p.kind,
-                    width: p.width,
-                    height: p.height,
-                    file_size: p.file_size,
-                    captured: p.captured.clone(),
-                    duplicate: Some("path".into()),
-                    existing: Some(p.id.0),
-                    ..Default::default()
-                };
-                by_path.insert(PathBuf::from(path), (p.id, c));
-            }
-            if let Some(h) = &p.content_hash {
-                by_hash.insert(h.clone(), p.id);
-            }
-        }
-        let input = ScanInput { probe: s.media.file_probe.clone(), skip, by_path, by_hash, cache: std::mem::take(&mut s.import_probes) };
+        // (no table of the library here: this is the session's thread, and the library may hold
+        // millions of photos. The scan looks up what it finds)
+        let library = std::sync::Arc::new(s.catalog.clone());
+        let input = ScanInput { probe: s.media.file_probe.clone(), skip, library, cache: std::mem::take(&mut s.import_probes) };
         (input, paths.to_vec())
+    }
+
+    /// The folder a scan never enters (the library's own).
+    pub(crate) fn skip(&self) -> Option<&Path> {
+        self.skip.as_deref()
+    }
+
+    /// The library as the scan sees it (shared, for [`crate::sync`], which looks at the same one).
+    pub(crate) fn library(&self) -> std::sync::Arc<lightcraft_catalog::Catalog> {
+        std::sync::Arc::clone(&self.library)
     }
 }
 
@@ -553,32 +716,46 @@ pub fn scan(s: &mut Session, paths: &[String]) -> Vec<ImportCandidate> {
 
 /// [`scan`] without the session, so it can run on a worker thread. Stops early (returning what it
 /// has) when `progress.cancel` is set.
-pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress) -> ScanOutput {
-    use std::sync::atomic::Ordering::Relaxed;
+pub fn scan_with(input: ScanInput, paths: &[String], progress: &ScanProgress) -> ScanOutput {
     let files = expand(paths, input.skip.as_deref());
-    let todo: Vec<String> = files.iter().filter(|f| !input.by_path.contains_key(Path::new(f))).cloned().collect();
+    scan_files(input, files, progress)
+}
+
+/// [`scan_with`] for files that were found already (`paths` expanded, [`expand`]).
+pub(crate) fn scan_files(mut input: ScanInput, files: Vec<String>, progress: &ScanProgress) -> ScanOutput {
+    use std::sync::atomic::Ordering::Relaxed;
+    let by_path = library_files(&input.library, &files);
+    let todo: Vec<String> = files.iter().filter(|f| !by_path.contains_key(Path::new(f))).cloned().collect();
     progress.total.store(todo.len(), Relaxed);
     // probes from a preceding `scan` are reused when the file is unchanged (same size)
     let cached: Vec<Option<ProbeInfo>> = todo
         .iter()
         .map(|f| {
             let info = input.cache.remove(f)?;
+            // (✕ set while the files' cached probes are checked: no more round trips to the disk; what is
+            // not reached counts as not probed, like the files after it)
+            if progress.cancel.load(Relaxed) {
+                return None;
+            }
             let size = std::fs::metadata(f).map(|m| m.len()).ok();
             (size.is_none() || size == Some(info.file_size)).then_some(info)
         })
         .collect();
     let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
     progress.done.store(todo.len() - missing.len(), Relaxed);
-    let mut fresh = probe_all(input.probe.as_ref(), &missing, progress).into_iter();
+    let mut fresh = probe_all(input.probe.as_ref(), &missing, &progress.done, &progress.cancel).into_iter();
     let probed: Vec<Result<ProbeInfo, String>> =
         cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
     crate::memory::release();
     let mut probes: HashMap<String, Result<ProbeInfo, String>> = todo.into_iter().zip(probed).collect();
-    let mut seen_hash: HashMap<String, Option<u64>> = input.by_hash.into_iter().map(|(h, id)| (h, Some(id.0))).collect();
+    // (who in the library has a content that was probed: asked once the probes are in)
+    let probed_hashes = probes.values().filter_map(|r| r.as_ref().ok()).filter_map(|info| info.content_hash.as_deref());
+    let mut seen_hash: HashMap<String, Option<u64>> =
+        library_hashes(&input.library, probed_hashes).into_iter().map(|(h, id)| (h, Some(id.0))).collect();
     let mut out = Vec::with_capacity(files.len());
     let mut kept = HashMap::new();
     for f in files {
-        if let Some((_, c)) = input.by_path.get(Path::new(&f)) {
+        if let Some((_, c)) = by_path.get(Path::new(&f)) {
             let mut c = c.clone();
             c.name = Path::new(&f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
             out.push(c);
@@ -590,6 +767,8 @@ pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress
             Some(Ok(info)) => {
                 (c.format, c.kind, c.width, c.height, c.file_size, c.captured) =
                     (info.format.clone(), info.kind, info.width, info.height, info.file_size, info.captured.clone());
+                // as the import will date it (a sidecar's date, when there is one, still wins there)
+                c.captured = c.captured.or_else(|| info.file_modified.clone());
                 c.preview_only = info.preview_only.clone();
                 if let Some(h) = &info.content_hash {
                     match seen_hash.get(h) {
@@ -640,6 +819,12 @@ pub struct ImportJob {
     mode: ImportMode,
     lib_dir: Option<PathBuf>,
     copy_root: Option<PathBuf>,
+    /// The library as it was when the import was set up, until it is looked up
+    /// ([`ImportJob::look_up_library`], with the first files): setting an import up is the
+    /// session's thread, and a table of a library of millions of photos takes seconds. With it,
+    /// whether a photo in Recently Deleted is passed over (an import that replaces such photos,
+    /// as the options said when the import was set up).
+    library: Option<(lightcraft_catalog::Catalog, bool)>,
     /// path → (photo, a Local browse record?)
     by_path: HashMap<String, (PhotoId, bool)>,
     /// content hash → the photo that has it (`None`: a file earlier in this import)
@@ -654,6 +839,10 @@ pub struct ImportJob {
     /// Files found so far (folders expanded) and handled so far, for progress.
     pub total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Of those, the files that have to be read first (not probed by a preceding scan) and the
+    /// ones read so far: the step before they are handled.
+    pub read_total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub read_done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The outcome of [`ImportJob::prepare`] for one batch, in file order.
@@ -777,28 +966,16 @@ impl ImportJob {
         if matches!(mode, ImportMode::Copy | ImportMode::Move) && copy_root.is_none() {
             return Err(crate::EngineError::Other("copying or moving needs a destination folder or an open library".into()));
         }
-        let mut by_path = HashMap::new();
-        let mut by_hash = HashMap::new();
-        for p in s.catalog.photos() {
-            // a trashed photo is replaced by a fresh import, so it doesn't count as a duplicate
-            if p.deleted && opts.on_deleted == OnDeleted::Fresh {
-                continue;
-            }
-            if let Source::File { path } = &p.source {
-                by_path.insert(path.clone(), (p.id, p.local));
-            }
-            if let Some(h) = &p.content_hash {
-                by_hash.insert(h.clone(), Some(p.id));
-            }
-        }
+        let fresh = opts.on_deleted == OnDeleted::Fresh;
         Ok(ImportJob {
             seq: opts.rename_start.max(1),
             opts,
             mode,
             lib_dir,
             copy_root,
-            by_path,
-            by_hash,
+            library: Some((s.catalog.clone(), fresh)),
+            by_path: HashMap::new(),
+            by_hash: HashMap::new(),
             probe: s.media.file_probe.clone(),
             file_bytes: s.media.file_bytes.clone(),
             cache: std::mem::take(&mut s.import_probes),
@@ -806,6 +983,8 @@ impl ImportJob {
             now: (s.clock)(),
             total: Default::default(),
             done: Default::default(),
+            read_total: Default::default(),
+            read_done: Default::default(),
         })
     }
 
@@ -831,9 +1010,32 @@ impl ImportJob {
         &self.now
     }
 
+    /// What the library held when the import was set up, by path and by content: made once, with
+    /// the first files (on the thread that prepares them), from the library as it was then. The
+    /// snapshot comes back: the files the import is adding are ranked against it for the ownership
+    /// of the shared stem sidecars they read ([`crate::sidecar::ImportStems`]).
+    fn look_up_library(&mut self) -> Option<lightcraft_catalog::Catalog> {
+        let (library, fresh) = self.library.take()?;
+        for p in library.photos() {
+            // a trashed photo is replaced by a fresh import, so it doesn't count as a duplicate
+            if p.deleted && fresh {
+                continue;
+            }
+            if let Source::File { path } = &p.source {
+                self.by_path.insert(path.clone(), (p.id, p.local));
+            }
+            if let Some(h) = &p.content_hash {
+                self.by_hash.insert(h.clone(), Some(p.id));
+            }
+        }
+        Some(library)
+    }
+
     /// [`ImportJob::prepare`] for files [`ImportJob::expand`] returned.
     pub fn prepare_files(&mut self, files: Vec<String>, cancel: &std::sync::atomic::AtomicBool) -> Prepared {
         use std::sync::atomic::Ordering::Relaxed;
+        // the library as it was, kept for the ownership of the shared stem sidecars below
+        let library = self.look_up_library();
         let opts = self.opts.clone();
         let mode = self.mode;
         let mut out = Prepared { scanned: files.len(), items: Vec::new() };
@@ -854,14 +1056,32 @@ impl ImportJob {
             }
         }
 
-        // files a preceding scan already probed are not read again (a network share is slow to read)
-        let cached: Vec<Option<ProbeInfo>> = todo.iter().map(|f| self.cache.remove(f)).collect();
+        // files a preceding scan already probed are not read again (a network share is slow to read),
+        // as long as they are still there, as they were: a file gone or changed since is probed again
+        let cached: Vec<Option<ProbeInfo>> = todo
+            .iter()
+            .map(|f| {
+                // (the web's files are not std::fs files: kept as probed)
+                self.cache
+                    .remove(f)
+                    .filter(|info| cfg!(target_arch = "wasm32") || std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.len() == info.file_size))
+            })
+            .collect();
         let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
-        let progress = ScanProgress::default();
-        let mut fresh = probe_all(self.probe.as_ref(), &missing, &progress).into_iter();
+        // Reading the files is the slow part of adding them where they are: it is counted on its
+        // own, and `cancel` stops it too (a large library takes long enough to want both).
+        self.read_total.fetch_add(missing.len(), Relaxed);
+        let mut fresh = probe_all(self.probe.as_ref(), &missing, &self.read_done, cancel).into_iter();
         let probed: Vec<Result<ProbeInfo, String>> =
             cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
         crate::memory::release();
+        // Who owns the shared stem sidecar (`IMG_0001.xmp`) among the library's files and the ones
+        // arriving with this import: a JPEG or a TIFF arriving beside its raw reads its own sidecar
+        // and never the raw's packet (issue #1905).
+        let stems = crate::sidecar::ImportStems::for_import(
+            library.as_ref(),
+            todo.iter().zip(&probed).filter_map(|(path, info)| info.as_ref().ok().map(|i| (path.as_str(), i.kind))),
+        );
         // Files are planned one by one, in order (duplicates, sidecars, names, folders); their
         // copies or moves — the slow part, reading and writing every byte and verifying it — are
         // collected and run on several threads (issue #367), then their outcomes take their places.
@@ -901,10 +1121,11 @@ impl ImportJob {
             // the XMP sidecar (or a raw's embedded XMP), read before copying: its capture time files
             // and names the copy when the file itself has none
             let raw = info.kind == MediaKind::Raw;
-            let packet = crate::sidecar::find_sidecar(&path, self.naming)
+            let packet = crate::sidecar::find_sidecar_for_import(&stems, self.naming, &path)
                 .and_then(|f| std::fs::read_to_string(f).ok())
                 .or_else(|| info.xmp.clone().filter(|_| raw));
-            let sidecar = packet.and_then(|x| match crate::sidecar::parse_sidecar(&x, raw) {
+            let target = crate::crs::Target::for_file(info.kind, &info.format, info.preview_only.is_some(), &info.meta.camera);
+            let sidecar = packet.and_then(|x| match crate::sidecar::parse_sidecar(&x, target) {
                 Ok(sc) => Some(sc),
                 Err(e) => {
                     log::warn!("import {path}: XMP: {e}");
@@ -913,6 +1134,10 @@ impl ImportJob {
             });
             if info.captured.is_none() {
                 info.captured = sidecar.as_ref().and_then(|sc| sc.captured.clone());
+            }
+            // no date in the file or its sidecar: the file's own date, as Lightroom does
+            if info.captured.is_none() {
+                info.captured = info.file_modified.clone();
             }
             let stored = match (mode, &self.copy_root) {
                 (ImportMode::Copy | ImportMode::Move, Some(root))
@@ -1049,7 +1274,7 @@ fn name_family(name: &str) -> String {
 
 /// Threads for `jobs` file reads (probes, copies) at once.
 #[cfg(not(target_arch = "wasm32"))]
-fn workers(jobs: usize) -> usize {
+pub(crate) fn workers(jobs: usize) -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8).min(jobs.max(1))
 }
 
@@ -1161,6 +1386,16 @@ fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>) -> P
     PreparedItem::Ready(Box::new(ReadyFile { path, stored, info, sidecar, placed }))
 }
 
+/// A trashed photo's file is not where the library had it (never on the web, where paths are
+/// storage keys, not files).
+fn trashed_file_is_gone(cat: &lightcraft_catalog::Catalog, id: PhotoId) -> bool {
+    !cfg!(target_arch = "wasm32")
+        && match cat.photo(id).map(|p| &p.source) {
+            Some(Source::File { path }) => !Path::new(path).exists(),
+            _ => false,
+        }
+}
+
 /// The catalog half of an import: add the photos [`ImportJob::prepare`] readied (one undoable op;
 /// a Move's sources are removed once it is saved). On a failed commit a Move's placed files are
 /// taken back.
@@ -1201,9 +1436,15 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
                 });
                 let trashed = existing.filter(|id| s.catalog.photo(*id).is_some_and(|p| p.deleted));
                 match trashed {
-                    Some(id) if opts.on_deleted == OnDeleted::Restore => {
+                    // (browsing a folder in Local only looks: it never restores)
+                    Some(id) if opts.on_deleted == OnDeleted::Restore && !opts.local => {
                         if !report.restored.contains(&id.0) {
                             ops.push(Op::SetDeleted { id, deleted: false });
+                            // matched by content from another path, and the file the record
+                            // points at is gone (moved, renamed): the photo follows the file
+                            if reason == "content" && trashed_file_is_gone(&s.catalog, id) {
+                                ops.push(crate::cmd::missing::relink_op(id, &path));
+                            }
                             report.restored.push(id.0);
                         }
                     }
@@ -1235,11 +1476,15 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
                 p.as_shot_wb = info.as_shot_wb;
                 p.content_hash = info.content_hash;
                 p.embedded_lens = info.embedded_lens;
-                p.preview_only = info.preview_only.clone();
+                p.set_preview_only(info.preview_only.clone());
                 apply_import_defaults(s, &mut p);
                 if let Some(sc) = &sidecar {
                     crate::sidecar::merge_into(&mut p, sc, &now);
                     report.sidecars += 1;
+                    report.warnings.extend(sc.warnings.iter().cloned().map(|mut warning| {
+                        warning.path = path.clone();
+                        warning
+                    }));
                 }
                 if let Some(mp) = opts.metadata_preset.as_ref().and_then(|n| s.metadata_presets.iter().find(|m| m.name.eq_ignore_ascii_case(n))) {
                     crate::cmd::metadata::apply_to(&mut p.meta, &mp.fields);
@@ -1376,6 +1621,10 @@ impl Session {
             cache: None,
             stages: None,
             view_cache: None,
+            display: None,
+            slide: None,
+            preview_cut: None,
+            display_fit: None,
         };
         let embedded = match (&self.media.preview_loader, c.kind) {
             (Some(l), MediaKind::Raw) => Some((c.path.clone(), l.clone(), edge)),
@@ -1392,8 +1641,58 @@ impl Session {
 }
 
 #[cfg(test)]
+#[path = "import/tests_known.rs"]
+mod tests_known;
+
+#[cfg(test)]
 mod prepared_tests {
     use super::*;
+
+    /// Extensions the picker may offer: every one in [`EXTENSIONS`], minus the
+    /// files this build cannot import (see [`accept_list`]).
+    fn pickable_extensions() -> Vec<&'static str> {
+        let heif_decodable = lightcraft_codecs::Format::Heif.can_decode();
+        EXTENSIONS
+            .iter()
+            .copied()
+            .filter(|ext| match *ext {
+                "avif" => false,
+                "heic" | "heif" => heif_decodable,
+                _ => true,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accept_list_covers_every_pickable_extension_in_both_cases() {
+        let list = accept_list();
+        for ext in pickable_extensions() {
+            assert!(list.contains(&format!(".{ext}")), "lowercase .{ext} missing from accept list");
+            assert!(list.contains(&format!(".{}", ext.to_uppercase())), "uppercase .{} missing from accept list", ext.to_uppercase());
+        }
+    }
+
+    /// The web picker must not offer files this build cannot import: `.avif` has
+    /// no AV1 decoder in any build, so it is never listed, in either case.
+    #[test]
+    fn accept_list_never_offers_avif() {
+        let list = accept_list();
+        assert!(!list.contains(".avif"), "{list}");
+        assert!(!list.contains(".AVIF"), "{list}");
+    }
+
+    /// `.heic`/`.heif` follow the codecs' `heif` feature: listed (in both cases)
+    /// only when this build can decode them; otherwise hidden, so a web user
+    /// cannot pick a file that would fail to import.
+    #[test]
+    fn accept_list_offers_heic_heif_only_when_decodable() {
+        let list = accept_list();
+        let listed = lightcraft_codecs::Format::Heif.can_decode();
+        for ext in ["heic", "heif"] {
+            assert_eq!(list.contains(&format!(".{ext}")), listed, "lowercase .{ext}");
+            assert_eq!(list.contains(&format!(".{}", ext.to_uppercase())), listed, "uppercase .{ext}");
+        }
+    }
 
     #[test]
     fn revalidate_add_only_converts_matching_ready_item() {
@@ -1416,5 +1715,52 @@ mod prepared_tests {
         prepared.revalidate_add(&s);
         assert!(matches!(prepared.items.first(), Some(PreparedItem::Duplicate { reason: "path", .. })));
         assert!(matches!(prepared.items.get(1), Some(PreparedItem::Ready(_))));
+    }
+
+    fn unread_paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| std::env::temp_dir().join(format!("lightcraft-probe-progress-{i}.jpg")).to_string_lossy().into()).collect()
+    }
+
+    /// Reading the files of a large import (a Lightroom catalog's originals) reported nothing:
+    /// the progress stood still at "14 of 24554" for as long as it took.
+    #[test]
+    fn prepare_counts_the_files_it_reads() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut s = Session::new();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen_in_probe, done_in_probe) = (seen.clone(), std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let mut job = ImportJob::new(&mut s, ImportOptions { mode: ImportMode::Add, ..ImportOptions::default() }).unwrap();
+        let (done, last) = (job.read_done.clone(), done_in_probe.clone());
+        job.probe = Some(std::sync::Arc::new(move |_: &str| {
+            seen_in_probe.fetch_add(1, Relaxed);
+            last.fetch_max(done.load(Relaxed), Relaxed);
+            Ok(ProbeInfo { format: "JPEG".into(), ..ProbeInfo::default() })
+        }));
+        let prepared = job.prepare(&unread_paths(40), &std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(prepared.items.len(), 40);
+        assert_eq!(seen.load(Relaxed), 40);
+        assert!(done_in_probe.load(Relaxed) > 0, "progress moves while files are read");
+        assert_eq!((job.read_done.load(Relaxed), job.read_total.load(Relaxed)), (40, 40), "every file read is counted");
+        assert_eq!((job.done.load(Relaxed), job.total.load(Relaxed)), (40, 40), "handling them is counted on its own");
+    }
+
+    /// Cancel had no effect until every file had been read.
+    #[test]
+    fn cancel_stops_reading_files() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut s = Session::new();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut job = ImportJob::new(&mut s, ImportOptions { mode: ImportMode::Add, ..ImportOptions::default() }).unwrap();
+        let (seen_in_probe, cancel_in_probe) = (seen.clone(), cancel.clone());
+        job.probe = Some(std::sync::Arc::new(move |_: &str| {
+            seen_in_probe.fetch_add(1, Relaxed);
+            cancel_in_probe.store(true, Relaxed);
+            Ok(ProbeInfo { format: "JPEG".into(), ..ProbeInfo::default() })
+        }));
+        let prepared = job.prepare(&unread_paths(400), &cancel);
+        // at most the files the (up to 8) readers had already started
+        assert!(seen.load(Relaxed) <= 8, "read {} files after cancel", seen.load(Relaxed));
+        assert!(prepared.items.is_empty());
     }
 }

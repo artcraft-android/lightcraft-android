@@ -4,6 +4,8 @@
 //! change when [`XmpPrefs::auto_write`] is on): rating, colour label, title, caption, copyright,
 //! creator, keywords, capture time and GPS in the standard namespaces, plus our complete develop
 //! settings (`lc:settings`, JSON), the pick/reject flag (`lc:flag`) and location (`lc:location`).
+//! A sidecar is written only beside an original that is an existing file at an absolute path;
+//! otherwise the save fails.
 //!
 //! An existing sidecar is never replaced wholesale (issue #92): LightCraft's properties
 //! ([`OWNED`], [`OWNED_IF_STATED`]) are merged into it ([`lightcraft_meta::merge_xmp`]) and
@@ -15,15 +17,20 @@
 //! **Shared names** (Stem naming): `IMG_0001.CR3` and `IMG_0001.JPG` would share `IMG_0001.xmp`.
 //! When two catalogued files map to one stem sidecar, it belongs to one of them (a raw first, then
 //! the first by file name — [`Session::sidecar_naming`]); the others use `<file>.xmp`
-//! (`IMG_0001.JPG.xmp`) for writing and reading, so neither overwrites the other.
+//! (`IMG_0001.JPG.xmp`) for writing and reading, so neither overwrites the other. An import ranks
+//! the files it is adding against the library the same way ([`ImportStems`]): a JPEG or a TIFF
+//! arriving beside its raw's `IMG_0001.xmp` reads its own `<file>.xmp`, never the raw's packet
+//! (issue #1905).
 //!
 //! **Read** (on import, and `photo.readMetadataFromFile`): the sidecar wins for metadata, except
 //! the capture time: a time embedded in the file wins, and the sidecar's (`exif:DateTimeOriginal`,
 //! else `photoshop:DateCreated`, else `xmp:CreateDate`) fills in only when the file has none; develop
 //! settings are restored from `lc:settings` when present, else mapped from interoperable `crs:`
 //! fields ([`crate::crs`]). For raw/DNG files without a sidecar the file's embedded XMP is used.
+//! Manual reads also accept the first complete standard XMP APP1 in a bounded JPEG header (see `read_jpeg_xmp`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,17 +70,48 @@ pub fn sidecar_path(original: &str, naming: SidecarNaming) -> PathBuf {
 }
 
 /// An existing sidecar for `original`: the preferred naming first, then the other one (also
-/// accepting an upper-case `.XMP`).
+/// accepting `.XMP` and `.Xmp`, and a full name whose photo extension differs in case, such as
+/// `IMG_1.cr3.xmp` beside `IMG_1.CR3`, which a case-sensitive file system would otherwise miss).
 pub fn find_sidecar(original: &str, naming: SidecarNaming) -> Option<PathBuf> {
+    sidecar_candidates(original, naming).find(|p| p.is_file())
+}
+
+/// Find the sidecar for a file an import is adding, by the ownership [`ImportStems`] worked out
+/// (issue #1905): [`find_sidecar`] with the library's naming, except that a file which does not
+/// own its stem sidecar reads its own `<file>.xmp` (the name it writes) and never the packet of
+/// the sibling that owns the stem one.
+pub(crate) fn find_sidecar_for_import(stems: &ImportStems, naming: SidecarNaming, original: &str) -> Option<PathBuf> {
+    if stems.owns(original) {
+        return find_sidecar(original, naming);
+    }
+    let shared = xmp_cases(sidecar_path(original, SidecarNaming::Stem));
+    sidecar_candidates(original, SidecarNaming::Full).filter(|p| !shared.contains(p)).find(|p| p.is_file())
+}
+
+/// The names `original`'s sidecar can have, in the order they are looked for: under `naming`,
+/// then under the other naming (the full name also with the photo extension in the other case),
+/// each as `.xmp`, `.XMP` and `.Xmp`.
+pub(crate) fn sidecar_candidates(original: &str, naming: SidecarNaming) -> impl Iterator<Item = PathBuf> {
     let other = if naming == SidecarNaming::Stem { SidecarNaming::Full } else { SidecarNaming::Stem };
+    let ext = Path::new(original).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+    let base = Path::new(original).with_extension("");
+    let recased = |e: String| (e != ext).then(|| format!("{}.{e}", base.to_string_lossy()));
+    let full_variants: Vec<String> = [recased(ext.to_lowercase()), recased(ext.to_uppercase())].into_iter().flatten().collect();
     [naming, other]
         .into_iter()
-        .flat_map(|n| {
-            let p = sidecar_path(original, n);
-            let upper = p.with_extension("XMP");
-            [p, upper]
+        .flat_map(move |n| {
+            let mut v = vec![sidecar_path(original, n)];
+            if n == SidecarNaming::Full {
+                v.extend(full_variants.iter().map(|o| sidecar_path(o, n)));
+            }
+            v
         })
-        .find(|p| p.is_file())
+        .flat_map(xmp_cases)
+}
+
+/// The three ways one sidecar name can be written: `.xmp`, `.XMP` and `.Xmp`.
+fn xmp_cases(p: PathBuf) -> [PathBuf; 3] {
+    [p.clone(), p.with_extension("XMP"), p.with_extension("Xmp")]
 }
 
 /// What a sidecar (or embedded XMP packet) says about a photo. `None` = not stated.
@@ -104,6 +142,9 @@ pub struct SidecarData {
     /// `xmp:CreateDate` (first found). Used only when the file itself has no capture time.
     pub captured: Option<String>,
     pub develop: Option<DevelopPatch>,
+    /// Actionable diagnostics for foreign develop settings that were not fully carried over.
+    /// These are surfaced in the photo import report and never persisted in the catalog.
+    pub warnings: Vec<crate::import::ImportWarning>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,8 +155,10 @@ pub enum DevelopPatch {
     Partial(Value),
 }
 
-/// Parse a sidecar / XMP packet. `raw` selects absolute (raw) vs relative white balance for `crs:`.
-pub fn parse_sidecar(xmp: &str, raw: bool) -> std::result::Result<SidecarData, String> {
+/// Parse a sidecar / XMP packet. `target` selects how a `crs:` white balance is read
+/// ([`crate::crs::Target`]: absolute Kelvin for raws with a measured illuminant, a shift from the
+/// as-shot white for everything developed relative to it).
+pub fn parse_sidecar(xmp: &str, target: crate::crs::Target) -> std::result::Result<SidecarData, String> {
     let d = lightcraft_meta::parse_xmp(xmp).map_err(|e| e.to_string())?;
     let m = &d.metadata;
     let lc = |k: &str| d.properties.get(&format!("lc:{k}")).and_then(|v| v.first()).cloned();
@@ -133,7 +176,8 @@ pub fn parse_sidecar(xmp: &str, raw: bool) -> std::result::Result<SidecarData, S
         country: m.country.clone(),
         alt_text: m.alt_text.clone(),
         extended_description: m.extended_description.clone(),
-        keywords: (!m.keywords.is_empty()).then(|| m.keywords.clone()),
+        keywords: (!m.keywords.is_empty() || !m.hierarchical_keywords.is_empty())
+            .then(|| lightcraft_catalog::keywords::from_file(&m.keywords, &m.hierarchical_keywords)),
         // A sidecar that has `mwg-rs:Regions` at all (even an empty list) was written by an app that
         // knows about regions, so it's authoritative: its list, empty or not, replaces the catalog's.
         // One without it (most writers, LightCraft's own included, which keeps another app's
@@ -162,7 +206,65 @@ pub fn parse_sidecar(xmp: &str, raw: bool) -> std::result::Result<SidecarData, S
     out.develop = match full {
         Some(s) => Some(DevelopPatch::Full(Box::new(s))),
         None if crate::crs::has_adjustments(&d.properties) => {
-            Some(DevelopPatch::Partial(crate::crs::to_partial_report(&d.properties, Some(&d.values), Some(raw), crate::crs_masks::DEFAULT_ASPECT).0))
+            let (partial, unmapped) = crate::crs::to_partial_report(&d.properties, Some(&d.values), target, crate::crs_masks::DEFAULT_ASPECT);
+            // Lightroom's default profiles are named by nearly every sidecar; our own starting look stands
+            // in for them, so only another profile is worth a warning
+            let profile = crate::crs::camera_profile_name(&d.properties)
+                .filter(|name| !matches!(name.trim(), "Adobe Standard" | "Adobe Color"))
+                .map(str::to_string);
+            if let Some(name) = profile {
+                out.warnings.push(crate::import::ImportWarning {
+                    path: String::new(),
+                    code: crate::import::ImportWarningCode::CameraProfile,
+                    profile: Some(name),
+                    mode: None,
+                    fields: Vec::new(),
+                });
+            }
+            let upright = crate::crs::has_saved_upright_transform(&d.properties);
+            if upright {
+                let mode = d
+                    .properties
+                    .get("crs:PerspectiveUpright")
+                    .and_then(|values| values.first())
+                    .map(String::as_str)
+                    .map(|mode| match mode {
+                        "0" => crate::import::ImportUprightMode::Off,
+                        "1" => crate::import::ImportUprightMode::Auto,
+                        "2" => crate::import::ImportUprightMode::Level,
+                        "3" => crate::import::ImportUprightMode::Vertical,
+                        "4" => crate::import::ImportUprightMode::Full,
+                        "5" => crate::import::ImportUprightMode::Guided,
+                        _ => crate::import::ImportUprightMode::Unknown,
+                    })
+                    .unwrap_or(crate::import::ImportUprightMode::Unknown);
+                out.warnings.push(crate::import::ImportWarning {
+                    path: String::new(),
+                    code: crate::import::ImportWarningCode::UprightGeometry,
+                    profile: None,
+                    mode: Some(mode),
+                    fields: Vec::new(),
+                });
+            }
+            let other: Vec<&str> = unmapped
+                .iter()
+                .map(String::as_str)
+                .filter(|name| {
+                    *name != "CameraProfile"
+                        && !name.starts_with("UprightTransform_")
+                        && !matches!(*name, "UprightTransformCount" | "UprightCenterNormX" | "UprightCenterNormY" | "UprightVersion")
+                })
+                .collect();
+            if !other.is_empty() {
+                out.warnings.push(crate::import::ImportWarning {
+                    path: String::new(),
+                    code: crate::import::ImportWarningCode::UnmappedXmp,
+                    profile: None,
+                    mode: None,
+                    fields: other.into_iter().map(str::to_string).collect(),
+                });
+            }
+            Some(DevelopPatch::Partial(partial))
         }
         None => None,
     };
@@ -245,6 +347,12 @@ impl SidecarData {
 /// The sidecar packet for a photo; the colour label is written by its name in `cat` (custom
 /// label names included, as other editors do).
 pub fn sidecar_packet(p: &Photo, cat: &lightcraft_catalog::Catalog) -> String {
+    sidecar_packet_with(p, cat, false)
+}
+
+/// [`sidecar_packet`], without any location (GPS, sublocation, city, state, country) when
+/// `remove_location` is set (an export with "Remove location info").
+pub fn sidecar_packet_with(p: &Photo, cat: &lightcraft_catalog::Catalog, remove_location: bool) -> String {
     let nz = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
     let meta = lightcraft_meta::Metadata {
         software: Some("LightCraft".into()),
@@ -268,6 +376,10 @@ pub fn sidecar_packet(p: &Photo, cat: &lightcraft_catalog::Catalog) -> String {
         gps: p.meta.gps.map(|(latitude, longitude)| lightcraft_meta::Gps { latitude, longitude, altitude: None }),
         ..Default::default()
     };
+    let mut meta = meta;
+    if remove_location {
+        (meta.sublocation, meta.city, meta.state, meta.country, meta.gps) = (None, None, None, None, None);
+    }
     let settings = serde_json::to_string(&*p.develop).unwrap_or_default();
     let flag = match p.flag {
         Flag::None => "none",
@@ -275,7 +387,7 @@ pub fn sidecar_packet(p: &Photo, cat: &lightcraft_catalog::Catalog) -> String {
         Flag::Reject => "reject",
     };
     let mut lc = vec![("settings", settings.as_str()), ("flag", flag)];
-    if !p.meta.location.trim().is_empty() {
+    if !remove_location && !p.meta.location.trim().is_empty() {
         lc.push(("location", p.meta.location.as_str()));
     }
     lightcraft_meta::write_xmp_lc(&meta, &lc)
@@ -376,6 +488,33 @@ fn stem_key(original: &str) -> String {
     sidecar_path(original, SidecarNaming::Stem).to_string_lossy().to_lowercase()
 }
 
+/// Where a plain path is cut to make its [`stem_key`]: at the dot of its extension, which is
+/// what `with_extension` replaces. A plain path is ASCII and ends in its file's name with an
+/// extension, which is what a library's paths are; `None` for any other shape.
+fn plain_cut(original: &str) -> Option<usize> {
+    let path = Path::new(original);
+    let (name, stem, ext) = (path.file_name()?.to_str()?, path.file_stem()?.to_str()?, path.extension()?.to_str()?);
+    // (the path ends in its file's name, as it stands: no `/.` or separator after it; and the
+    // name has a stem and an extension of its own, which `..jpg` and `a.` have not)
+    let plain = original.is_ascii() && original.ends_with(name) && !ext.is_empty() && !stem.is_empty() && stem != "." && stem != "..";
+    let cut = original.len().checked_sub(ext.len().saturating_add(1))?;
+    (plain && original.as_bytes().get(cut) == Some(&b'.')).then_some(cut)
+}
+
+/// [`stem_key`] written into `key`, which is reused: nothing is allocated for a plain path
+/// ([`plain_cut`]). Any other shape goes the long way.
+fn stem_key_into(key: &mut String, original: &str) {
+    key.clear();
+    match plain_cut(original) {
+        Some(cut) => {
+            key.push_str(original.get(..cut).unwrap_or_default());
+            key.make_ascii_lowercase();
+            key.push_str(".xmp");
+        }
+        None => key.push_str(&stem_key(original)),
+    }
+}
+
 fn file_path(p: &Photo) -> Option<&str> {
     match &p.source {
         Source::File { path } => Some(path),
@@ -383,17 +522,76 @@ fn file_path(p: &Photo) -> Option<&str> {
     }
 }
 
-/// The XMP packet that describes a photo on disk: its sidecar, else (raw/DNG) the embedded XMP.
+/// The XMP packet that describes a photo on disk: its sidecar, else embedded raw/DNG or JPEG XMP.
 pub fn read_packet(original: &str, kind: MediaKind, naming: SidecarNaming) -> Option<(String, PathBuf)> {
-    if let Some(sc) = find_sidecar(original, naming)
-        && let Ok(s) = std::fs::read_to_string(&sc)
-    {
-        return Some((s, sc));
+    if let Some(sc) = find_sidecar(original, naming) {
+        // A discovered sidecar keeps precedence even when reading it fails.
+        return std::fs::read_to_string(&sc).ok().map(|s| (s, sc));
     }
     if kind == MediaKind::Raw {
         let bytes = std::fs::read(original).ok()?;
         let x = lightcraft_meta::embedded(&bytes).xmp?;
         return Some((x, PathBuf::from(original)));
+    }
+    if kind == MediaKind::Image {
+        let mut file = std::fs::File::open(original).ok()?;
+        let x = read_jpeg_xmp(&mut file, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS)?;
+        return Some((x, PathBuf::from(original)));
+    }
+    None
+}
+
+const JPEG_XMP_HEADER_SPAN: u64 = 16 * 1024 * 1024;
+const JPEG_XMP_HEADER_STEPS: usize = 4096;
+
+/// Read from SOI at the current position, stopping at the first standard XMP packet or SOS/EOI.
+/// The span includes SOI, segment headers and skipped payloads; each marker/fill step after SOI
+/// consumes one iteration. Only a complete APP1 payload (at most 65533 bytes) reaches the shared
+/// parser, in a single SOI+APP1 wrapper (at most 65539 bytes). This does not validate the whole JPEG.
+fn read_jpeg_xmp(reader: &mut (impl Read + Seek), header_span: u64, marker_steps: usize) -> Option<String> {
+    let mut header = reader.take(header_span);
+    let mut soi = [0; 2];
+    header.read_exact(&mut soi).ok()?;
+    if soi != [0xff, 0xd8] {
+        return None;
+    }
+    let mut filled = false;
+    for _ in 0..marker_steps {
+        if !filled {
+            let mut prefix = [0];
+            header.read_exact(&mut prefix).ok()?;
+            if prefix != [0xff] {
+                return None;
+            }
+        }
+        let mut code = [0];
+        header.read_exact(&mut code).ok()?;
+        let [marker] = code;
+        filled = marker == 0xff;
+        match marker {
+            0xff | 0xd8 | 0xd0..=0xd7 | 0x01 => continue,
+            0xd9 | 0xda => return None,
+            _ => {}
+        }
+        let mut length = [0; 2];
+        header.read_exact(&mut length).ok()?;
+        let payload_len = u16::from_be_bytes(length).checked_sub(2)?;
+        let remaining = header.limit().checked_sub(u64::from(payload_len))?;
+        if marker != 0xe1 {
+            // Seeking must spend the same span budget as reading, before the seek is attempted.
+            header.set_limit(remaining);
+            header.get_mut().seek(SeekFrom::Current(i64::from(payload_len))).ok()?;
+            continue;
+        }
+        let segment_len = 6usize.checked_add(usize::from(payload_len))?;
+        let [hi, lo] = length;
+        let mut segment = Vec::with_capacity(segment_len);
+        segment.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe1, hi, lo]);
+        segment.resize(segment_len, 0);
+        header.read_exact(segment.get_mut(6..)?).ok()?;
+        if let Some(xmp) = lightcraft_meta::jpeg_segments(&segment).xmp {
+            return Some(xmp);
+        }
     }
     None
 }
@@ -401,14 +599,24 @@ pub fn read_packet(original: &str, kind: MediaKind, naming: SidecarNaming) -> Op
 /// Photo ids touched by an op (for auto-write).
 pub(crate) fn op_photos(op: &Op, out: &mut Vec<PhotoId>) {
     match op {
-        Op::SetRating { id, .. } | Op::SetFlag { id, .. } | Op::SetLabel { id, .. } | Op::SetDevelop { id, .. } | Op::SetMeta { id, .. } => {
-            if !out.contains(id) {
-                out.push(*id);
-            }
+        Op::SetRating { id, .. } | Op::SetFlag { id, .. } | Op::SetLabel { id, .. } | Op::SetDevelop { id, .. } | Op::SetMeta { id, .. }
+            if !out.contains(id) =>
+        {
+            out.push(*id);
         }
         Op::Batch { ops } => ops.iter().for_each(|o| op_photos(o, out)),
         _ => {}
     }
+}
+
+/// Where a file stands in the order a shared stem sidecar is owned by: a raw first, then the file
+/// name in lower case, then the catalog id (a file an import is adding has no id yet, and ranks
+/// last among files of its kind and name: see [`ImportStems`]).
+type Rank = (bool, String, u64);
+
+/// The rank of the file at `path`, of kind `kind`, catalogued as `id`.
+fn rank_of(path: &str, kind: MediaKind, id: u64) -> Rank {
+    (kind != MediaKind::Raw, path.to_lowercase(), id)
 }
 
 /// Which photo owns each stem sidecar that several catalogued files map to (see
@@ -416,13 +624,49 @@ pub(crate) fn op_photos(op: &Op, out: &mut Vec<PhotoId>) {
 pub(crate) struct StemOwners(HashMap<String, PhotoId>);
 
 impl StemOwners {
+    /// The owners of every shared stem in the library, each file's key made the long way: what
+    /// [`StemOwners::among`] must agree with for the photos it is asked about (this is how the
+    /// owners were worked out before, for every write).
+    #[cfg(test)]
     pub(crate) fn of(cat: &lightcraft_catalog::Catalog) -> StemOwners {
-        // per stem: (raw first, then file name, then id) of the best candidate; and how many
-        let mut best: HashMap<String, ((bool, String, u64), PhotoId, usize)> = HashMap::new();
+        let mut best: HashMap<String, (Rank, PhotoId, usize)> = HashMap::new();
         for p in cat.photos().filter(|p| p.copy_of.is_none()) {
             let Some(path) = file_path(p) else { continue };
-            let rank = (p.kind != MediaKind::Raw, path.to_lowercase(), p.id.0);
+            let rank = rank_of(path, p.kind, p.id.0);
             let e = best.entry(stem_key(path)).or_insert_with(|| (rank.clone(), p.id, 0));
+            e.2 += 1;
+            if rank < e.0 {
+                (e.0, e.1) = (rank, p.id);
+            }
+        }
+        StemOwners(best.into_iter().filter(|(_, v)| v.2 > 1).map(|(k, v)| (k, v.1)).collect())
+    }
+
+    /// The owners of the stems photos `ids` map to: all that naming those photos needs. The
+    /// library is passed over once, and only files of those stems are looked at closer, so a
+    /// sidecar written for one photo does not cost a table of the whole library.
+    pub(crate) fn among(cat: &lightcraft_catalog::Catalog, ids: &[PhotoId]) -> StemOwners {
+        let wanted: std::collections::HashSet<String> =
+            ids.iter().filter_map(|id| cat.photo(*id)).filter_map(|p| file_path(p)).map(stem_key).collect();
+        if wanted.is_empty() {
+            return StemOwners(HashMap::new());
+        }
+        Self::where_wanted(cat, &wanted)
+    }
+
+    /// The owners of the shared stems in `wanted`.
+    fn where_wanted(cat: &lightcraft_catalog::Catalog, wanted: &std::collections::HashSet<String>) -> StemOwners {
+        // per stem: (raw first, then file name, then id) of the best candidate; and how many
+        let mut best: HashMap<String, (Rank, PhotoId, usize)> = HashMap::new();
+        let mut key = String::new();
+        for p in cat.photos().filter(|p| p.copy_of.is_none()) {
+            let Some(path) = file_path(p) else { continue };
+            stem_key_into(&mut key, path);
+            if !wanted.contains(key.as_str()) {
+                continue;
+            }
+            let rank = rank_of(path, p.kind, p.id.0);
+            let e = best.entry(key.clone()).or_insert_with(|| (rank.clone(), p.id, 0));
             e.2 += 1;
             if rank < e.0 {
                 (e.0, e.1) = (rank, p.id);
@@ -440,44 +684,167 @@ impl StemOwners {
     }
 }
 
+/// Which of the files an import is adding may read the shared stem sidecar (`IMG_0001.xmp`) of
+/// their stem, and which read their own `<file>.xmp` (`IMG_0001.TIF.xmp`) instead (issue #1905:
+/// before, a JPEG or a TIFF imported beside its raw read the raw's packet and took its rating,
+/// metadata and develop settings). The order is the one [`StemOwners`] applies to writing, with
+/// the arriving files ranked against the library and against each other: a raw first, then the
+/// file name in lower case. A file that is not catalogued yet has no id, and the id it draws when
+/// the import commits is above every id in the library, so it loses a tie against a catalogued
+/// file; between arriving files the order they arrive in stands for it.
+pub(crate) struct ImportStems {
+    /// The arriving files that own the stem sidecar of their stem, by path as it arrives.
+    owners: HashSet<String>,
+}
+
+impl ImportStems {
+    /// Work out [`ImportStems`] for the files `incoming`, in the order they arrive. `None` for a
+    /// library already looked over (a job prepared twice): there is nothing to rank against, so
+    /// every arriving file reads as it did before. The library is passed over once, and only the
+    /// stems the arriving files map to are looked at closer.
+    pub(crate) fn for_import<'a>(cat: Option<&lightcraft_catalog::Catalog>, incoming: impl Iterator<Item = (&'a str, MediaKind)>) -> ImportStems {
+        // per stem: the best of the library's files, and the best arriving file with its path
+        let mut best: HashMap<String, (Option<Rank>, Option<(Rank, &'a str)>)> = HashMap::new();
+        let mut arriving_paths = HashSet::new();
+        for (arriving, (path, kind)) in incoming.enumerate() {
+            arriving_paths.insert(path);
+            let e = best.entry(stem_key(path)).or_default();
+            let rank = rank_of(path, kind, arriving as u64);
+            if e.1.as_ref().is_none_or(|(b, _)| rank < *b) {
+                e.1 = Some((rank, path));
+            }
+        }
+        if let Some(cat) = cat {
+            let mut key = String::new();
+            for p in cat.photos().filter(|p| p.copy_of.is_none()) {
+                // the arriving file's own record (a trashed photo imported again) is not a rival
+                let Some(path) = file_path(p).filter(|path| !arriving_paths.contains(*path)) else { continue };
+                stem_key_into(&mut key, path);
+                let Some(e) = best.get_mut(key.as_str()) else { continue };
+                let rank = rank_of(path, p.kind, p.id.0);
+                if e.0.as_ref().is_none_or(|b| rank < *b) {
+                    e.0 = Some(rank);
+                }
+            }
+        }
+        let owners = best
+            .into_values()
+            .filter_map(|(in_library, arriving)| {
+                let (rank, path) = arriving?;
+                let wins = in_library.as_ref().is_none_or(|b| (rank.0, rank.1.as_str()) < (b.0, b.1.as_str()));
+                wins.then(|| path.to_string())
+            })
+            .collect();
+        ImportStems { owners }
+    }
+
+    /// Whether the arriving file at `original` owns the stem sidecar of its stem.
+    pub(crate) fn owns(&self, original: &str) -> bool {
+        self.owners.contains(original)
+    }
+}
+
+/// How the sidecar of each of photos `ids` is named in library `cat`, whose naming is `naming`
+/// ([`Session::sidecar_namings`], for a thread that has the library and not the session).
+pub(crate) fn namings_in(cat: &lightcraft_catalog::Catalog, naming: SidecarNaming, ids: &[PhotoId]) -> Vec<SidecarNaming> {
+    let owners = (naming == SidecarNaming::Stem).then(|| StemOwners::among(cat, ids));
+    ids.iter()
+        .map(|id| match (cat.photo(*id), &owners) {
+            (Some(p), Some(o)) => o.naming(p, naming),
+            _ => naming,
+        })
+        .collect()
+}
+
 impl Session {
     /// The sidecar naming for photo `id`: the library's, except under Stem naming when another
     /// catalogued file shares the stem (`IMG_0001.CR3` + `IMG_0001.JPG`) and owns the stem
     /// sidecar — a raw first, else the first by file name. The others use Full naming
     /// (`IMG_0001.JPG.xmp`), so their metadata never overwrites each other.
+    /// [`Session::sidecar_naming`] for many photos, their stems' owners worked out once (per
+    /// photo that is a pass over the whole catalog).
+    pub fn sidecar_namings(&self, ids: &[PhotoId]) -> Vec<SidecarNaming> {
+        namings_in(&self.catalog, self.xmp.naming, ids)
+    }
+
     pub fn sidecar_naming(&self, id: PhotoId) -> SidecarNaming {
         match self.catalog.photo(id) {
-            Some(p) if self.xmp.naming == SidecarNaming::Stem => StemOwners::of(&self.catalog).naming(p, self.xmp.naming),
+            Some(p) if self.xmp.naming == SidecarNaming::Stem => StemOwners::among(&self.catalog, &[id]).naming(p, self.xmp.naming),
             _ => self.xmp.naming,
         }
     }
 
     /// Write the photo's XMP sidecar, merged into an existing one (see the module docs).
-    pub fn save_sidecar(&self, id: PhotoId) -> Result<SidecarSaved> {
-        self.save_sidecar_with(id, &StemOwners::of(&self.catalog))
+    pub fn save_sidecar(&mut self, id: PhotoId) -> Result<SidecarSaved> {
+        self.save_sidecar_with(id, &StemOwners::among(&self.catalog, &[id]))
     }
 
-    pub(crate) fn save_sidecar_with(&self, id: PhotoId, owners: &StemOwners) -> Result<SidecarSaved> {
+    pub(crate) fn save_sidecar_with(&mut self, id: PhotoId, owners: &StemOwners) -> Result<SidecarSaved> {
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         if p.copy_of.is_some() {
             return Err(EngineError::Other(format!("{} is a virtual copy: its settings live only in the library", p.file_name)));
         }
         let orig = file_path(p).ok_or_else(|| EngineError::Other(format!("{} is not a file on disk", p.file_name)))?;
-        let path = sidecar_path(orig, owners.naming(p, self.xmp.naming));
+        // A relative path would be taken from the working directory.
+        if Path::new(orig).is_relative() || !Path::new(orig).is_file() {
+            return Err(EngineError::Other(format!("{}: the original {orig} is missing; no XMP sidecar is written", p.file_name)));
+        }
+        let naming = owners.naming(p, self.xmp.naming);
+        let preferred = sidecar_path(orig, naming);
+        let other = if naming == SidecarNaming::Stem { SidecarNaming::Full } else { SidecarNaming::Stem };
+        let candidates: Vec<PathBuf> = [naming, other]
+            .into_iter()
+            .filter(|n| *n != SidecarNaming::Stem || owners.naming(p, SidecarNaming::Stem) == SidecarNaming::Stem)
+            .flat_map(|n| {
+                let path = sidecar_path(orig, n);
+                [path.clone(), path.with_extension("XMP")]
+            })
+            .collect();
+        // A separated packet is still the photo's metadata. Repair it before a fresh write
+        // occupies its destination; a failure preserves the queue and both existing packets.
+        self.repair_sidecars_for_paths(&candidates, &crate::rename::RealFs)
+            .map_err(|e| EngineError::Other(format!("{}: unfinished XMP repair: {e}", preferred.display())))?;
+        // Keep an existing packet's spelling/style so foreign properties survive this save and
+        // subsequent Undo/Redo writes. Shared stems owned by another photo were excluded above.
+        // On a case-insensitive volume `a.xmp` also answers for `a.XMP`: the spelling the folder
+        // lists comes first, so the atomic write doesn't rename the packet.
+        use crate::rename::MoveFs;
+        let existing: Vec<PathBuf> = candidates.into_iter().filter(|path| path.is_file()).collect();
+        let listed = existing.iter().find(|path| crate::rename::RealFs.listed(path)).cloned();
+        let path = listed.or_else(|| existing.into_iter().next()).unwrap_or(preferred);
+        self.validate_sidecar_packets_for_paths(std::slice::from_ref(&path), &crate::rename::RealFs)?;
+        let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         let err = |e: std::io::Error| EngineError::Other(format!("{}: {e}", path.display()));
         let (data, merged, backup) = sidecar_contents(&path, sidecar_packet(p, &self.catalog), &(self.clock)()).map_err(err)?;
         write_atomic(&path, data.as_bytes()).map_err(err)?;
+        self.note_sidecar_write(&path, data.as_bytes());
         Ok(SidecarSaved { path, merged, backup })
     }
 
     /// The op that applies a photo's sidecar (or embedded XMP) to the catalog, if there is one.
     pub fn read_sidecar_op(&self, id: PhotoId) -> Result<Option<(Op, PathBuf)>> {
+        self.read_sidecar_op_with_warnings(id).map(|result| result.map(|(op, from, _)| (op, from)))
+    }
+
+    /// Like [`Session::read_sidecar_op`], retaining transient diagnostics for the command report.
+    pub fn read_sidecar_op_with_warnings(&self, id: PhotoId) -> Result<Option<(Op, PathBuf, Vec<crate::import::ImportWarning>)>> {
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         let Some(orig) = file_path(p) else { return Ok(None) };
         let Some((packet, from)) = read_packet(orig, p.kind, self.sidecar_naming(id)) else { return Ok(None) };
-        let sc = parse_sidecar(&packet, p.kind == MediaKind::Raw)
-            .map_err(|e| EngineError::Other(format!("{}: {e}", from.display())))?
-            .resolve_label(&self.catalog);
+        let sc = parse_sidecar(&packet, crate::crs::Target::for_photo(p)).map_err(|e| EngineError::Other(format!("{}: {e}", from.display())))?;
+        let mut warnings = sc.warnings.clone();
+        for warning in &mut warnings {
+            warning.path = orig.to_string();
+        }
+        let op = self.sidecar_op(id, sc)?;
+        Ok(Some((op, from, warnings)))
+    }
+
+    /// The op that applies what a sidecar says (already read and parsed, e.g. on a worker
+    /// thread) to photo `id`: the sidecar wins. No file is read.
+    pub fn sidecar_op(&self, id: PhotoId, sc: SidecarData) -> Result<Op> {
+        let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
+        let sc = sc.resolve_label(&self.catalog);
         let mut q = (**p).clone();
         let develop_changed = merge_into(&mut q, &sc, &(self.clock)());
         let mut ops = vec![
@@ -492,29 +859,127 @@ impl Session {
         if develop_changed {
             ops.extend(self.develop_op(id, (*q.develop).clone(), "Read Metadata from File"));
         }
-        Ok(Some((Op::Batch { ops }, from)))
+        Ok(Op::Batch { ops })
     }
 
     /// Auto-write: sidecars for photos changed by `ops` (errors are logged, not returned).
-    pub(crate) fn auto_write_sidecars(&self, ops: &[Op]) {
+    pub(crate) fn auto_write_sidecars(&mut self, ops: &[Op]) {
         let mut ids = Vec::new();
         ops.iter().for_each(|o| op_photos(o, &mut ids));
+        self.auto_write_sidecar_ids(ids);
+    }
+
+    /// Gather changed IDs before the saves mutate retained physical repair queues.
+    pub(crate) fn auto_write_sidecars_since(&mut self, log_start: usize) {
+        let mut ids = Vec::new();
+        if let Some(ops) = self.pending_log.get(log_start..) {
+            ops.iter().for_each(|o| op_photos(o, &mut ids));
+        }
+        self.auto_write_sidecar_ids(ids);
+    }
+
+    fn auto_write_sidecar_ids(&mut self, ids: Vec<PhotoId>) {
         if ids.is_empty() {
             return;
         }
-        let owners = StemOwners::of(&self.catalog);
+        let owners = StemOwners::among(&self.catalog, &ids);
         for id in ids {
-            if self.catalog.photo(id).is_some_and(|p| file_path(p).is_some() && p.copy_of.is_none())
-                && let Err(e) = self.save_sidecar_with(id, &owners)
-            {
-                log::warn!("auto-write XMP: {e}");
+            if self.catalog.photo(id).is_some_and(|p| file_path(p).is_some() && p.copy_of.is_none()) {
+                match self.save_sidecar_with(id, &owners) {
+                    Ok(_) => {
+                        self.unsaved_sidecars.remove(&id);
+                    }
+                    Err(e) => {
+                        // kept for a retry once the file is reachable: a network share that dropped out mustn't leave
+                        // the sidecar silently behind the edit
+                        log::warn!("auto-write XMP: {e}");
+                        self.unsaved_sidecars.insert(id);
+                    }
+                }
             }
         }
+    }
+
+    /// How many photos have an automatic sidecar write waiting (it failed: the folder offline, read-only or full).
+    pub fn unsaved_sidecars(&self) -> usize {
+        self.unsaved_sidecars.len()
+    }
+
+    /// Write the waiting sidecars whose originals are reachable again (the availability cache answers without
+    /// touching the disk for the others); photos that are gone, or with auto-write off, are dropped from the wait.
+    /// Returns how many were written.
+    pub fn retry_unsaved_sidecars(&mut self) -> usize {
+        if !self.xmp.auto_write {
+            self.unsaved_sidecars.clear();
+            return 0;
+        }
+        let mut ready = Vec::new();
+        for id in self.unsaved_sidecars.clone() {
+            match self.catalog.photo(id).filter(|p| p.copy_of.is_none()).and_then(|p| file_path(p).map(str::to_owned)) {
+                None => {
+                    self.unsaved_sidecars.remove(&id);
+                }
+                Some(path) if self.media.availability.exists(&path) == Some(true) => ready.push(id),
+                Some(_) => {}
+            }
+        }
+        if ready.is_empty() {
+            return 0;
+        }
+        let owners = StemOwners::among(&self.catalog, &ready);
+        let mut written = 0;
+        for id in ready {
+            match self.save_sidecar_with(id, &owners) {
+                Ok(_) => {
+                    self.unsaved_sidecars.remove(&id);
+                    written += 1;
+                }
+                Err(e) => log::debug!("retry XMP: {e}"),
+            }
+        }
+        written
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sidecars_are_written_only_beside_an_existing_original() {
+        let dir = std::env::temp_dir().join(format!("lightcraft-sidecar-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("IMG_1.jpg"), b"original").unwrap();
+        let originals = [
+            (r"\\192.0.2.1\share\IMG_1.jpg".to_string(), false),
+            (dir.join("IMG_2.jpg").to_string_lossy().to_string(), false),
+            (dir.join("IMG_1.jpg").to_string_lossy().to_string(), true),
+        ];
+        for (original, written) in originals {
+            let _ = std::fs::remove_file(dir.join("IMG_1.xmp"));
+            let mut s = Session::new();
+            let p = Photo::new(PhotoId(1), Source::File { path: original.clone() }, "IMG_1.jpg", "JPEG", 4, 3, "2026-01-01T00:00:00");
+            s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+            assert_eq!(s.save_sidecar(PhotoId(1)).is_ok(), written, "{original}");
+            assert_eq!(dir.join("IMG_1.xmp").is_file(), written, "{original}");
+            assert!(!dir.join("IMG_2.xmp").exists(), "{original}");
+            assert!(!Path::new(r"\\192.0.2.1\share\IMG_1.xmp").exists(), "{original}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sidecar written by Lightroom Classic (names flat, paths in `lr:hierarchicalSubject`)
+    /// gives the photo its keywords as paths.
+    #[test]
+    fn sidecar_keywords_keep_their_hierarchy() {
+        let m = lightcraft_meta::Metadata {
+            keywords: vec!["Lisbon".into(), "Places".into()],
+            hierarchical_keywords: vec!["Places|Lisbon".into()],
+            ..Default::default()
+        };
+        let sc = super::parse_sidecar(&lightcraft_meta::write_xmp(&m, None), crate::crs::Target::Rendered).unwrap();
+        assert_eq!(sc.keywords, Some(vec!["Places|Lisbon".to_string()]));
+    }
+
     use super::*;
     use lightcraft_catalog::Meta;
 
@@ -553,7 +1018,7 @@ mod tests {
     fn packet_roundtrip_restores_everything() {
         let p = photo();
         let x = sidecar_packet(&p, &lightcraft_catalog::Catalog::new());
-        let sc = parse_sidecar(&x, false).unwrap();
+        let sc = parse_sidecar(&x, crate::crs::Target::Rendered).unwrap();
         assert_eq!(sc.rating, Some(4));
         assert_eq!(sc.flag, Some(Flag::Pick));
         assert_eq!(sc.label, Some(Some(ColorLabel::Purple)));
@@ -572,7 +1037,7 @@ mod tests {
         let x = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
           <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
             xmp:Rating="-1" xmp:Label="Green" crs:Exposure2012="-0.40" crs:Vibrance="+12"/></rdf:RDF></x:xmpmeta>"#;
-        let sc = parse_sidecar(x, true).unwrap();
+        let sc = parse_sidecar(x, crate::crs::Target::RawAbsolute).unwrap();
         assert_eq!((sc.rating, sc.flag, sc.label), (Some(0), Some(Flag::Reject), Some(Some(ColorLabel::Green))));
         let mut p = photo();
         let before = p.develop.clone();
@@ -597,5 +1062,238 @@ mod tests {
             &mut v,
         );
         assert_eq!(v, vec![PhotoId(1), PhotoId(3)]);
+    }
+}
+
+#[cfg(test)]
+#[path = "sidecar/tests_repair_saves.rs"]
+mod tests_repair_saves;
+
+#[cfg(test)]
+#[path = "sidecar/tests_repair_companions.rs"]
+mod tests_repair_companions;
+
+#[cfg(test)]
+#[path = "sidecar/tests_repair_provenance.rs"]
+mod tests_repair_provenance;
+
+#[cfg(test)]
+#[path = "sidecar/tests_stem_owners.rs"]
+mod tests_stem_owners;
+
+#[cfg(test)]
+mod jpeg_header_tests {
+    use super::{JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS, read_jpeg_xmp};
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+    struct CountedReader {
+        cursor: Cursor<Vec<u8>>,
+        bytes_read: usize,
+        largest_read: usize,
+        seeks: usize,
+        chunk: usize,
+        read_error_at: Option<u64>,
+        seek_error: bool,
+    }
+
+    impl CountedReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self { cursor: Cursor::new(bytes), bytes_read: 0, largest_read: 0, seeks: 0, chunk: usize::MAX, read_error_at: None, seek_error: false }
+        }
+    }
+
+    impl Read for CountedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.largest_read = self.largest_read.max(buf.len());
+            if self.read_error_at.is_some_and(|at| self.cursor.position() >= at) {
+                return Err(io::Error::other("injected header read failure"));
+            }
+            let len = buf.len().min(self.chunk);
+            let read = self.cursor.read(&mut buf[..len])?;
+            self.bytes_read += read;
+            Ok(read)
+        }
+    }
+
+    impl Seek for CountedReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.seeks += 1;
+            if self.seek_error {
+                return Err(io::Error::other("injected header seek failure"));
+            }
+            self.cursor.seek(pos)
+        }
+    }
+
+    fn segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(payload.len() + 2).unwrap();
+        let mut bytes = vec![0xff, marker];
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn packet(rating: i8) -> String {
+        lightcraft_meta::write_xmp(&lightcraft_meta::Metadata { rating: Some(rating), ..Default::default() }, None)
+    }
+
+    fn xmp_segment(packet: &str) -> Vec<u8> {
+        let mut payload = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        payload.extend_from_slice(packet.as_bytes());
+        segment(0xe1, &payload)
+    }
+
+    fn jpeg(packet: &str) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8];
+        bytes.extend(xmp_segment(packet));
+        bytes
+    }
+
+    #[test]
+    fn first_standard_packet_skips_other_segments_and_stops_before_tail() {
+        let first = packet(2);
+        let first_payload_len = xmp_segment(&first).len() - 4;
+        let mut bytes = vec![0xff, 0xd8];
+        bytes.extend(segment(0xe0, &[7; 17]));
+        bytes.extend(segment(0xe1, b"Exif\0\0tiny"));
+        let mut extended = b"http://ns.adobe.com/xmp/extension/\0".to_vec();
+        extended.extend_from_slice(&[0; 40]);
+        extended.extend_from_slice(b"not a standard packet");
+        bytes.extend(segment(0xe1, &extended));
+        bytes.extend(xmp_segment(&first));
+        let end = bytes.len();
+        bytes.extend(xmp_segment(&packet(5)));
+        bytes.extend_from_slice(&[0xff, 0xda, 0, 2]);
+        bytes.extend_from_slice(&[3; 128]);
+        let mut reader = CountedReader::new(bytes);
+        reader.read_error_at = Some(end as u64);
+        assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS), Some(first));
+        assert_eq!(reader.cursor.position(), end as u64, "later packets and image bytes are not read");
+        assert_eq!(reader.bytes_read, end - 17, "APP0 payload is skipped, not buffered");
+        assert_eq!(reader.seeks, 1);
+        assert_eq!(reader.largest_read, first_payload_len, "reads at most one complete APP1 payload at a time");
+    }
+
+    #[test]
+    fn stops_at_sos_or_eoi_without_reading_later_xmp() {
+        for stop in [0xda, 0xd9] {
+            let mut bytes = vec![0xff, 0xd8, 0xff, stop];
+            bytes.extend(xmp_segment(&packet(3)));
+            let mut reader = CountedReader::new(bytes);
+            reader.read_error_at = Some(4);
+            assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS), None);
+            assert_eq!((reader.bytes_read, reader.cursor.position(), reader.seeks), (4, 4, 0));
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_app1_even_when_partial_xmp_parses() {
+        let expected = packet(4);
+        let mut bytes = jpeg(&expected);
+        let declared = u16::from_be_bytes([bytes[4], bytes[5]]) + 7;
+        bytes[4..6].copy_from_slice(&declared.to_be_bytes());
+        let partial = lightcraft_meta::jpeg_segments(&bytes).xmp.unwrap();
+        assert_eq!(partial, expected, "the shared extractor tolerates a truncated declared payload");
+        assert_eq!(super::parse_sidecar(&partial, crate::crs::Target::Rendered).unwrap().rating, Some(4));
+        let len = bytes.len();
+        let mut reader = CountedReader::new(bytes);
+        assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS), None);
+        assert_eq!(reader.bytes_read, len);
+    }
+
+    #[test]
+    fn span_budget_counts_soi_headers_and_skipped_payloads() {
+        let expected = packet(3);
+        let mut bytes = vec![0xff, 0xd8];
+        bytes.extend(segment(0xe0, &[9; 23]));
+        bytes.extend(xmp_segment(&expected));
+        let end = bytes.len();
+        let mut exact = CountedReader::new(bytes.clone());
+        assert_eq!(read_jpeg_xmp(&mut exact, end as u64, JPEG_XMP_HEADER_STEPS), Some(expected));
+        assert_eq!(exact.cursor.position(), end as u64, "a complete early APP1 does not require EOI");
+        assert_eq!(exact.bytes_read, end - 23);
+        let mut short = CountedReader::new(bytes);
+        assert_eq!(read_jpeg_xmp(&mut short, (end - 1) as u64, JPEG_XMP_HEADER_STEPS), None);
+        assert_eq!((short.bytes_read, short.cursor.position(), short.seeks), (10, 33, 1), "reject before APP1 payload read");
+        assert_eq!(short.largest_read, 2);
+    }
+
+    #[test]
+    fn span_budget_rejects_skip_before_seeking() {
+        let mut bytes = vec![0xff, 0xd8];
+        bytes.extend(segment(0xe0, &[8; 18]));
+        bytes.extend(xmp_segment(&packet(1)));
+        let mut reader = CountedReader::new(bytes);
+        assert_eq!(read_jpeg_xmp(&mut reader, 6, JPEG_XMP_HEADER_STEPS), None);
+        assert_eq!((reader.bytes_read, reader.cursor.position(), reader.seeks), (6, 6, 0));
+    }
+
+    #[test]
+    fn marker_budget_counts_fill_and_standalone_markers() {
+        let expected = packet(1);
+        // Two fill steps, SOI, TEM, RST3, then APP1: six steps after the initial SOI.
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xff, 0xff, 0xd8, 0xff, 0x01, 0xff, 0xd3];
+        bytes.extend(xmp_segment(&expected));
+        for (steps, end) in [(0, 2), (5, 10)] {
+            let mut reader = CountedReader::new(bytes.clone());
+            assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, steps), None);
+            assert_eq!((reader.bytes_read, reader.cursor.position()), (end, end as u64));
+        }
+        let mut reader = CountedReader::new(bytes);
+        assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, 6), Some(expected));
+    }
+
+    #[test]
+    fn rejects_invalid_headers_and_segment_lengths() {
+        for bytes in [
+            vec![],
+            vec![0xff],
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+            vec![0xff, 0xd8, 0, 0xe1, 0, 2],
+            vec![0xff, 0xd8, 0xff, 0xe1, 0],
+            vec![0xff, 0xd8, 0xff, 0xe1, 0, 0],
+            vec![0xff, 0xd8, 0xff, 0xe1, 0, 1],
+            vec![0xff, 0xd8, 0xff, 0xe1, 0, 3],
+        ] {
+            let len = bytes.len();
+            let mut reader = CountedReader::new(bytes);
+            assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS), None);
+            assert!(reader.bytes_read <= len);
+        }
+    }
+
+    #[test]
+    fn propagates_read_and_seek_failures() {
+        for at in [0, 6] {
+            let mut reader = CountedReader::new(jpeg(&packet(4)));
+            reader.read_error_at = Some(at);
+            assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS), None);
+            assert_eq!(reader.bytes_read as u64, at);
+        }
+        let mut bytes = vec![0xff, 0xd8];
+        bytes.extend(segment(0xe0, &[1]));
+        bytes.extend(xmp_segment(&packet(4)));
+        let mut reader = CountedReader::new(bytes);
+        reader.seek_error = true;
+        assert_eq!(read_jpeg_xmp(&mut reader, JPEG_XMP_HEADER_SPAN, JPEG_XMP_HEADER_STEPS), None);
+        assert_eq!((reader.bytes_read, reader.seeks), (6, 1));
+    }
+
+    #[test]
+    fn handles_short_reads_without_bypassing_span_limit() {
+        let expected = packet(2);
+        let bytes = jpeg(&expected);
+        let end = bytes.len();
+        let mut exact = CountedReader::new(bytes.clone());
+        exact.chunk = 1;
+        assert_eq!(read_jpeg_xmp(&mut exact, end as u64, JPEG_XMP_HEADER_STEPS), Some(expected));
+        assert_eq!(exact.bytes_read, end);
+        for (span, read) in [(0, 0), (1, 1), (end - 1, 6)] {
+            let mut reader = CountedReader::new(bytes.clone());
+            reader.chunk = 1;
+            assert_eq!(read_jpeg_xmp(&mut reader, span as u64, JPEG_XMP_HEADER_STEPS), None);
+            assert_eq!(reader.bytes_read, read);
+            assert!(reader.cursor.position() <= span as u64);
+        }
     }
 }

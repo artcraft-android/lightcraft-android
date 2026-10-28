@@ -5,6 +5,10 @@
 //!   (frequency separation — a fast, stable approximation of gradient-domain healing).
 //! - **Remove** is Heal with an automatically chosen source: candidate offsets on rings around the
 //!   spot are scored by how well the source's surrounding annulus matches the target's.
+//! - **Fill** (content-aware) rebuilds the spot from patches of its surroundings instead of one
+//!   source: PatchMatch-based completion ([`lightcraft_inpaint::complete`]), coarse to fine, so the
+//!   structure is chosen at a scale set by the spot's size (the same at preview and export size).
+//!   Deterministic; the source offset is ignored.
 
 use lightcraft_develop::{Spot, SpotMode};
 use lightcraft_geom::Point;
@@ -14,8 +18,25 @@ use crate::geometry::Frame;
 
 #[inline]
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
+    // Zero feather is a hard edge, including when the pixel lies exactly on the radius.
+    // Dividing 0 by 0 here would give that pixel a NaN alpha, even at zero opacity.
+    if e0 >= e1 {
+        return if x < e1 { 0.0 } else { 1.0 };
+    }
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Most a spot's size counts for, in long edges: a size read from a sidecar isn't held to the slider's range, and one
+/// far past the picture (or infinite) made the radius, the blur it heals with and the patch it reads from unbounded
+/// (issue #1519). Two long edges cover the whole frame from anywhere in it.
+const MAX_SPOT_SIZE: f64 = 2.0;
+
+/// A spot's radius in output pixels, `ppl` output pixels to the long edge: at least a pixel (a size that is not a
+/// number too), at most [`MAX_SPOT_SIZE`] long edges.
+fn radius_px(size: f64, ppl: f64) -> f64 {
+    let size = if size.is_nan() { 0.0 } else { size.min(MAX_SPOT_SIZE) };
+    (size * ppl).max(1.0)
 }
 
 /// Mean colour of `img` in a disc/annulus.
@@ -95,7 +116,7 @@ pub fn pick_source(
     let img = frame.sample(src, w, h);
     let (to_out, to_norm) = (frame.norm_to_out(w, h), frame.out_to_norm(w, h));
     let t = to_out.apply(*spot.points.first()?);
-    let r = (spot.size * frame.px_per_long(w)).max(1.0) as f32;
+    let r = radius_px(spot.size, frame.px_per_long(w)) as f32;
     let avoid = avoid.map(|o| {
         let (a, b) = (to_out.apply(Point::new(0.0, 0.0)), to_out.apply(o));
         ((b.x - a.x) as f32, (b.y - a.y) as f32)
@@ -161,7 +182,7 @@ pub fn window_for_reads_checked(
     let boxes: Vec<([f64; 4], [f64; 4])> = spots
         .iter()
         .filter_map(|spot| {
-            let r = (spot.size * ppl).max(1.0);
+            let r = radius_px(spot.size, ppl);
             let pts: Vec<_> = spot.points.iter().map(|p| to_out.apply(*p)).collect();
             let first = pts.first()?;
             let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
@@ -235,6 +256,20 @@ pub fn window_for_reads_checked(
     )
 }
 
+/// Content-aware fill of the box: `src` becomes `tgt` with every pixel under the stroke (`alpha > 0`)
+/// rebuilt from the rest of the box. Falls back to a smooth membrane fill when the box holds no whole
+/// patch to copy from.
+fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh: usize) {
+    let hole: Vec<bool> = alpha.iter().map(|a| *a > 0.0).collect();
+    let flat: Vec<f32> = tgt.iter().flatten().copied().collect();
+    let out = lightcraft_inpaint::complete(bw, bh, 3, &flat, &hole, &lightcraft_inpaint::CompleteParams::default())
+        .unwrap_or_else(|| lightcraft_inpaint::membrane_fill(bw, bh, 3, &flat, &hole));
+    let (pixels, _) = out.as_chunks::<3>();
+    for (d, v) in src.iter_mut().zip(pixels) {
+        *d = *v;
+    }
+}
+
 /// Apply all spots to `img` (output resolution). `ppl` = output pixels per long-edge unit.
 pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
     if spots.is_empty() {
@@ -243,7 +278,7 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
     let (w, h) = (img.width, img.height);
     let to_out = frame.norm_to_out(w, h);
     for spot in spots {
-        let r = (spot.size * ppl).max(1.0) as f32;
+        let r = radius_px(spot.size, ppl) as f32;
         let pts: Vec<(f32, f32)> = spot
             .points
             .iter()
@@ -253,7 +288,9 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             })
             .collect();
         let Some(&first) = pts.first() else { continue };
+        let fill = spot.mode == SpotMode::Fill;
         let offset = match spot.source_offset {
+            _ if fill => (0.0, 0.0),
             Some(o) => {
                 let a = to_out.apply(Point::new(0.0, 0.0));
                 let b = to_out.apply(o);
@@ -269,7 +306,8 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             x1 = x1.max(p.0 + r);
             y1 = y1.max(p.1 + r);
         }
-        let pad = r;
+        // content-aware fill reads the spot's surroundings (the window holds 2 radii around it)
+        let pad = if fill { 2.0 * r } else { r };
         let (bx0, by0) = (((x0 - pad).floor().max(0.0)) as usize, ((y0 - pad).floor().max(0.0)) as usize);
         let (bx1, by1) = (((x1 + pad).ceil() as usize).min(w), ((y1 + pad).ceil() as usize).min(h));
         if bx1 <= bx0 || by1 <= by0 {
@@ -292,7 +330,10 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
                 tgt[y * bw + x] = img.get(bx0 + x, by0 + y);
             }
         }
-        let heal = spot.mode != SpotMode::Clone;
+        if fill {
+            fill_box(&mut src, &tgt, &alpha, bw, bh);
+        }
+        let heal = matches!(spot.mode, SpotMode::Remove | SpotMode::Heal);
         let low = if heal {
             // Tone correction from the spot's *surroundings* only: normalized convolution of
             // (target − source) over pixels outside the stroke (a membrane-like interpolation).
@@ -346,6 +387,51 @@ mod tests {
     use lightcraft_develop::DevelopSettings;
 
     #[test]
+    fn hard_edge_spots_at_zero_opacity_leave_every_pixel_unchanged() {
+        for mode in [SpotMode::Clone, SpotMode::Heal, SpotMode::Remove, SpotMode::Fill] {
+            for (cx, cy) in [(32.5, 24.5), (0.5, 0.5)] {
+                let original = Rgb32f::from_fn(64, 48, |x, y| [0.2 + x as f32 / 128.0, 0.3 + y as f32 / 128.0, 0.4]);
+                let mut img = original.clone();
+                let frame = Frame::new(64, 48, &DevelopSettings::default(), true);
+                let spot = Spot {
+                    mode,
+                    points: vec![Point::new(cx / 64.0, cy / 48.0)],
+                    size: 5.0 / 64.0,
+                    feather: 0.0,
+                    opacity: 0.0,
+                    source_offset: Some(Point::new(8.0 / 64.0, 0.0)),
+                };
+                apply(&mut img, &[spot], &frame, frame.px_per_long(64));
+                for (i, (actual, expected)) in img.data.iter().zip(&original.data).enumerate() {
+                    assert_eq!(actual, expected, "zero-opacity {mode:?} at ({cx}, {cy}), pixel {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hard_edge_clone_copies_inside_and_preserves_pixels_on_the_radius() {
+        for (w, h, cx, cy, radius) in [(64, 48, 32.5, 24.5, 5.0), (128, 96, 64.5, 48.5, 10.0)] {
+            let original = Rgb32f::from_fn(w, h, |x, y| [0.2 + x as f32 / w as f32, y as f32 / h as f32, 0.4]);
+            let mut img = original.clone();
+            let frame = Frame::new(w, h, &DevelopSettings::default(), true);
+            let spot = Spot {
+                mode: SpotMode::Clone,
+                points: vec![Point::new(cx / w as f64, cy / h as f64)],
+                size: radius / w as f64,
+                feather: 0.0,
+                opacity: 100.0,
+                source_offset: Some(Point::new(0.125, 0.0)),
+            };
+            apply(&mut img, &[spot], &frame, frame.px_per_long(w));
+            let (x, y) = (cx as usize, cy as usize);
+            assert_eq!(img.get(x, y), original.get(x + w / 8, y), "inside copies the source at {w}px");
+            assert_eq!(img.get(x + radius as usize, y), original.get(x + radius as usize, y), "radius stays unchanged at {w}px");
+            assert!(img.data.iter().flatten().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
     fn remove_erases_a_dot() {
         // flat grey with a gentle gradient and a black dot in the middle
         let mut img = Rgb32f::from_fn(120, 80, |x, _| [0.2 + x as f32 * 0.001; 3]);
@@ -359,6 +445,79 @@ mod tests {
         apply(&mut img, &[spot], &frame, frame.px_per_long(120));
         let c = img.get(60, 40);
         assert!((c[0] - 0.26).abs() < 0.03, "{c:?}");
+    }
+
+    /// Vertical stripes (period `period` px) with a black blot over the middle.
+    fn striped_with_blot(w: usize, h: usize, period: usize) -> Rgb32f {
+        let mut img = Rgb32f::from_fn(w, h, |x, _| if (x / period).is_multiple_of(2) { [0.2; 3] } else { [0.7; 3] });
+        let (cx, cy, r) = (w as f32 / 2.0, h as f32 / 2.0, w as f32 * 0.04);
+        for y in 0..h {
+            for x in 0..w {
+                if (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy) < r {
+                    img.set(x, y, [0.0; 3]);
+                }
+            }
+        }
+        img
+    }
+
+    fn fill_spot() -> Spot {
+        // a source offset is ignored by Fill
+        Spot {
+            mode: SpotMode::Fill,
+            points: vec![Point::new(0.5, 0.5)],
+            size: 0.06,
+            feather: 0.0,
+            source_offset: Some(Point::new(0.3, 0.0)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fill_rebuilds_structure_deterministically() {
+        let (w, h) = (200, 160);
+        let mut img = striped_with_blot(w, h, 8);
+        let frame = Frame::new(w, h, &DevelopSettings::default(), true);
+        apply(&mut img, &[fill_spot()], &frame, frame.px_per_long(w));
+        // the blot is gone and the stripes continue through it
+        let mut err = 0.0f32;
+        for x in 90..110 {
+            let want = if (x / 8) % 2 == 0 { 0.2 } else { 0.7 };
+            err += (img.get(x, 80)[0] - want).abs();
+        }
+        assert!(err / 20.0 < 0.12, "mean error {}", err / 20.0);
+        let mut again = striped_with_blot(w, h, 8);
+        apply(&mut again, &[fill_spot()], &frame, frame.px_per_long(w));
+        assert_eq!(img.data, again.data);
+    }
+
+    #[test]
+    fn fill_matches_between_preview_and_export_size() {
+        // the same photo at two sizes: the half-size fill matches the full-size one, downsampled
+        let (mut big, mut small) = (striped_with_blot(320, 240, 16), striped_with_blot(160, 120, 8));
+        let (fb, fs) = (Frame::new(320, 240, &DevelopSettings::default(), true), Frame::new(160, 120, &DevelopSettings::default(), true));
+        apply(&mut big, &[fill_spot()], &fb, fb.px_per_long(320));
+        apply(&mut small, &[fill_spot()], &fs, fs.px_per_long(160));
+        let (mut err, mut n) = (0.0f32, 0);
+        for y in 50..70 {
+            for x in 70..90 {
+                let b: f32 = [(0, 0), (1, 0), (0, 1), (1, 1)].iter().map(|(dx, dy)| big.get(2 * x + dx, 2 * y + dy)[0]).sum::<f32>() / 4.0;
+                err += (b - small.get(x, y)[0]).abs();
+                n += 1;
+            }
+        }
+        assert!(err / n as f32 <= 0.08, "mean difference {}", err / n as f32);
+    }
+
+    #[test]
+    fn fill_survives_hostile_spots() {
+        let frame = Frame::new(40, 30, &DevelopSettings::default(), true);
+        for (p, size) in [((0.0, 0.0), 2.0), ((-5.0, 9.0), 0.1), ((0.5, 0.5), 0.0), ((f64::NAN, 0.5), 0.1), ((0.5, 0.5), f64::INFINITY)] {
+            let mut img = Rgb32f::from_fn(40, 30, |x, _| [x as f32 / 40.0; 3]);
+            let spot = Spot { mode: SpotMode::Fill, points: vec![Point::new(p.0, p.1)], size, ..Default::default() };
+            apply(&mut img, &[spot], &frame, frame.px_per_long(40));
+            assert!(img.data.iter().flatten().all(|v| v.is_finite()));
+        }
     }
 
     #[test]

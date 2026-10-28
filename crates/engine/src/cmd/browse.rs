@@ -6,11 +6,14 @@
 //! Each browse records when the folders it listed were browsed. Untouched records of folders
 //! not browsed for [`Session::forget_local_days`] are forgotten (when the library opens, or with
 //! `library.forgetLocal`); see [`lightcraft_catalog::local`] for what "untouched" means. Files
-//! and sidecars on disk are never touched, and browsing the folder again brings them back.
+//! and sidecars on disk are never touched, and browsing the folder again brings them back. A
+//! browse also forgets at once the untouched records of the folder's files that are gone from
+//! the disk (deleted or moved by another app), so the folder shows what is on disk.
 
 use std::path::Path;
 
-use lightcraft_catalog::{Op, PhotoId};
+use lightcraft_catalog::query::in_folder;
+use lightcraft_catalog::{Op, PhotoId, Source};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, bool_or, cmd, str_param};
@@ -39,12 +42,86 @@ fn browse(s: &mut Session, p: &Value) -> Result<Value> {
         v.sort();
         v
     };
-    let report = import_with(s, &files, &ImportOptions { mode: ImportMode::Add, local: true, ..Default::default() })?;
+    // looking at a folder never brings its deleted photos back (importing the files does)
+    let opts = ImportOptions { mode: ImportMode::Add, local: true, on_deleted: crate::import::OnDeleted::Skip, ..Default::default() };
+    let report = import_with(s, &files, &opts)?;
+    let forgotten = forget_gone(s, &dir_s, subfolders, &files);
     stamp_browsed(s, &dir_s, &files);
     s.browse = Some(Browse { path: dir_s.clone(), subfolders });
     s.source = LibrarySource::Folder;
+    s.keep_active_in_view();
     let shown = s.visible().len();
-    Ok(json!({"path": dir_s, "subfolders": subfolders, "photos": shown, "new": report.imported.len(), "failed": report.failed.len()}))
+    Ok(json!({
+        "path": dir_s,
+        "subfolders": subfolders,
+        "photos": shown,
+        "new": report.imported.len(),
+        "failed": report.failed.len(),
+        "forgotten": forgotten,
+    }))
+}
+
+impl Session {
+    /// Forget the untouched Local records of files gone from the folder `dir` (with its subfolders when
+    /// `subfolders`) that a browse just listed as `files`: what `library.browse` does after reading a folder, for a
+    /// UI that reads it on a worker thread instead. Returns how many went.
+    pub fn forget_gone_from(&mut self, dir: &str, subfolders: bool, files: &[String]) -> usize {
+        forget_gone(self, dir, subfolders, files)
+    }
+}
+
+/// Local records in the browsed folder whose files are no longer on disk (deleted or moved by
+/// another app) and that nothing was changed on are forgotten, as `library.forgetLocal` forgets
+/// them: the folder shows what is on disk, not photos that fail to load (and log an error) on
+/// every visit (issue #1392). Records the user changed stay, shown as missing, and so do those
+/// the session holds (selected, edited, in the undo history) or with a smart preview. Returns how
+/// many went.
+fn forget_gone(s: &mut Session, dir: &str, subfolders: bool, files: &[String]) -> usize {
+    let listed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+    let held = held(s);
+    let smart = s.media.smart_dir.clone();
+    let gone: Vec<PhotoId> = s
+        .catalog
+        .photos()
+        .filter(|p| p.local && !p.deleted && !held.contains(&p.id))
+        // a smart preview may be all that is left of the picture
+        .filter(|p| !smart.as_ref().is_some_and(|d| crate::smart::file_path(d, p).exists()))
+        .filter(|p| match &p.source {
+            // a file left out of the listing is checked on disk: another spelling of its path, or
+            // a listing that missed it, keeps it
+            Source::File { path } => in_folder(path, dir, subfolders) && !listed.contains(path.as_str()) && !Path::new(path).exists(),
+            Source::Demo { .. } => false,
+        })
+        .map(|p| p.id)
+        .collect();
+    if gone.is_empty() {
+        return 0;
+    }
+    let mut forgotten = 0;
+    for chunk in s.catalog.forgettable_local(&gone).chunks(2000) {
+        let op = Op::Batch { ops: chunk.iter().map(|id| Op::RemovePhoto { id: *id }).collect() };
+        match s.catalog.apply(op.clone()) {
+            Ok(_) => {
+                s.pending_log.push(op);
+                forgotten += chunk.len();
+            }
+            Err(e) => log::warn!("forget Local records of files gone from {dir}: {e}"),
+        }
+    }
+    if forgotten > 0 {
+        log::info!("forgot {forgotten} untouched Local record(s) of files gone from {dir}");
+    }
+    forgotten
+}
+
+impl Session {
+    /// Record that the folder `root` was browsed now, with the folders of `files` (the photos it showed): what
+    /// `library.browse` does after reading a folder, for a UI that reads it on a worker thread instead. Untouched
+    /// Local photos are forgotten only from folders not browsed for the set number of days, so a browse that
+    /// isn't recorded lets a folder in daily use be forgotten.
+    pub fn note_browsed(&mut self, root: &str, files: &[String]) {
+        stamp_browsed(self, root, files);
+    }
 }
 
 /// Folders whose browse time is refreshed at most this often (keeps repeated browsing from
@@ -80,7 +157,19 @@ fn stamp_browsed(s: &mut Session, root: &str, files: &[String]) {
 /// Photos the session still needs, whatever their state: shown, selected, being edited, or
 /// referred to by an undo / redo step.
 fn in_use(s: &mut Session) -> std::collections::HashSet<PhotoId> {
-    let mut keep: std::collections::HashSet<PhotoId> = s.visible().iter().copied().collect();
+    let mut keep = held(s);
+    // Missing Photos lists library photos only, never Local records, so it keeps nothing here; and
+    // working it out checks every original (minutes on a sleeping NAS when the library opens on it)
+    if s.source != crate::LibrarySource::Missing {
+        keep.extend(s.visible().iter().copied());
+    }
+    keep
+}
+
+/// Photos the session holds whatever is shown: selected, being edited, or referred to by an undo
+/// / redo step.
+fn held(s: &Session) -> std::collections::HashSet<PhotoId> {
+    let mut keep: std::collections::HashSet<PhotoId> = std::collections::HashSet::new();
     keep.extend(s.selection.ids.iter().copied());
     keep.extend(s.selection.active);
     keep.extend(s.previous_active);
@@ -105,7 +194,7 @@ impl Session {
         let smart = self.media.smart_dir.clone();
         let plan = self
             .catalog
-            .forget_local_plan(&now, days, &|p| keep.contains(&p.id) || smart.as_ref().is_some_and(|d| d.join(crate::smart::file_name(p)).exists()));
+            .forget_local_plan(&now, days, &|p| keep.contains(&p.id) || smart.as_ref().is_some_and(|d| crate::smart::file_path(d, p).exists()));
         if dry_run {
             return plan;
         }
@@ -149,7 +238,7 @@ fn forget_local(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// The browsed photos among `ids` (default: the selection) become library photos.
 fn add_to_library(s: &mut Session, p: &Value) -> Result<Value> {
-    let ids: Vec<PhotoId> = s.targets(p).into_iter().filter(|id| s.catalog.photo(*id).is_some_and(|ph| ph.local)).collect();
+    let ids: Vec<PhotoId> = s.targets(p)?.into_iter().filter(|id| s.catalog.photo(*id).is_some_and(|ph| ph.local)).collect();
     if ids.is_empty() {
         return Ok(json!({"added": 0}));
     }
@@ -194,6 +283,24 @@ pub fn specs() -> Vec<CommandSpec> {
                 let n = move_folder(s, &from, &to).map_err(|e| bad("folder.move", e))?;
                 Ok(json!({"path": to, "relinked": n}))
             }
+        ),
+        cmd!(
+            "folder.create",
+            "New Folder on Disk",
+            [],
+            None,
+            "{parent, name} — create a folder on disk inside `parent` (refused if the name is taken); one undo step (undo removes it again while it is empty) → {path}",
+            always,
+            create_folder
+        ),
+        cmd!(
+            "photo.moveToFolder",
+            "Move to Folder",
+            [],
+            None,
+            "{folder, ids?} — move the photos' files (default: the selection) with their XMP sidecars into `folder` on disk and relink them; virtual copies follow their master; across volumes the file is copied, verified and only then removed; never overwrites (a name taken in `folder` refuses the whole move); missing/offline and Local photos are refused; one undo step (undo moves them back) → {moved, folder}",
+            always,
+            move_to_folder
         ),
         cmd!(
             "library.browse",
@@ -249,11 +356,135 @@ pub(crate) fn rename_folder_on_disk(from: &str, to: &str) -> std::result::Result
     std::fs::rename(src, dst).map_err(|e| format!("{from} → {to}: {e}"))
 }
 
+/// Do an undo step's folder change on disk: rename `from` → `to`; with `to` empty, remove the
+/// empty folder `from`; with `from` empty, create the folder `to`. Never overwrites.
+pub(crate) fn folder_on_disk(from: &str, to: &str) -> std::result::Result<(), String> {
+    match (from.is_empty(), to.is_empty()) {
+        (false, false) => rename_folder_on_disk(from, to),
+        (false, true) => remove_empty_folder(from),
+        (true, false) => {
+            if Path::new(to).exists() {
+                return Err(format!("{to} already exists"));
+            }
+            std::fs::create_dir(to).map_err(|e| format!("{to}: {e}"))
+        }
+        (true, true) => Ok(()),
+    }
+}
+
+/// Remove an empty folder; one with anything in it (hidden files too) is refused.
+fn remove_empty_folder(path: &str) -> std::result::Result<(), String> {
+    let p = Path::new(path);
+    if !p.is_dir() {
+        return Err(format!("{path} is not a folder"));
+    }
+    let mut entries = std::fs::read_dir(p).map_err(|e| format!("{path}: {e}"))?;
+    if entries.next().is_some() {
+        return Err(format!("{path} is not empty"));
+    }
+    std::fs::remove_dir(p).map_err(|e| format!("{path}: {e}"))
+}
+
+/// A folder path parameter without trailing separators (`None` when missing or blank).
+fn folder_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
+    str_param(p, key).map(|x| x.trim_end_matches(['/', '\\'])).filter(|x| !x.is_empty())
+}
+
+/// `folder.create`: a new folder on disk inside `parent`; undo removes it while it is empty.
+fn create_folder(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "folder.create";
+    let parent = folder_param(p, "parent").ok_or_else(|| bad(C, "missing parent"))?;
+    let name = str_param(p, "name")
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && *n != "." && *n != "..")
+        .ok_or_else(|| bad(C, "give a folder name (no slashes)"))?;
+    if !Path::new(parent).is_dir() {
+        return Err(bad(C, format!("{parent} is not a folder (offline, moved or deleted?)")));
+    }
+    let path = Path::new(parent).join(name).to_string_lossy().to_string();
+    if Path::new(&path).exists() {
+        return Err(bad(C, format!("{path} already exists: choose another name")));
+    }
+    folder_on_disk("", &path).map_err(|e| bad(C, e))?;
+    let undo = crate::FolderMove { from: path.clone(), to: String::new() };
+    if let Err(e) = s.commit_with_folder(&format!("Create Folder “{name}”"), Op::Batch { ops: vec![] }, undo) {
+        let _ = remove_empty_folder(&path);
+        return Err(e);
+    }
+    Ok(json!({"path": path}))
+}
+
+/// `photo.moveToFolder`: move the photos' files (with their sidecars) into `folder` and relink
+/// them, as one undo step. Virtual copies follow their master's file. Never overwrites: a name
+/// already taken in `folder` refuses the whole move.
+fn move_to_folder(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "photo.moveToFolder";
+    let folder = folder_param(p, "folder").ok_or_else(|| bad(C, "missing folder"))?;
+    let dir = Path::new(folder);
+    if !dir.is_dir() {
+        return Err(bad(C, format!("{folder} is not a folder (create it first with folder.create)")));
+    }
+    let ids = s.targets(p)?;
+    if ids.is_empty() {
+        return Err(bad(C, "no photos to move: select some or give ids"));
+    }
+    let mut plans: Vec<crate::rename::RenamePlan> = Vec::new();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut clashes: Vec<String> = Vec::new();
+    for id in ids {
+        let ph = s.catalog.photo(id).ok_or_else(|| bad(C, format!("no photo {}", id.0)))?;
+        if ph.local {
+            return Err(bad(C, format!("{} is not in the library (Local): add it first", ph.file_name)));
+        }
+        let lightcraft_catalog::Source::File { path } = &ph.source else {
+            return Err(bad(C, format!("{} has no file on disk", ph.file_name)));
+        };
+        if plans.iter().any(|pl| pl.from_path.as_deref() == Some(path.as_str())) {
+            continue; // a virtual copy of a photo already moving
+        }
+        let src = Path::new(path);
+        if !src.is_file() {
+            return Err(bad(C, format!("{path} is missing or offline: find it first (Find Missing Photos)")));
+        }
+        let Some(file) = src.file_name() else { return Err(bad(C, format!("{path}: no file name"))) };
+        if src.parent() == Some(dir) {
+            continue; // already there
+        }
+        let to = dir.join(file);
+        let to_s = to.to_string_lossy().to_string();
+        if to.exists() || !taken.insert(to_s.to_lowercase()) {
+            clashes.push(file.to_string_lossy().to_string());
+            continue;
+        }
+        let name = ph.file_name.clone();
+        plans.push(crate::rename::RenamePlan { id: id.0, from: name.clone(), to: name, from_path: Some(path.clone()), to_path: Some(to_s) });
+    }
+    if !clashes.is_empty() {
+        let s_ = if clashes.len() == 1 { "" } else { "s" };
+        return Err(bad(
+            C,
+            format!("{} already in {folder}: nothing was moved. Rename the photo{s_} first or choose another folder", clashes.join(", ")),
+        ));
+    }
+    let n = plans.len();
+    if n == 0 {
+        return Ok(json!({"moved": 0, "folder": folder}));
+    }
+    let plural = |k: usize| if k == 1 { "" } else { "s" };
+    let _task = s.activity.start("move", &format!("Moving {n} photo{}", plural(n)), crate::activity::Cancel::No);
+    let name = dir.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| folder.to_string());
+    s.apply_file_plans(&crate::rename::RealFs, &plans, &|k| format!("Move {k} Photo{} to “{name}”", plural(k)))?;
+    Ok(json!({"moved": n, "folder": folder}))
+}
+
 /// After a folder moved from `from` to `to`: a browsed folder at or below it follows.
 pub(crate) fn follow_folder(s: &mut Session, from: &str, to: &str) {
     // a library folder chosen at or below it follows too, as a source or as a filter
     follow_library_folder(&mut s.library_folder, from, to);
     follow_library_folder(&mut s.filter.library_folder, from, to);
+    if let Some(f) = s.shelved_filter.as_mut() {
+        follow_library_folder(&mut f.library_folder, from, to);
+    }
     if let Some(b) = &mut s.browse
         && let Ok(rel) = Path::new(&b.path).strip_prefix(from)
     {
@@ -285,8 +516,11 @@ pub(crate) fn move_folder(s: &mut Session, from: &str, to: &str) -> std::result:
     if s.library.as_ref().is_some_and(|l| l.dir.starts_with(src) || src.starts_with(&l.dir)) {
         return Err("the library's own folders can't be moved here".into());
     }
+    // Repairs retain their exact old paths, including those on surviving history entries.
+    // Complete them before the directory moves; an unavailable repair leaves it in place.
+    s.repair_sidecars_with(&crate::rename::RealFs).map_err(|e| e.to_string())?;
     rename_folder_on_disk(from, to)?;
-    let ops: Vec<Op> = s
+    let mut ops: Vec<Op> = s
         .catalog
         .photos()
         .filter_map(|p| match &p.source {
@@ -301,6 +535,8 @@ pub(crate) fn move_folder(s: &mut Session, from: &str, to: &str) -> std::result:
         })
         .collect();
     let n = ops.len();
+    // what the library knows about the folder (and those inside it) goes along, in the same step
+    ops.extend(s.catalog.folder_records_follow(from, to));
     let name = Path::new(to).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let renamed = src.parent() == dst.parent();
     let label = if renamed { format!("Rename Folder to “{name}”") } else { format!("Move Folder “{name}”") };

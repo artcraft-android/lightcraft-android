@@ -1,19 +1,122 @@
 //! The develop settings schema. Every field has a neutral default; serde uses `#[serde(default)]` so
-//! older/newer files load (unknown fields are ignored, missing fields take defaults).
+//! older/newer files load (unknown fields are ignored, missing fields take defaults). The one
+//! exception is `process`: missing (or unreadable), it is V1, the rendering those older files were
+//! made with.
 
 use lightcraft_geom::{CropGeometry, Homography, Orientation, Point};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The rendering process a photo's settings are interpreted by (what Lightroom calls the process
+/// version). A change that would alter how existing settings render ships as a new process, so a
+/// photo keeps its look until someone updates it (`develop.updateProcess`). See
+/// `docs/process-versions.md`.
+///
+/// Stored as a plain number: one written by a newer LightCraft loads, is kept as it is, and
+/// renders with the newest process this build knows ([`ProcessVersion::process`]). Reading is
+/// lenient: a whole number from 0 to 2^32 - 1 (also written as `2.0`) is that process; anything
+/// else (negative, fractional, too large, text, null, a list…) reads as V1, like a missing field,
+/// so a damaged value never costs the rest of the settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ProcessVersion(pub u32);
+
+impl<'de> Deserialize<'de> for ProcessVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Whole(u64),
+            Number(f64),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::Whole(n) => u32::try_from(n).map_or_else(|_| ProcessVersion::legacy(), ProcessVersion),
+            Wire::Number(x) if x.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&x) => ProcessVersion(x as u32),
+            Wire::Number(_) | Wire::Other(_) => ProcessVersion::legacy(),
+        })
+    }
+}
+
+impl ProcessVersion {
+    /// The first process: LightCraft's rendering from before process versions existed. Frozen.
+    pub const V1: ProcessVersion = Process::V1.version();
+    /// The process new photos and Reset get.
+    pub const LATEST: ProcessVersion = Process::LATEST.version();
+
+    /// The process of settings saved without one (catalogs, snapshots, XMP sidecars and browser
+    /// libraries written before process versions existed): V1, whatever [`Self::LATEST`] becomes.
+    pub fn legacy() -> ProcessVersion {
+        ProcessVersion::V1
+    }
+
+    /// Saved settings leave the field out for V1, so files and preview-cache keys of settings made
+    /// before process versions existed stay byte for byte what they were.
+    pub fn is_legacy(&self) -> bool {
+        *self == ProcessVersion::legacy()
+    }
+
+    /// The process this build renders with: the newest one it knows that isn't newer than this
+    /// number (a number from a newer LightCraft renders with [`Process::LATEST`]; one below V1,
+    /// which no LightCraft writes, with V1).
+    pub fn process(self) -> Process {
+        Process::ALL.into_iter().rev().find(|p| p.version() <= self).unwrap_or(Process::V1)
+    }
+
+    /// A process this build implements.
+    pub fn is_known(self) -> bool {
+        Process::ALL.iter().any(|p| p.version() == self)
+    }
+
+    /// Older than [`Self::LATEST`]: Update to Current Process applies.
+    pub fn is_outdated(self) -> bool {
+        self < ProcessVersion::LATEST
+    }
+}
+
+/// A rendering process this build implements. Matches on it are exhaustive, so adding a process
+/// makes the compiler point at every stage whose behaviour depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Process {
+    /// The rendering of LightCraft before process versions existed (2026-10).
+    V1,
+    /// Highlights and Shadows keep the local contrast of the tones they move: their edge-aware base
+    /// is taken of a fine median of log luminance (issue #632).
+    V2,
+}
+
+impl Process {
+    /// Every process, oldest first.
+    pub const ALL: [Process; 2] = [Process::V1, Process::V2];
+    pub const LATEST: Process = Process::V2;
+
+    pub const fn version(self) -> ProcessVersion {
+        match self {
+            Process::V1 => ProcessVersion(1),
+            Process::V2 => ProcessVersion(2),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevelopSettings {
+    /// Schema version of this structure (not the rendering process, see `process`).
     pub version: u32,
+    /// The rendering process ([`ProcessVersion`]): the latest for new settings, V1 for settings
+    /// saved without the field (the field-level default: not the struct's `Default`) or with a
+    /// value that isn't a process number.
+    #[serde(default = "ProcessVersion::legacy", skip_serializing_if = "ProcessVersion::is_legacy")]
+    pub process: ProcessVersion,
     pub profile: Profile,
     pub treatment: Treatment,
     pub wb: WhiteBalance,
     pub light: Light,
+    /// HDR editing: highlights above SDR white, and the SDR rendition derived from them. Not written while it is
+    /// the default, so settings without HDR keep their JSON and `hash64` (and every cached preview stays valid).
+    #[serde(skip_serializing_if = "Hdr::is_default")]
+    pub hdr: Hdr,
     pub curve: ToneCurve,
     pub color: ColorAdj,
     pub mixer: Mixer,
@@ -44,10 +147,12 @@ impl Default for DevelopSettings {
     fn default() -> Self {
         Self {
             version: SCHEMA_VERSION,
+            process: ProcessVersion::LATEST,
             profile: Profile::default(),
             treatment: Treatment::Color,
             wb: WhiteBalance::default(),
             light: Light::default(),
+            hdr: Hdr::default(),
             curve: ToneCurve::default(),
             color: ColorAdj::default(),
             mixer: Mixer::default(),
@@ -88,11 +193,16 @@ pub struct Profile {
     pub id: String,
     /// Creative profile amount 0..200 (%).
     pub amount: f64,
+    /// Render the raw's own local tone mapping (DNG `ProfileGainTableMap`, Apple ProRAW), as the
+    /// camera does. Off: rendered as Lightroom Classic does, without it. Omitted when off, so
+    /// settings without it keep their JSON (and hash).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub camera_local_tone: bool,
 }
 
 impl Default for Profile {
     fn default() -> Self {
-        Self { id: "lc.color".into(), amount: 100.0 }
+        Self { id: "lc.color".into(), amount: 100.0, camera_local_tone: false }
     }
 }
 
@@ -136,7 +246,13 @@ impl WbMode {
             WbMode::Custom => "Custom",
         }
     }
-    /// Preset temperature/tint for raw files (K, tint).
+    /// Preset temperature/tint for raw files with a Kelvin scale (K, tint): the CIE daylight series D55 / D65 /
+    /// D75 (5503, 6504, 7504 K; CIE 15:2004) for Daylight / Cloudy / Shade, CIE Illuminant A (2856 K) for
+    /// Tungsten, a typical cool-white fluorescent (CIE F2, 4230 K, is the lamp; 3800 K with a magenta correction
+    /// is what a camera's preset neutralises) and a flash at daylight; the tints are the small magenta
+    /// corrections daylight-series whites need above the Planckian locus, as Lightroom's presets of the same
+    /// names show them in its panel (observed values, no Adobe data). On the relative scale (rendered files, raws
+    /// without matrices) `develop.wb` scales them around 6500 K = as shot.
     pub fn preset(self) -> Option<(f64, f64)> {
         match self {
             WbMode::Daylight => Some((5500.0, 10.0)),
@@ -150,9 +266,35 @@ impl WbMode {
     }
 }
 
-/// White balance. For raw files `temp` is the scene illuminant in Kelvin; for rendered files
-/// (JPEG etc.) the image is assumed D65-balanced and `temp`/`tint` are the same model with an
-/// "as shot" of 6500 K / 0 (the UI shows a relative −100..100 scale for those, like Lightroom).
+/// Which scale a [`WhiteBalance`]'s `temp` / `tint` were written on.
+///
+/// Raws whose camera has colour matrices (in the file, or measured for the model) edit white balance in Kelvin;
+/// before that, raws without matrices in the file were all edited relative to their as-shot look, where 6500 K / 0
+/// means *as shot*. Settings written then carry no scale and keep that meaning (`Legacy`): the pipeline turns them
+/// into the same colour change on the Kelvin scale (`lightcraft_pipeline::local::legacy_to_kelvin`), so no photo's
+/// look changes. Settings written on the Kelvin scale say so (`Kelvin`). The scale is irrelevant on files the
+/// Kelvin scale does not reach (rendered photos, raws without matrices): their values keep the relative meaning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WbScale {
+    /// Written before the scale existed, or by a preset / partial JSON without one: relative (6500 K / 0 = as shot)
+    /// on a raw developed from a fitted look, Kelvin on a raw whose file carries matrices. Not written.
+    #[default]
+    Legacy,
+    /// Absolute Kelvin and tint, as Lightroom writes them for raws.
+    Kelvin,
+}
+
+impl WbScale {
+    fn is_legacy(&self) -> bool {
+        *self == WbScale::Legacy
+    }
+}
+
+/// White balance. For raw files with colour matrices `temp` is the scene illuminant in Kelvin (`scale` says the
+/// values were written on that scale); for rendered files (JPEG etc.) and raws without matrices the image is
+/// assumed D65-balanced and `temp`/`tint` are the same model with an "as shot" of 6500 K / 0 (the UI shows a
+/// relative −100..100 scale for those, like Lightroom).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhiteBalance {
@@ -160,11 +302,17 @@ pub struct WhiteBalance {
     pub temp: f64,
     /// Correction direction: negative adds green, positive adds magenta.
     pub tint: f64,
+    /// The scale `temp` / `tint` were written on; left out of the JSON when [`WbScale::Legacy`], so settings
+    /// from before it existed read and write unchanged.
+    #[serde(skip_serializing_if = "WbScale::is_legacy")]
+    pub scale: WbScale,
 }
 
 impl Default for WhiteBalance {
     fn default() -> Self {
-        Self { mode: WbMode::AsShot, temp: 6500.0, tint: 0.0 }
+        // (`Legacy`, like an absent field: a default photo's settings JSON stays what it was; the engine marks the
+        // scale when white balance is written on a raw that has one, `lightcraft_pipeline::local::normalize_wb`)
+        Self { mode: WbMode::AsShot, temp: 6500.0, tint: 0.0, scale: WbScale::Legacy }
     }
 }
 
@@ -550,6 +698,33 @@ impl Default for Optics {
 pub struct EmbeddedLens {
     pub warp: Option<EmbeddedWarp>,
     pub vignette: Option<EmbeddedVignette>,
+    /// A DNG 1.6 `WarpRectilinear2` chain (up to [`WARP_STAGES`] stages, in `OpcodeList3` order; each stage warps
+    /// the result of the one before it). When any is set, `warp` is `None`: the chain holds every warp opcode.
+    pub stages: [Option<EmbeddedWarpStage>; WARP_STAGES],
+}
+
+/// Most warp stages an [`EmbeddedLens`] chain keeps.
+pub const WARP_STAGES: usize = 3;
+
+/// One DNG `WarpRectilinear2` (or a `WarpRectilinear` in a chain with one): per plane (R, G, B)
+/// `[kr0 .. kr14, kt0, kt1, min_valid_radius, max_valid_radius]`. For an output point at offset
+/// `d = (p − center) / radius` with `r = |d|` and `f = Σ krₚ·clamp(r, min, max)ᵖ`, the source point is
+/// `center + radius · (d·f + tangential(d))`, or `d / f` for the radial part when `reciprocal`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddedWarpStage {
+    pub planes: [[f64; 19]; 3],
+    /// Optical centre, normalized to the oriented image (0..1).
+    pub center: Point,
+    /// Normalisation radius as a fraction of the oriented image's long edge.
+    pub radius: f64,
+    pub reciprocal: bool,
+}
+
+impl EmbeddedLens {
+    /// Whether a `WarpRectilinear2` chain is set.
+    pub fn has_stages(&self) -> bool {
+        self.stages.iter().any(Option::is_some)
+    }
 }
 
 /// DNG `WarpRectilinear`: per plane (R, G, B) `[kr0, kr1, kr2, kr3, kt0, kt1]`. For an output (corrected) point at
@@ -730,11 +905,24 @@ pub struct BrushStroke {
     /// edge inside the radius and flow per dab.
     #[serde(skip_serializing_if = "is_false")]
     pub spread: bool,
+    /// Pen pressure (0..1) at each of `points`, recorded when the brush's pressure switch is on: it scales each dab's
+    /// radius and flow. Empty (the default, a mouse or the switch off) is full pressure everywhere; a point past the
+    /// end of a shorter list takes the last value.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pressure: Vec<f32>,
+}
+
+impl BrushStroke {
+    /// The pressure at point `i` (0..1; 1 without pressure data, a hostile value clamped, NaN as 1).
+    pub fn pressure_at(&self, i: usize) -> f32 {
+        let p = self.pressure.get(i).or(self.pressure.last()).copied().unwrap_or(1.0);
+        if p.is_nan() { 1.0 } else { p.clamp(0.0, 1.0) }
+    }
 }
 
 impl Default for BrushStroke {
     fn default() -> Self {
-        Self { points: Vec::new(), size: 0.03, feather: 50.0, flow: 100.0, density: 100.0, erase: false, auto_mask: false, spread: false }
+        Self { points: Vec::new(), size: 0.03, feather: 50.0, flow: 100.0, density: 100.0, erase: false, auto_mask: false, spread: false, pressure: Vec::new() }
     }
 }
 
@@ -890,6 +1078,8 @@ pub enum SpotMode {
     Remove,
     Heal,
     Clone,
+    /// Content-aware: the spot is rebuilt from patches of its surroundings (no single source).
+    Fill,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -957,5 +1147,80 @@ pub struct Enhance {
 impl Enhance {
     pub fn denoise_enabled(&self) -> bool {
         self.denoise_on.unwrap_or(self.denoise > 0.0)
+    }
+}
+
+/// HDR editing. When enabled, an HDR render ([`Hdr::peak`]) keeps highlights above SDR white (1.0)
+/// up to `2^max_ev`; every SDR render (previews on SDR displays, 8/16-bit exports and a gain map's
+/// base image) uses the SDR rendition ([`DevelopSettings::sdr_rendition`]): the same edit with the
+/// `sdr_*` offsets applied.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hdr {
+    pub enabled: bool,
+    /// Headroom limit: stops above SDR white the HDR render may reach.
+    pub max_ev: f64,
+    /// SDR rendition offsets (−100..100): brightness (±1 EV), then added to the matching sliders.
+    pub sdr_brightness: f64,
+    pub sdr_contrast: f64,
+    pub sdr_highlights: f64,
+    pub sdr_shadows: f64,
+    pub sdr_whites: f64,
+    pub sdr_clarity: f64,
+}
+
+impl Default for Hdr {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_ev: Hdr::DEFAULT_MAX_EV,
+            sdr_brightness: 0.0,
+            sdr_contrast: 0.0,
+            sdr_highlights: 0.0,
+            sdr_shadows: 0.0,
+            sdr_whites: 0.0,
+            sdr_clarity: 0.0,
+        }
+    }
+}
+
+impl Hdr {
+    pub const DEFAULT_MAX_EV: f64 = 3.0;
+    pub const MAX_EV_LIMIT: f64 = 5.0;
+
+    /// Whether these are the default HDR settings (HDR off, nothing changed).
+    pub fn is_default(&self) -> bool {
+        *self == Hdr::default()
+    }
+
+    /// Peak linear value of an HDR render relative to SDR white (1.0 when HDR is off). A non-finite headroom
+    /// (a damaged file or argument) falls back to the default, so the peak is always finite and at least 1.
+    pub fn peak(&self) -> f32 {
+        if !self.enabled {
+            return 1.0;
+        }
+        let ev = if self.max_ev.is_finite() { self.max_ev } else { Hdr::DEFAULT_MAX_EV };
+        (ev.clamp(0.0, Hdr::MAX_EV_LIMIT) as f32).exp2()
+    }
+}
+
+impl DevelopSettings {
+    /// The settings an SDR render uses: unchanged when HDR is off; otherwise HDR off and the
+    /// SDR rendition offsets applied to exposure, contrast, highlights, shadows, whites, clarity.
+    pub fn sdr_rendition(&self) -> std::borrow::Cow<'_, DevelopSettings> {
+        if !self.hdr.enabled {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let h = self.hdr;
+        let mut s = self.clone();
+        s.hdr.enabled = false;
+        let add = |v: f64, d: f64| (v + d).clamp(-100.0, 100.0);
+        s.light.exposure = (s.light.exposure + h.sdr_brightness / 100.0).clamp(-5.0, 5.0);
+        s.light.contrast = add(s.light.contrast, h.sdr_contrast);
+        s.light.highlights = add(s.light.highlights, h.sdr_highlights);
+        s.light.shadows = add(s.light.shadows, h.sdr_shadows);
+        s.light.whites = add(s.light.whites, h.sdr_whites);
+        s.effects.clarity = add(s.effects.clarity, h.sdr_clarity);
+        std::borrow::Cow::Owned(s)
     }
 }

@@ -1,7 +1,7 @@
 //! Build previews ahead of time: each photo's grid thumbnail and its loupe view (standard size,
 //! or 1:1), rendered into the memory + disk preview cache so browsing and the loupe are instant.
-//! Runs on a background thread (the app keeps working; progress / cancel by command), or inline
-//! with `wait` (CLI, MCP, tests).
+//! Runs on a background thread (the app keeps working; progress / cancel by command, and a row in
+//! the activity stack, issue #345), or inline with `wait` (CLI, MCP, tests).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, cmd, str_param};
+use crate::activity::{Cancel, TaskGuard};
 use crate::media::{RenderJob, THUMB_SIZES};
 use crate::{Result, Session};
 
@@ -21,7 +22,8 @@ pub struct PreviewBuild {
     pub total: usize,
     pub done: AtomicUsize,
     pub failed: AtomicUsize,
-    pub cancel: AtomicBool,
+    /// Shared with the build's row in the activity stack (its ✕ sets it).
+    pub cancel: Arc<AtomicBool>,
     pub finished: AtomicBool,
     /// Damaged smart previews rebuilt (Build Smart Previews only).
     pub repaired: AtomicUsize,
@@ -50,28 +52,91 @@ impl PreviewBuild {
     }
 }
 
-/// The jobs that build `id`'s previews: the largest grid thumbnail, then the view render at
-/// `edge` (`None` = 1:1, the photo's full size).
-fn jobs_for(s: &mut Session, id: lightcraft_catalog::PhotoId, edge: Option<usize>) -> Vec<RenderJob> {
+/// The jobs that build `id`'s previews: the largest grid thumbnail and the view render at `edge`
+/// (`None` = 1:1, the photo's full size), the larger first.
+pub(crate) fn jobs_for(s: &mut Session, id: lightcraft_catalog::PhotoId, edge: Option<usize>) -> Vec<RenderJob> {
     let Some(p) = s.catalog.photo(id) else { return Vec::new() };
     let full = p.width.max(p.height) as usize;
     let e = edge.unwrap_or(full).min(full.max(1)).max(1);
-    let mut v = Vec::new();
-    v.extend(s.thumb_job(id, THUMB_SIZES[THUMB_SIZES.len() - 1]));
-    v.extend(s.loupe_job(id, e, e, true));
-    v
+    let thumb = THUMB_SIZES[THUMB_SIZES.len() - 1];
+    let (view, grid) = (s.loupe_job(id, e, e, true), s.thumb_job(id, thumb));
+    // the larger render goes first: the one after it renders from the source it loaded (see
+    // `run_photo`), which must not be smaller than what it needs
+    if e >= thumb { view.into_iter().chain(grid).collect() } else { grid.into_iter().chain(view).collect() }
 }
 
-fn run_all(jobs: Vec<Vec<RenderJob>>, state: &PreviewBuild) {
-    for photo_jobs in jobs {
-        if state.cancel.load(Ordering::Relaxed) {
-            break;
+/// The build's row in the activity stack (`what` as in [`PreviewBuild::what`]).
+fn task_for(s: &Session, state: &PreviewBuild) -> TaskGuard {
+    let (kind, label) = match state.what {
+        "" => ("previews", "Building previews"),
+        "smart previews" => ("smartPreviews", "Building smart previews"),
+        _ => ("smartPreviews", "Discarding smart previews"),
+    };
+    let task = s.activity.start(kind, label, Cancel::Flag(state.cancel.clone()));
+    task.progress(0, state.total as u64);
+    task
+}
+
+/// Render one photo's jobs in order. The source the first job decodes serves the ones after it
+/// (the grid thumbnail is made from the view's source instead of decoding the file again).
+pub(crate) fn run_photo(jobs: Vec<RenderJob>) -> bool {
+    let mut decoded: Option<crate::media::DecodedSource> = None;
+    let mut ok = true;
+    for mut j in jobs {
+        if let Some(src) = &decoded
+            && !matches!(j.source, crate::media::SourceRef::Loaded(_))
+        {
+            j.source = crate::media::SourceRef::Loaded(Box::new(src.clone()));
         }
-        let ok = photo_jobs.into_iter().all(|j| j.run().rendered.is_ok());
-        if !ok {
-            state.failed.fetch_add(1, Ordering::Relaxed);
+        let r = j.run();
+        ok &= r.rendered.is_ok();
+        if decoded.is_none() {
+            decoded = r.loaded;
         }
-        state.done.fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
+/// How many photos render side by side: as many as an export batch for standard previews (each
+/// render spreads over the cores already; the others fill them while one decodes), two for 1:1
+/// previews (a full-size source each).
+fn lanes(n: usize, full: bool) -> usize {
+    let l = crate::export::export_parallelism(n);
+    if full { l.min(2) } else { l }
+}
+
+fn run_all(jobs: Vec<Vec<RenderJob>>, state: &PreviewBuild, task: &TaskGuard, lanes: usize) {
+    let total = jobs.len();
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let work = || {
+        loop {
+            if state.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let next = queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next();
+            let Some(photo_jobs) = next else { break };
+            let ok = crate::guard::catch("building previews", || run_photo(photo_jobs)).unwrap_or(false);
+            if !ok {
+                state.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            let done = state.done.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            task.progress(done as u64, total as u64);
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::scope(|sc| {
+        for k in 1..lanes.max(1) {
+            // a lane that can't start leaves its photos to the others (and to this thread)
+            if std::thread::Builder::new().name(format!("previews-{k}")).spawn_scoped(sc, work).is_err() {
+                break;
+            }
+        }
+        work();
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = lanes;
+        work();
     }
     state.finished.store(true, Ordering::Relaxed);
 }
@@ -87,30 +152,46 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "a preview build is already running"));
     }
     // explicit ids, else the selection, else everything in view
-    let ids = if p.get("ids").is_some() || p.get("id").is_some() || !s.selection.ids.is_empty() { s.targets(p) } else { s.visible_cloned() };
+    let ids = if p.get("ids").is_some() || p.get("id").is_some() || !s.selection.ids.is_empty() { s.targets(p)? } else { s.visible_cloned() };
     let jobs: Vec<Vec<RenderJob>> = ids.iter().map(|id| jobs_for(s, *id, edge)).filter(|j| !j.is_empty()).collect();
     let state = Arc::new(PreviewBuild { total: jobs.len(), ..Default::default() });
     s.preview_build = Some(state.clone());
+    let task = task_for(s, &state);
+    let lanes = lanes(jobs.len(), edge.is_none());
     let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false) || cfg!(target_arch = "wasm32");
     if wait {
-        run_all(jobs, &state);
+        run_all(jobs, &state, &task, lanes);
         return Ok(state.json());
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // the row stays while the worker runs (it is dropped with the closure, however that ends)
         let st = state.clone();
         std::thread::Builder::new()
             .name("lc-build-previews".into())
-            .spawn(move || run_all(jobs, &st))
+            .spawn(move || run_all(jobs, &st, &task, lanes))
             .map_err(|e| bad(C, format!("could not start: {e}")))?;
     }
     Ok(state.json())
 }
 
 /// One photo's smart preview to build or discard: (photo, its file in the smart previews folder,
-/// how to load the original at preview size).
+/// how to load the original at preview size, whether the photo can take a preview-fitted look:
+/// vendor raws and DNGs (whose tone can come from their preview); only those proxies go stale when
+/// the fit changes; an older encoding makes any proxy stale).
 #[cfg(not(target_arch = "wasm32"))]
-type SmartJob = (lightcraft_catalog::PhotoId, std::path::PathBuf, Option<crate::media::SourceRef>);
+type SmartJob = (lightcraft_catalog::PhotoId, std::path::PathBuf, Option<crate::media::SourceRef>, bool);
+
+/// DNG tone fits also go stale, although DNGs keep their own matrix and Kelvin white-balance scale.
+#[cfg(not(target_arch = "wasm32"))]
+fn preview_fitted_look(photo: &lightcraft_catalog::Photo) -> bool {
+    photo.fitted_look() || (photo.develops_raw() && photo.format.eq_ignore_ascii_case("DNG"))
+}
+
+/// Held while one proxy is checked and (re)written, so Build Smart Previews and the opening look
+/// refresh ([`refresh_stale_smart_previews`]), on their own threads, never write the same file at once.
+#[cfg(not(target_arch = "wasm32"))]
+static SMART_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What Build / Discard Smart Previews did.
 #[cfg(not(target_arch = "wasm32"))]
@@ -120,9 +201,30 @@ struct SmartCounts {
     built: usize,
     /// Of those, damaged ones (cut short by a crash or a full drive) that were rebuilt.
     repaired: usize,
+    /// Of those, proxies written by an older camera-look fit that were rebuilt from their online originals.
+    refreshed: usize,
+    /// Of those kept as they were: out of date, but the original can't be read now (offline), so
+    /// the stored look stays and the next run with the original online rebuilds them.
+    stale_kept: usize,
     removed: usize,
     /// `[[id, why]]`
     failed: Vec<Value>,
+}
+
+/// `source` if it reads the photo's original, else `None`. A source decoded from a smart preview
+/// (it now carries the proxy's stored facts), a proxy standing in for an offline original, and the
+/// proxy fallback of a file source are not the original: refreshing a stale proxy from one of them
+/// would stamp its older look as current.
+#[cfg(not(target_arch = "wasm32"))]
+fn original_only(source: crate::media::SourceRef) -> Option<crate::media::SourceRef> {
+    use crate::media::SourceRef;
+    match source {
+        SourceRef::File { path, max_edge, loader, denoise, .. } => {
+            Some(SourceRef::File { path, max_edge, loader, fallback: None, denoise, reduced: None })
+        }
+        SourceRef::Loaded(d) if d.info.is_some() && !d.from_proxy && !d.reduced => Some(SourceRef::Loaded(d)),
+        _ => None,
+    }
 }
 
 /// The file-system half of Build / Discard Smart Previews (runs on a worker thread in the app).
@@ -134,7 +236,7 @@ fn smart_run(
     custom: bool,
     discard: bool,
     jobs: Vec<SmartJob>,
-    state: Option<&PreviewBuild>,
+    state: Option<(&PreviewBuild, &TaskGuard)>,
 ) -> std::result::Result<SmartCounts, String> {
     let mut n = SmartCounts::default();
     if !discard {
@@ -145,50 +247,79 @@ fn smart_run(
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
     }
-    for (id, path, source) in jobs {
-        if state.is_some_and(|st| st.cancel.load(Ordering::Relaxed)) {
+    for (id, path, source, look) in jobs {
+        if state.is_some_and(|(st, _)| st.cancel.load(Ordering::Relaxed)) {
             break;
         }
+        let _one = SMART_WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read either the new shard or a pre-upgrade flat file, without making new work
+        // depend on having the original online.
+        let path = crate::smart::existing_file_path(dir, path);
         if discard {
             if std::fs::remove_file(&path).is_ok() {
                 n.removed += 1;
             }
         } else {
-            // a complete proxy is kept; a missing or damaged one (cut short by a crash or a full
-            // drive) is (re)built
+            // a complete, current proxy is kept; a missing or damaged one (cut short by a crash or a
+            // full drive) is (re)built, and so is one written by an older encoding or camera-look
+            // fit (see `smart::ENCODE_VERSION` and `camera_preview::LOOK_VERSION`) when its
+            // original can be read
             let damaged = path.exists();
-            if damaged && crate::smart::is_valid(&path) {
+            let stale = damaged && crate::smart::is_stale_for(&path, look);
+            if damaged && !stale && crate::smart::is_valid(&path) {
                 n.built += 1;
             } else {
+                // a stale proxy is rebuilt from the original only: never from itself (the file
+                // fallback or a source decoded from a proxy would stamp the old look as current)
+                let source = if stale { source.and_then(original_only) } else { source };
                 // atomic: a failed write leaves no partial proxy that would pass for a built one;
                 // and synced (issue #134): built so the photo can be edited while its original
                 // is offline, when it is the only copy — the sync is small next to the decode
                 let r = source
                     .ok_or_else(|| "nothing to build from".to_string())
                     .and_then(|s| s.load_source())
-                    .and_then(|src| crate::smart::encode(&src.image, src.info_or(Default::default()).camera_tone.as_ref()))
-                    .and_then(|b| lightcraft_catalog::safe_file::write_atomic(&path, &b).map_err(|e| format!("{}: {e}", path.display())));
+                    .and_then(|src| {
+                        let info = src.info_or(Default::default());
+                        crate::smart::encode(&src.image, Some(&info))
+                    })
+                    .and_then(|b| {
+                        let parent = path.parent().ok_or_else(|| format!("{}: no parent folder", path.display()))?;
+                        // Only create the leaf shard: do not recreate a missing external drive.
+                        if !parent.is_dir() {
+                            std::fs::create_dir(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                        }
+                        lightcraft_catalog::safe_file::write_atomic(&path, &b).map_err(|e| format!("{}: {e}", path.display()))
+                    });
                 match r {
                     Ok(()) => {
                         n.built += 1;
-                        if damaged {
+                        if stale {
+                            n.refreshed += 1;
+                        } else if damaged {
                             n.repaired += 1;
-                            if let Some(st) = state {
+                            if let Some((st, _)) = state {
                                 st.repaired.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
+                    Err(e) if stale => {
+                        // offline (or unreadable) original: the proxy is all there is, keep its look
+                        log::info!("smart preview {} keeps its older look: {e}", path.display());
+                        n.built += 1;
+                        n.stale_kept += 1;
+                    }
                     Err(e) => {
                         n.failed.push(json!([id.0, e]));
-                        if let Some(st) = state {
+                        if let Some((st, _)) = state {
                             st.failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             }
         }
-        if let Some(st) = state {
-            st.done.fetch_add(1, Ordering::Relaxed);
+        if let Some((st, task)) = state {
+            let done = st.done.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            task.progress(done as u64, st.total as u64);
         }
     }
     Ok(n)
@@ -206,27 +337,28 @@ fn smart(s: &mut Session, p: &Value) -> Result<Value> {
     if background && s.preview_build.as_ref().is_some_and(|b| !b.finished.load(Ordering::Relaxed)) {
         return Err(bad(C, "a preview build is already running"));
     }
-    let ids = if p.get("ids").is_some() || !s.selection.ids.is_empty() { s.targets(p) } else { s.visible_cloned() };
+    let ids = if p.get("ids").is_some() || !s.selection.ids.is_empty() { s.targets(p)? } else { s.visible_cloned() };
     let mut jobs: Vec<SmartJob> = Vec::new();
     for id in ids {
         let Some(ph) = s.catalog.photo(id).cloned() else { continue };
         if !matches!(ph.source, lightcraft_catalog::Source::File { .. }) {
             continue;
         }
-        let path = dir.join(crate::smart::file_name(&ph));
+        let path = crate::smart::sharded_file_path(&dir, &ph);
         let source = (!discard).then(|| s.media.source_ref(&ph, crate::media::SourceLevel::Preview));
-        jobs.push((id, path, source));
+        jobs.push((id, path, source, preview_fitted_look(&ph)));
     }
     let custom = s.smart_previews_dir.is_some();
     if background {
         let what = if discard { "discarding smart previews" } else { "smart previews" };
         let state = Arc::new(PreviewBuild { total: jobs.len(), what, ..Default::default() });
         s.preview_build = Some(state.clone());
+        let task = task_for(s, &state);
         let st = state.clone();
         std::thread::Builder::new()
             .name("lc-smart-previews".into())
             .spawn(move || {
-                if let Err(e) = smart_run(&dir, custom, discard, jobs, Some(&st)) {
+                if let Err(e) = smart_run(&dir, custom, discard, jobs, Some((&st, &task))) {
                     log::warn!("{C}: {e}");
                     *st.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
                 }
@@ -236,7 +368,60 @@ fn smart(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(state.json());
     }
     let r = smart_run(&dir, custom, discard, jobs, None).map_err(|e| bad(C, e))?;
-    Ok(json!({"built": r.built, "repaired": r.repaired, "removed": r.removed, "failed": r.failed}))
+    Ok(
+        json!({"built": r.built, "repaired": r.repaired, "refreshed": r.refreshed, "staleKept": r.stale_kept, "removed": r.removed, "failed": r.failed}),
+    )
+}
+
+/// Bring smart previews up to date, once per fit-and-encoding version: when the smart previews
+/// folder has not been checked at this build's versions (its marker, [`crate::smart::look_checked`]),
+/// a worker thread (the UI never waits on the drives) looks at the proxies of the photos on disk
+/// and rebuilds the stale ones from their originals — one whose stored pixels are an older encoding
+/// (every photo), or, for a raw that takes the per-file camera look or a DNG, one written by an older fit.
+/// One whose original can't be read (offline) is kept as it is, still marked stale in its header:
+/// Build Smart Previews rebuilds it once the original is back. Only existing proxies are touched:
+/// none is built, and a missing folder is never created. Returns the thread, if started.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn refresh_stale_smart_previews(s: &mut Session) -> Option<std::thread::JoinHandle<()>> {
+    let dir = s.media.smart_dir.clone()?;
+    if !dir.is_dir() || crate::smart::look_checked(&dir) {
+        return None;
+    }
+    let max_edge = crate::media::SourceLevel::Preview.max_edge();
+    let photos: Vec<_> = s.catalog.photos().filter(|p| matches!(p.source, lightcraft_catalog::Source::File { .. })).collect();
+    let jobs: Vec<SmartJob> = photos
+        .iter()
+        .map(|p| (p.id, crate::smart::sharded_file_path(&dir, p), Some(s.media.origin_ref(&p.source, max_edge)), preview_fitted_look(p)))
+        .collect();
+    std::thread::Builder::new()
+        .name("lc-smart-look".into())
+        .spawn(move || refresh_stale(&dir, jobs))
+        .map_err(|e| log::warn!("smart previews: could not start the look refresh: {e}"))
+        .ok()
+}
+
+/// The body of [`refresh_stale_smart_previews`]: rebuild the stale proxies among `jobs`.
+#[cfg(not(target_arch = "wasm32"))]
+fn refresh_stale(dir: &std::path::Path, jobs: Vec<SmartJob>) {
+    let stale: Vec<SmartJob> = jobs
+        .into_iter()
+        .map(|(id, path, source, look)| (id, crate::smart::existing_file_path(dir, path), source, look))
+        .filter(|(_, path, _, look)| crate::smart::is_stale_for(path, *look))
+        .collect();
+    if !stale.is_empty() {
+        // `custom`: the folder is there already, and must not be recreated if it went away since
+        match smart_run(dir, true, false, stale, None) {
+            Ok(n) => log::info!("smart previews: {} refreshed to the current camera look, {} kept (original offline)", n.refreshed, n.stale_kept),
+            Err(e) => {
+                // not marked: the next opening tries again
+                log::warn!("smart previews: look refresh: {e}");
+                return;
+            }
+        }
+    }
+    if let Err(e) = crate::smart::mark_look_checked(dir) {
+        log::warn!("smart previews: {e}");
+    }
 }
 
 /// The smart previews folder: where it is, whether it is custom, what it holds, whether it can be
@@ -305,7 +490,7 @@ fn smart_location(s: &mut Session, p: &Value) -> Result<Value> {
 /// Whether photo `id` has a smart preview.
 pub fn has_smart_preview(s: &Session, id: lightcraft_catalog::PhotoId) -> bool {
     match (&s.media.smart_dir, s.catalog.photo(id)) {
-        (Some(dir), Some(p)) => crate::smart::is_valid(&dir.join(crate::smart::file_name(p))),
+        (Some(dir), Some(p)) => crate::smart::is_valid(&crate::smart::file_path(dir, p)),
         _ => false,
     }
 }
@@ -333,7 +518,7 @@ pub fn specs() -> Vec<CommandSpec> {
             smart_location
         ),
         cmd!(query "photo.smartPreview", "Smart Preview Status", [], None, "{id?} → {smartPreview: bool, originalOnline: bool}", always, |s, p| {
-            let id = s.targets(p).first().copied().ok_or_else(|| bad("photo.smartPreview", "no photo"))?;
+            let id = s.targets(p)?.first().copied().ok_or_else(|| bad("photo.smartPreview", "no photo"))?;
             let online = match s.catalog.photo(id).map(|p| p.source.clone()) {
                 Some(lightcraft_catalog::Source::File { path }) => std::path::Path::new(&path).exists(),
                 _ => true,
@@ -359,4 +544,39 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(s.preview_build.as_ref().map_or(Value::Null, |b| b.json()))
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{jobs_for, run_photo};
+    use crate::Session;
+    use crate::media::SourceRef;
+
+    // Given a photo's preview jobs, the grid thumbnail is made from the source the view decoded, not
+    // by reading the file again (here: a thumbnail job pointing at a file that is not there)
+    #[test]
+    fn preview_build_makes_the_thumbnail_from_the_views_source() {
+        let mut s = Session::with_demo();
+        let id = s.active().unwrap();
+        let mut jobs = jobs_for(&mut s, id, Some(512));
+        assert_eq!(jobs.len(), 2, "view and thumbnail");
+        assert!(jobs[0].view_cache.is_some(), "the view renders first");
+        jobs[1].source =
+            SourceRef::File { path: "/nonexistent/photo.arw".into(), max_edge: 512, loader: None, fallback: None, denoise: None, reduced: None };
+        assert!(run_photo(jobs), "the thumbnail rendered from the view's decoded source");
+    }
+
+    // Given many photos, a standard preview build renders them side by side and counts every one
+    #[test]
+    fn preview_build_of_many_photos_counts_each_once() {
+        let mut s = Session::with_demo();
+        let ids: Vec<u64> = s.catalog.photos().map(|p| p.id.0).collect();
+        assert!(ids.len() > 4);
+        let r = s.execute("library.buildPreviews", &json!({"size": "standard", "edge": 512, "ids": ids, "wait": true})).unwrap();
+        assert_eq!(r["done"], json!(ids.len()), "{r}");
+        assert_eq!(r["total"], json!(ids.len()));
+        assert_eq!(r["failed"], json!(0));
+    }
 }

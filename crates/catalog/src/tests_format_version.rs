@@ -47,7 +47,7 @@ fn v1_library_loads_and_is_upgraded() {
     assert_eq!((r.replayed, r.upgraded_from), (1, None));
 }
 
-/// A library saved before albums could be ordered by hand opens as it was and is rewritten as v3.
+/// A library saved before albums could be ordered by hand opens as it was and is rewritten in the current format.
 #[test]
 fn v2_library_loads_and_is_upgraded() {
     let (base, log, full) = legacy_parts();
@@ -57,7 +57,44 @@ fn v2_library_loads_and_is_upgraded() {
     let (_, c, r) = Journal::open(Box::new(m.clone())).unwrap();
     assert_eq!(c.to_snapshot(), full.to_snapshot());
     assert_eq!((r.replayed, r.upgraded_from), (1, Some(2)));
-    assert_eq!(snapshot_version(&m), 3);
+    assert_eq!(snapshot_version(&m), u64::from(VERSION));
+}
+
+/// A library saved before keywords could be listed on their own opens as it was and is rewritten
+/// in the current format.
+#[test]
+fn v3_library_loads_and_is_upgraded() {
+    let (base, log, full) = legacy_parts();
+    let m = MemStore::new();
+    m.set(SNAPSHOT, format!("{{\"format\":\"lightcraft-catalog\",\"version\":3,\"seq\":2,\"catalog\":{}}}\n", base.to_snapshot()).into_bytes());
+    m.set(LOG, log.into_bytes());
+    let (_, c, r) = Journal::open(Box::new(m.clone())).unwrap();
+    assert_eq!(c.to_snapshot(), full.to_snapshot());
+    assert_eq!((r.replayed, r.upgraded_from), (1, Some(3)));
+    assert_eq!(snapshot_version(&m), u64::from(VERSION));
+}
+
+/// A v6 library (before preview-only photos recorded which version decided it, #662) opens with
+/// an empty stamp on its preview-only photos, so they are rechecked once, and is rewritten in the
+/// current format.
+#[test]
+fn v6_preview_only_photo_loads_unstamped_and_is_upgraded() {
+    let mut c = Catalog::new();
+    let id = c.alloc_photo_id();
+    let mut p = Photo::new(id, Source::File { path: "/p/a.cr3".into() }, "a.cr3", "CR3", 160, 120, "2026-01-01");
+    p.kind = MediaKind::Raw;
+    p.preview_only = Some("Cr3 files are not decoded yet".into());
+    c.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    let snap = c.to_snapshot();
+    assert!(!snap.contains("preview_checked"), "an empty stamp isn't written");
+    let m = MemStore::new();
+    m.set(SNAPSHOT, format!("{{\"format\":\"lightcraft-catalog\",\"version\":6,\"seq\":1,\"catalog\":{snap}}}\n").into_bytes());
+    let (_, loaded, r) = Journal::open(Box::new(m.clone())).unwrap();
+    let p = loaded.photo(id).unwrap();
+    assert_eq!(p.preview_only.as_deref(), Some("Cr3 files are not decoded yet"));
+    assert_eq!(p.preview_checked, "");
+    assert_eq!(r.upgraded_from, Some(6));
+    assert_eq!(snapshot_version(&m), u64::from(VERSION));
 }
 
 #[test]
@@ -157,7 +194,8 @@ fn bad_crc_is_still_a_torn_tail() {
 
 /// Guard for the version rule (see `journal` → *Format versions*): adding an [`Op`] variant breaks
 /// this match. When it does, bump `journal::VERSION`, add a row to the format table, and add the
-/// variant here under the new version.
+/// variant here under the new version. A version that only adds serialized fields raises
+/// `NEWEST_FIELDS` instead.
 #[test]
 fn op_variants_are_versioned() {
     fn since(op: &Op) -> u32 {
@@ -193,8 +231,15 @@ fn op_variants_are_versioned() {
             | Op::Batch { .. } => 1,
             Op::SetBrowsed { .. } => 2,
             Op::SetAlbumOrder { .. } => 3,
+            Op::SetEmbeddedLens { .. } => 4,
+            Op::SetKeyword { .. } => 5,
+            Op::SetFolderRecord { .. } => 6,
+            Op::SetAsShotWb { .. } => 7,
+            Op::SetHistoryCursor { .. } => 8,
         }
     }
-    let newest = since(&Op::SetAlbumOrder { id: AlbumId(0), order: None });
-    assert_eq!(newest, VERSION, "the newest op's version must be the current format version");
+    /// v9: `Photo.preview_checked` and `Op::SetContent.preview_checked`.
+    const NEWEST_FIELDS: u32 = 9;
+    let newest = since(&Op::SetHistoryCursor { id: PhotoId(1), cursor: None });
+    assert_eq!(newest.max(NEWEST_FIELDS), VERSION, "the newest op's or fields' version must be the current format version");
 }

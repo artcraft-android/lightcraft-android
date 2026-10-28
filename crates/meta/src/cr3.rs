@@ -226,7 +226,8 @@ impl Cr3<'_> {
 }
 
 const CANON_UUID: [u8; 16] = [0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48];
-const XMP_UUID: [u8; 16] = [0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac];
+/// The `uuid` of the top-level box holding the XMP packet.
+pub const XMP_UUID: [u8; 16] = [0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac];
 const MAX_DEPTH: usize = 12;
 const MAX_BOXES: usize = 4096;
 /// A `VisualSampleEntry` (78 bytes after the box header) plus 4 bytes Canon adds before the child boxes.
@@ -237,7 +238,8 @@ pub fn is_cr3(bytes: &[u8]) -> bool {
     bytes.get(4..12) == Some(b"ftypcrx ".as_slice())
 }
 
-/// Parse a CR3 file's boxes; `None` when it is not a CR3 file.
+/// Parse a CR3 file's boxes; `None` when it is not a CR3 file. Of the top-level boxes only `moov`
+/// and the XMP `uuid` are read (`lightcraft_raw::sparse` relies on it to skip the others).
 pub fn parse_cr3(bytes: &[u8]) -> Option<Cr3<'_>> {
     if !is_cr3(bytes) {
         return None;

@@ -3,13 +3,15 @@ resolver = "3"
 members = ["crates/*", "apps/lightcraft-android", "apps/lightcraft-android/bindgen"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.14.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.90"
+rust-version = "1.95"
 repository = "https://github.com/storytold/lightcraft"
 
 [workspace.dependencies]
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "5c874d51eeb3de70e735c8ce87a59a7dedd47675", features = ["serde"] }
+craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
 # internal
 lightcraft-denoise-core = { path = "crates/denoise-core" }
 lightcraft-denoise = { path = "crates/denoise", default-features = false }
@@ -22,6 +24,8 @@ lightcraft-raw = { path = "crates/raw" }
 lightcraft-codecs = { path = "crates/codecs" }
 lightcraft-meta = { path = "crates/meta" }
 lightcraft-develop = { path = "crates/develop" }
+lightcraft-lensdb = { path = "crates/lensdb" }
+lightcraft-inpaint = { path = "crates/inpaint" }
 lightcraft-scenes = { path = "crates/scenes" }
 lightcraft-pipeline = { path = "crates/pipeline" }
 lightcraft-gpu = { path = "crates/gpu" }
@@ -32,6 +36,9 @@ lightcraft-engine = { path = "crates/engine" }
 lightcraft-fetch = { path = "crates/fetch" }
 lightcraft-heif = { path = "crates/heif" }
 lightcraft-segment = { path = "crates/segment" }
+lightcraft-geocode = { path = "crates/geocode" }
+lightcraft-slideshow = { path = "crates/slideshow" }
+lightcraft-testkit = { path = "crates/testkit" }
 
 # foundation
 thiserror = "2"
@@ -39,16 +46,18 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
+# All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 rayon = "1"
 proptest = "1"
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1"
 siphasher = "1"
 libc = "0.2" # dev-only: process CPU time in benches
-dhat = "0.3" # opt-in heap profiling (lightcraft-cli --features dhat-heap); never in default builds
+dhat = "0.3" # opt-in heap profiling (lightcraft-cli --features dhat-heap) and heap tests; never in product builds
 
 # formats
-quick-xml = "0.38"
+quick-xml = "0.41"
 miniz_oxide = "0.8"
 
 # codecs
@@ -63,8 +72,12 @@ tiff = "0.11"
 image-webp = "0.2"
 moxcms = { version = "0.9", default-features = false, features = ["lut"] }
 jxl-oxide = { version = "0.12", default-features = false }
+jixel = "=0.3.4" # BSD-3-Clause OR Apache-2.0, pure-Rust JPEG XL encoder (export; port of libjxl-tiny)
 zune-jpegxl = { version = "0.5", default-features = false, features = ["std"] } # MIT/Apache-2.0/Zlib lossless JXL encoder (test fixtures only)
 ravif = { version = "0.13", default-features = false, features = ["threading"] } # no "asm": it needs nasm (non-Rust)
+# HDR AVIF (PQ): ravif fixes the sRGB transfer curve, so HDR files drive its rav1e + avif-serialize directly
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
+avif-serialize = "0.8.6"
 
 # gpu (crates/gpu; native backends only, no GL: everything stays pure Rust)
 # SAM 3 inference (lightcraft-segment). 0.9.2: later releases pull `tokenizers` with the
@@ -81,6 +94,13 @@ eframe = { version = "0.36", default-features = false }
 egui_kittest = "0.36"
 rfd = "0.17"
 muda = { version = "0.21", default-features = false } # native menu bar (macOS: objc2/AppKit, pure Rust; no GTK)
+# macOS: the profile of the screen showing the window (safe AppKit bindings; muda and wgpu use the same)
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSColorSpace", "NSResponder", "NSScreen", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData"] }
+# Linux: the desktop's dark/light setting from the XDG settings portal (Settings ▸ Interface ▸
+# Appearance Mode ▸ Auto). Pure Rust; the version accesskit already brings in, pinned to it.
+zbus = "=5.19.0"
 web-time = "1"
 
 # web (apps/lightcraft-web)
@@ -102,9 +122,11 @@ excessive_precision = "allow"
 
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"

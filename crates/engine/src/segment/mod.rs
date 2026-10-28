@@ -35,7 +35,7 @@ pub const MODEL_BYTES: u64 = 3_439_938_512;
 /// The model's licence (not LightCraft's): shown before downloading.
 pub const LICENSE_NAME: &str = "SAM License (Meta)";
 pub const LICENSE_URL: &str = "https://github.com/facebookresearch/sam3/blob/main/LICENSE";
-/// How errors about a missing model start (the UI offers the download on it).
+/// How errors about a missing model start (frontends decide on [`crate::ErrorKind::ModelMissing`], not on this text).
 pub const NOT_INSTALLED: &str = "The SAM 3 model is not installed";
 /// Longest a waiting command (CLI, MCP) waits for the model (loading on a CPU can take minutes).
 #[cfg_attr(not(feature = "sam"), allow(dead_code))]
@@ -75,6 +75,7 @@ pub(crate) struct Input {
 }
 
 /// What a detail pass re-runs.
+#[derive(Clone)]
 #[cfg_attr(not(feature = "sam"), allow(dead_code))]
 pub(crate) enum Prompt {
     Clicks(Vec<Click>),
@@ -111,6 +112,8 @@ pub struct DownloadStatus {
     pub total: u64,
     pub file: String,
     pub error: Option<String>,
+    /// The last download was cancelled (it resumes next time): decide on this, not on `error`'s text.
+    pub cancelled: bool,
     pub finished: bool,
 }
 
@@ -215,7 +218,15 @@ impl Segmenter {
         #[cfg(feature = "sam")]
         {
             let s = self.download.status();
-            DownloadStatus { running: s.running, done: s.done, total: s.total, file: s.file, error: s.error, finished: s.finished }
+            DownloadStatus {
+                running: s.running,
+                done: s.done,
+                total: s.total,
+                file: s.file,
+                error: s.error,
+                cancelled: s.cancelled,
+                finished: s.finished,
+            }
         }
         #[cfg(not(feature = "sam"))]
         DownloadStatus::default()
@@ -234,32 +245,41 @@ impl Segmenter {
 
     /// The model folder, if the model is there; otherwise an error that says what to do.
     pub fn model_dir(&self) -> Result<PathBuf, String> {
+        self.require_model().map_err(|e| e.to_string())
+    }
+
+    /// [`Segmenter::model_dir`] for commands: a model that is not installed (or still downloading) is
+    /// [`crate::EngineError::ModelMissing`], so a frontend offers the download without reading the message.
+    pub fn require_model(&self) -> crate::Result<PathBuf> {
+        let other = |why: &str| crate::EngineError::Other(why.into());
         if !Self::AVAILABLE {
-            return Err("AI masks are not available in this build".into());
+            return Err(other("AI masks are not available in this build"));
         }
         #[cfg(feature = "sam")]
         if lightcraft_segment::remote::configured().is_some() {
             return Ok(PathBuf::new());
         }
-        let dir = self.dir.clone().ok_or("no folder is set for the SAM 3 model")?;
+        let dir = self.dir.clone().ok_or_else(|| other("no folder is set for the SAM 3 model"))?;
         if self.installed() {
             return Ok(dir);
         }
         let d = self.download_status();
-        if d.running {
+        let msg = if d.running {
             let pct = d.done.saturating_mul(100).checked_div(d.total).unwrap_or(0);
-            return Err(format!("{NOT_INSTALLED} yet: it is downloading ({pct} %)."));
-        }
-        Err(format!(
-            "{NOT_INSTALLED}. Download it (about {:.1} GB, {LICENSE_NAME}) when LightCraft offers it, with `segment.model.download {{\"acknowledged\": true}}`, or put model.safetensors, vocab.json and merges.txt in {}.",
-            MODEL_BYTES as f64 / 1e9,
-            dir.display()
-        ))
+            format!("{NOT_INSTALLED} yet: it is downloading ({pct} %).")
+        } else {
+            format!(
+                "{NOT_INSTALLED}. Download it (about {:.1} GB, {LICENSE_NAME}) when LightCraft offers it, with `segment.model.download {{\"acknowledged\": true}}`, or put model.safetensors, vocab.json and merges.txt in {}.",
+                MODEL_BYTES as f64 / 1e9,
+                dir.display()
+            )
+        };
+        Err(crate::EngineError::ModelMissing { model: crate::AiModel::Sam3, msg })
     }
 
     /// Start downloading the model (on a background thread; see `segment.model.download`).
     /// `Ok(false)` when it is installed or downloading already.
-    pub fn start_download(&self) -> Result<bool, String> {
+    pub fn start_download(&self, activity: &crate::activity::Activity) -> Result<bool, String> {
         if !Self::AVAILABLE {
             return Err("AI masks are not available in this build".into());
         }
@@ -273,11 +293,11 @@ impl Segmenter {
             if mirrors.is_empty() {
                 return Err(lightcraft_segment::fetch::no_mirrors_message());
             }
-            self.download.start(lightcraft_segment::fetch::SAM3_FILES, mirrors, dir, lightcraft_segment::fetch::options())
+            self.download.start(lightcraft_segment::fetch::SAM3_FILES, mirrors, dir, lightcraft_segment::fetch::options(), activity, "SAM 3")
         }
         #[cfg(not(feature = "sam"))]
         {
-            let _ = dir;
+            let _ = (dir, activity);
             Ok(false)
         }
     }
@@ -421,7 +441,11 @@ impl Session {
         let job = self.segment_job(id, kind, Tag::Wait, tx, region)?;
         self.segmenter.worker.submit(job)?;
         match rx.recv_timeout(WAIT) {
-            Ok(o) => o.result,
+            Ok(o) => {
+                // (shown by the next poll in an app; logged anyway)
+                self.segmenter.messages.extend(o.notice);
+                o.result
+            }
             Err(_) => Err("the AI model took too long; try again".into()),
         }
     }
@@ -560,7 +584,7 @@ impl Session {
                 self.segment_queue(id, kind, tag, Some(region))?;
             } else {
                 let patch = self.segment_wait(id, kind, Some(region))?;
-                let outcome = worker::Outcome { tag, result: Ok(patch), superseded: false };
+                let outcome = worker::Outcome { tag, result: Ok(patch), superseded: false, notice: None };
                 let mut polled = Polled::default();
                 self.apply_outcome(outcome, &mut polled);
             }
@@ -599,6 +623,7 @@ impl Session {
         if o.superseded {
             return;
         }
+        polled.messages.extend(o.notice);
         match o.tag {
             Tag::Wait => {}
             Tag::Prepare => {
@@ -691,6 +716,18 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sam")]
+    #[test]
+    fn a_worker_notice_reaches_the_user_with_the_result() {
+        // the job after which the model runs on the CPU (the GPU failed) says so
+        let mut s = Session::with_demo();
+        let notice = Some(worker::GPU_FAILED.to_string());
+        s.segmenter.results.0.send(worker::Outcome { tag: Tag::Prepare, result: Ok(None), superseded: false, notice }).unwrap();
+        let polled = s.segment_poll();
+        assert_eq!(polled.messages, vec![worker::GPU_FAILED.to_string()]);
+        assert!(s.segment_poll().messages.is_empty(), "once");
+    }
 
     fn seg_box(side: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> SegMask {
         let l: Vec<f32> =

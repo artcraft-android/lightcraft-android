@@ -7,6 +7,15 @@
 //!
 //! `IAD1` stores the valid sensor area separately from the recommended image crop. Both use inclusive
 //! sensor offsets. The CFA is anchored at the full sensor's origin; cropping shifts its phase later.
+//!
+//! The in-camera aspect ratio (3:2, 4:3, 16:9, 1:1 ...) is not applied to the sensor data: the raw always
+//! holds the whole image. The maker note's `AspectInfo` (tag `0x009a`; ExifTool names `AspectRatio`,
+//! `CroppedImageWidth`, `CroppedImageHeight`, `CroppedImageLeft`, `CroppedImageTop`) holds the shot's rectangle
+//! as five 32-bit values, measured from the top-left of the recommended image crop (the "Canon image", whose
+//! size is ExifTool's `CanonImageWidth` x `CanonImageHeight`). That rectangle replaces the crop. Established
+//! on the CC0 PowerShot SX70 HS, EOS 250D, PowerShot G5 X Mark II and EOS M6 Mark II samples shot at 3:2, 4:3,
+//! 16:9 and 1:1: the rectangle is centred, has the shot's aspect, and files shot at the sensor's own aspect
+//! store the whole image.
 //! Unknown camera metadata versions are ignored rather than assigned a guessed white balance.
 
 use super::{black_from_columns, crx, white_from_data};
@@ -17,11 +26,12 @@ use lightcraft_tiff::{Ifd, Tiff};
 const SENSOR_INFO: u16 = 0x00e0;
 const COLOR_DATA: u16 = 0x4001;
 const LENS_MODEL: u16 = 0x0095;
+const ASPECT_INFO: u16 = 0x009a;
 
 /// Pick the first largest raw track. Equal-sized later tracks can be the Dual Pixel delta, which
 /// must never replace the main sensor image. An invalid full-size descriptor is reported, not
 /// silently replaced with the reduced raw preview.
-fn main_track(tracks: &[Cr3Track]) -> Option<&Cr3Track> {
+pub(crate) fn main_track(tracks: &[Cr3Track]) -> Option<&Cr3Track> {
     let mut best = None;
     let mut best_area = 0u64;
     for track in tracks {
@@ -83,16 +93,36 @@ fn sensor_crop(maker: Option<&Ifd>, width: usize, height: usize) -> Option<Rect>
     )
 }
 
+/// The shot's aspect-ratio rectangle from `AspectInfo`, placed inside `image` (the recommended crop). `None`
+/// when the tag is absent or malformed, or its rectangle doesn't fit inside `image`.
+fn aspect_crop(maker: Option<&Ifd>, image: Rect) -> Option<Rect> {
+    let data = maker?.u64s(ASPECT_INFO)?;
+    let [width, height, left, top] = [1usize, 2, 3, 4].map(|i| data.get(i).and_then(|&v| usize::try_from(v).ok()));
+    let (width, height, left, top) = (width?, height?, left?, top?);
+    if width < 2 || height < 2 || left.checked_add(width)? > image.width || top.checked_add(height)? > image.height {
+        return None;
+    }
+    Some(Rect::new(image.x.checked_add(left)?, image.y.checked_add(top)?, width, height))
+}
+
 fn geometry(area: Option<&Cr3ImageArea>, maker: Option<&Ifd>, width: usize, height: usize) -> (Rect, Rect) {
     let area = area.filter(|a| usize::from(a.width) == width && usize::from(a.height) == height);
     let sensor = sensor_crop(maker, width, height);
-    let active = area.and_then(|a| a.active).and_then(|b| inclusive_rect(b, width, height)).or(sensor).unwrap_or(Rect::new(0, 0, width, height));
-    let crop = area.and_then(|a| inclusive_rect(a.crop, width, height)).or(sensor).and_then(|c| relative_crop(c, active)).unwrap_or(Rect::new(
-        0,
-        0,
-        active.width,
-        active.height,
-    ));
+    let mut active = area.and_then(|a| a.active).and_then(|b| inclusive_rect(b, width, height)).or(sensor).unwrap_or(Rect::new(0, 0, width, height));
+    // The recommended crop. `AspectInfo` is measured from its origin, so it is applied on top of it.
+    let stated = area.and_then(|a| inclusive_rect(a.crop, width, height)).or(sensor);
+    let mut recommended = stated.and_then(|c| relative_crop(c, active));
+    // Some crop-mode files (EOS R5 Mark II APS-C, 5376 x 3574) state an active area that starts in the dark
+    // columns and stops short of the image, while their recommended crop lies on the image (measured: columns
+    // 132..~256 sit at the black level, the image runs to the right edge). The recommended crop is then the
+    // valid area.
+    if recommended.is_none()
+        && let Some(c) = stated.filter(|c| c.width >= 2 && c.height >= 2)
+    {
+        active = c;
+        recommended = Some(Rect::new(0, 0, c.width, c.height));
+    }
+    let crop = recommended.map(|c| aspect_crop(maker, c).unwrap_or(c)).unwrap_or(Rect::new(0, 0, active.width, active.height));
     (active, crop)
 }
 
@@ -105,13 +135,15 @@ struct CameraLevels {
 
 /// Canon's versioned word arrays. Offsets are word indices from the published tag tables, not
 /// byte offsets. The four as-shot WB values are R, G, G, B, independent of the CFA layout.
+/// A version without a white-level offset takes its white level from the data (see `docs/cr3.md`).
 fn camera_levels(maker: Option<&Ifd>, bits: u8) -> CameraLevels {
     let Some(values) = maker.and_then(|m| m.u64s(COLOR_DATA)) else { return CameraLevels::default() };
     let offsets = match values.first().copied() {
-        Some(16..=19) => (71, 329, 797),
-        Some(32 | 33) => (85, 343, 811),
-        Some(34 | 48) => (105, 363, 641),
-        Some(64 | 65) => (105, 383, 661),
+        Some(16..=19) => (71, 329, Some(797)),
+        Some(32 | 33) => (85, 343, Some(811)),
+        Some(34 | 48) => (105, 363, Some(641)),
+        Some(64 | 65) => (105, 383, Some(661)),
+        Some(66) => (105, 383, None),
         _ => return CameraLevels::default(),
     };
     let full = ((1u32 << u32::from(bits.clamp(1, 16))) - 1) as f32;
@@ -130,7 +162,7 @@ fn camera_levels(maker: Option<&Ifd>, bits: u8) -> CameraLevels {
     });
     let black = quadruple(offsets.1).filter(|v| v.iter().any(|&b| b > 0.0) && v.iter().all(|&b| b >= 0.0 && b < full * 0.5));
     let max_black = black.map(|v| v.into_iter().fold(0.0f32, f32::max)).unwrap_or(0.0);
-    let white = values.get(offsets.2).map(|&v| v as f32).filter(|&v| v > max_black && v >= full * 0.5 && v <= full);
+    let white = offsets.2.and_then(|at| values.get(at)).map(|&v| v as f32).filter(|&v| v > max_black && v >= full * 0.5 && v <= full);
     CameraLevels { wb, black, white }
 }
 
@@ -221,8 +253,10 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         color: ColorData::default(),
         wb_multipliers: levels.wb,
         linearized: false,
+        pixel_aspect: 1.0,
         opcodes: OpcodeLists::default(),
         metadata,
+        lens_metadata: Default::default(),
     };
     image.validate_for(mode)?;
     Ok(image)
@@ -266,6 +300,10 @@ mod tests {
     }
 
     fn synthetic_header() -> Vec<u8> {
+        synthetic_header_with(None)
+    }
+
+    fn synthetic_header_with(aspect: Option<[u32; 5]>) -> Vec<u8> {
         use lightcraft_tiff::{ByteOrder, TiffWriter, tags as t};
         let tiff = |b: IfdBuilder| TiffWriter::new(ByteOrder::Little, false).write(&[b]).unwrap();
         let cmt1 = tiff(
@@ -275,11 +313,13 @@ mod tests {
                 .with(t::ORIENTATION, Value::Short(vec![6])),
         );
         let cmt2 = tiff(IfdBuilder::new().with(t::ISO_SPEED, Value::Short(vec![800])));
-        let cmt3 = tiff(
-            IfdBuilder::new()
-                .with(SENSOR_INFO, Value::Short(vec![34, 64, 48, 1, 1, 6, 4, 61, 45]))
-                .with(LENS_MODEL, Value::Ascii("RF-S18-45mm F4.5-6.3 IS STM".into())),
-        );
+        let mut cmt3 = IfdBuilder::new()
+            .with(SENSOR_INFO, Value::Short(vec![34, 64, 48, 1, 1, 6, 4, 61, 45]))
+            .with(LENS_MODEL, Value::Ascii("RF-S18-45mm F4.5-6.3 IS STM".into()));
+        if let Some(a) = aspect {
+            cmt3 = cmt3.with(ASPECT_INFO, Value::Long(a.to_vec()));
+        }
+        let cmt3 = tiff(cmt3);
         let mut canon = vec![0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48];
         canon.extend([box_bytes(b"CMT1", &cmt1), box_bytes(b"CMT2", &cmt2), box_bytes(b"CMT3", &cmt3)].concat());
         let mut coding = vec![0u8; 52];
@@ -374,6 +414,64 @@ mod tests {
         assert!(decode(&bytes[..4200], Mode::Header).is_err());
     }
 
+    #[test]
+    fn aspect_info_replaces_the_crop() {
+        // 16:9 inside the 56 x 42 recommended crop at (2, 2): 56 x 30, 6 rows down.
+        let bytes = synthetic_header_with(Some([7, 56, 30, 0, 6]));
+        let image = decode(&bytes, Mode::Header).unwrap();
+        assert_eq!(image.active_area, Rect::new(4, 2, 60, 46));
+        assert_eq!(image.crop, Rect::new(2, 8, 56, 30));
+        assert_eq!((image.metadata.width, image.metadata.height), (Some(56), Some(30)));
+        // 1:1 with a left offset.
+        let image = decode(&synthetic_header_with(Some([1, 42, 42, 7, 0])), Mode::Header).unwrap();
+        assert_eq!(image.crop, Rect::new(9, 2, 42, 42));
+        // The whole image, as stored for a shot at the sensor's own aspect, changes nothing.
+        let image = decode(&synthetic_header_with(Some([0, 56, 42, 0, 0])), Mode::Header).unwrap();
+        assert_eq!(image.crop, Rect::new(2, 2, 56, 42));
+    }
+
+    #[test]
+    fn aspect_info_that_does_not_fit_is_ignored() {
+        for bad in [[7, 57, 30, 0, 6], [7, 56, 30, 0, 13], [7, 56, 30, 1, 6], [7, 1, 30, 0, 0], [7, 56, 0, 0, 0], [7, u32::MAX, 30, 0, 0]] {
+            let image = decode(&synthetic_header_with(Some(bad)), Mode::Header).unwrap();
+            assert_eq!(image.crop, Rect::new(2, 2, 56, 42), "{bad:?}");
+        }
+    }
+
+    /// Some crop-mode files (EOS R5 Mark II 7883) record a recommended crop that reaches past their stated active
+    /// area, which starts in dark columns. The recommended crop is then the valid area (no black band on the left),
+    /// and `AspectInfo` applies from its origin.
+    #[test]
+    fn aspect_info_needs_a_consistent_recommended_crop() {
+        let aspect = lightcraft_tiff::IfdBuilder::new().with(ASPECT_INFO, Value::Long(vec![13, 5088, 3392, 0, 0]));
+        let bytes = lightcraft_tiff::TiffWriter::new(lightcraft_tiff::ByteOrder::Little, false).write(&[aspect]).unwrap();
+        let maker = Tiff::parse(&bytes).unwrap().ifds.remove(0);
+        let area =
+            |crop| Cr3ImageArea { width: 5376, height: 3574, crop, active: Some([132, 160, 5243, 3567]), masked_left: [0; 4], masked_top: None };
+        // crop right edge 5359 > active right edge 5243: the recommended crop becomes the valid area
+        assert_eq!(
+            geometry(Some(&area([272, 172, 5359, 3563])), Some(&maker), 5376, 3574),
+            (Rect::new(272, 172, 5088, 3392), Rect::new(0, 0, 5088, 3392))
+        );
+        // consistent crop: AspectInfo applies from its origin
+        assert_eq!(geometry(Some(&area([140, 172, 5227, 3563])), Some(&maker), 5376, 3574).1, Rect::new(8, 12, 5088, 3392));
+    }
+
+    /// `AspectInfo` as the SX70 HS 16:9 sample stores it, byte for byte (little-endian LONG x 5), read through
+    /// the TIFF parser: AspectRatio 7, 5184 x 2912 at (0, 488).
+    #[test]
+    fn aspect_info_known_bytes() {
+        let mut tiff = b"II*     ".to_vec();
+        tiff.extend_from_slice(&[0x9a, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00]);
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(&[0x07, 0, 0, 0, 0x40, 0x14, 0, 0, 0x60, 0x0b, 0, 0, 0, 0, 0, 0, 0xe8, 0x01, 0, 0]);
+        let parsed = Tiff::parse(&tiff).unwrap();
+        let maker = parsed.ifds.first();
+        assert_eq!(aspect_crop(maker, Rect::new(132, 40, 5184, 3888)), Some(Rect::new(132, 528, 5184, 2912)));
+        assert_eq!(aspect_crop(maker, Rect::new(0, 0, 5184, 2000)), None);
+        assert_eq!(aspect_crop(None, Rect::new(0, 0, 5184, 3888)), None);
+    }
+
     fn prepend_tracks(bytes: &[u8], tracks: &[u8]) -> Vec<u8> {
         let ftyp_end = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         let moov_len = u32::from_be_bytes(bytes[ftyp_end..ftyp_end + 4].try_into().unwrap()) as usize;
@@ -432,6 +530,11 @@ mod tests {
             assert_eq!(levels.black, Some([100.0, 101.0, 102.0, 103.0]));
             assert_eq!(levels.white, Some(15000.0));
         }
+        // A version without a white-level offset leaves the white level to the data.
+        let levels = camera_levels(Some(&maker(66, 105, 383, 661)), 14);
+        assert_eq!(levels.wb, Some([2.0, 1.0, 1.5]));
+        assert_eq!(levels.black, Some([100.0, 101.0, 102.0, 103.0]));
+        assert_eq!(levels.white, None);
         assert!(camera_levels(Some(&maker(255, 71, 329, 797)), 14).wb.is_none());
         assert!(camera_levels(None, 14).black.is_none());
     }

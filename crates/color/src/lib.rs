@@ -149,7 +149,8 @@ impl RgbSpace {
     }
 }
 
-const BRADFORD: Mat3 = Mat3([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]]);
+/// The Bradford cone-response matrix (XYZ → sharpened cones) that [`bradford`] adapts in.
+pub const BRADFORD: Mat3 = Mat3([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]]);
 
 /// Bradford chromatic adaptation matrix (XYZ → XYZ) from white `src` to white `dst`.
 pub fn bradford(src: Xy, dst: Xy) -> Mat3 {
@@ -179,8 +180,8 @@ pub struct Rgb8(pub u8, pub u8, pub u8);
 
 impl Rgb8 {
     pub fn from_hex(s: &str) -> Option<Rgb8> {
-        let s = s.trim_start_matches('#');
-        if s.len() != 6 {
+        let s = s.strip_prefix('#').unwrap_or(s);
+        if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let v = u32::from_str_radix(s, 16).ok()?;
@@ -194,6 +195,15 @@ impl Rgb8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgb8_from_hex_rejects_signs_and_extra_hashes() {
+        assert_eq!(Rgb8::from_hex("#0f0f0f"), Some(Rgb8(15, 15, 15)));
+        assert_eq!(Rgb8::from_hex("ff8000"), Some(Rgb8(255, 128, 0)));
+        for bad in ["+12345", "#+12345", "#+f+f+f", "-12345", "##123456", "#12345", ""] {
+            assert_eq!(Rgb8::from_hex(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn srgb_matrix_matches_standard() {

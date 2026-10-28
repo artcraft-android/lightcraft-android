@@ -1,8 +1,11 @@
 //! Photoshop PSD/PSB merged-composite reader (clean-room, from the public file-format description):
 //! 8/16/32-bit gray, RGB, CMYK, indexed, duotone (as gray); raw or PackBits/RLE image data;
 //! ICC (resource 1039), EXIF (1058), XMP (1060); transparency when the layer count is negative.
+//! Also a flat-file writer ([`encode`]): the merged image of an 8- or 16-bit gray/RGB document
+//! with no layers, so an image editor opens it as one background layer and saves back to it.
 
 use crate::convert::{Buf, Meta, Model, Raw, check_size, finish};
+use crate::encode::{EncodeImage, EncodeMeta, Samples};
 use crate::{DecodeOptions, Decoded, Error, Format, Result};
 
 const F: Format = Format::Psd;
@@ -209,6 +212,129 @@ pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
     };
     let raw = Raw { width, height, model, alpha, premultiplied: false, buf, bit_depth: depth as u8 };
     finish(F, raw, Meta { icc, exif, xmp, ..Default::default() }, (width as u32, height as u32), opts)
+}
+
+/// The largest side a PSD (version 1) may have; larger documents need PSB.
+pub const MAX_SIDE: u32 = 30_000;
+
+/// Write a flat PSD: header, the image resources for `meta` (resolution 1005, ICC 1039, EXIF
+/// 1058, XMP 1060), an empty layer section and the merged image. 8-bit planes are PackBits
+/// compressed, 16-bit ones stored raw (PackBits saves little on 16-bit photos). Gray or RGB;
+/// alpha is dropped (the render is opaque). Float samples are refused.
+pub(crate) fn encode(img: &EncodeImage, meta: &EncodeMeta) -> Result<Vec<u8>> {
+    img.validate()?;
+    let (w, h) = (img.width, img.height);
+    if w > MAX_SIDE || h > MAX_SIDE {
+        return Err(Error::Encode(format!("{w} × {h} is larger than a PSD can hold ({MAX_SIDE} px a side): use TIFF")));
+    }
+    let ch = usize::from(img.channels);
+    let color = if ch <= 2 { 1 } else { 3 };
+    let (depth, bpc) = match img.samples {
+        Samples::U8(_) => (8u16, 1usize),
+        Samples::U16(_) => (16, 2),
+        Samples::F32(_) => return Err(Error::Encode("32-bit float PSD is not supported: use TIFF".into())),
+    };
+    let (wu, hu) = (w as usize, h as usize);
+    let mut b = Vec::new();
+    b.extend_from_slice(b"8BPS");
+    b.extend_from_slice(&1u16.to_be_bytes());
+    b.extend_from_slice(&[0; 6]);
+    b.extend_from_slice(&(color as u16).to_be_bytes());
+    b.extend_from_slice(&h.to_be_bytes());
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&depth.to_be_bytes());
+    b.extend_from_slice(&(if color == 1 { 1u16 } else { 3 }).to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes()); // colour mode data
+    let res = resource_section(meta);
+    b.extend_from_slice(&u32::try_from(res.len()).map_err(|_| Error::Encode("metadata too large for PSD".into()))?.to_be_bytes());
+    b.extend_from_slice(&res);
+    b.extend_from_slice(&0u32.to_be_bytes()); // layer and mask information: none
+    // planar samples, one plane per colour channel (big-endian)
+    let plane = |c: usize| -> Vec<u8> {
+        let mut p = Vec::with_capacity(wu * hu * bpc);
+        match img.samples {
+            Samples::U8(s) => p.extend(s.iter().skip(c).step_by(ch).take(wu * hu)),
+            Samples::U16(s) => s.iter().skip(c).step_by(ch).take(wu * hu).for_each(|v| p.extend_from_slice(&v.to_be_bytes())),
+            Samples::F32(_) => {}
+        }
+        p
+    };
+    if bpc == 1 {
+        b.extend_from_slice(&1u16.to_be_bytes());
+        let mut counts = Vec::with_capacity(color * hu * 2);
+        let mut data = Vec::new();
+        for c in 0..color {
+            for row in plane(c).chunks_exact(wu) {
+                let start = data.len();
+                packbits(row, &mut data);
+                let n = u16::try_from(data.len() - start).map_err(|_| Error::Encode("PSD row too long".into()))?;
+                counts.extend_from_slice(&n.to_be_bytes());
+            }
+        }
+        b.extend_from_slice(&counts);
+        b.extend_from_slice(&data);
+    } else {
+        b.extend_from_slice(&0u16.to_be_bytes());
+        for c in 0..color {
+            b.extend_from_slice(&plane(c));
+        }
+    }
+    Ok(b)
+}
+
+/// The image resources section for `meta`.
+fn resource_section(meta: &EncodeMeta) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut add = |id: u16, data: &[u8]| {
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+    };
+    if let Some(ppi) = meta.ppi.filter(|p| *p > 0) {
+        // ResolutionInfo: 16.16 fixed pixels per inch, unit 1 (ppi), display unit 1 (inches), twice
+        let fixed = (u32::from(ppi) << 16).to_be_bytes();
+        let one = 1u16.to_be_bytes();
+        add(1005, &[&fixed[..], &one, &one, &fixed, &one, &one].concat());
+    }
+    if let Some(icc) = meta.icc {
+        add(1039, icc);
+    }
+    if let Some(exif) = meta.exif {
+        add(1058, exif);
+    }
+    if let Some(xmp) = meta.xmp {
+        add(1060, xmp.as_bytes());
+    }
+    out
+}
+
+/// PackBits: append one encoded row of `src` to `out` (runs of 2+ equal bytes as repeats, the
+/// rest as literals of at most 128 bytes).
+fn packbits(src: &[u8], out: &mut Vec<u8>) {
+    let mut rest = src;
+    while let Some(&b) = rest.first() {
+        // a run of 2 to 128 equal bytes
+        let run = rest.iter().take(128).take_while(|&&x| x == b).count();
+        if run >= 2 {
+            // 1 - run in 2..=128: -1..=-127, as a signed byte
+            out.push((1 - run as i16) as i8 as u8);
+            out.push(b);
+            rest = rest.get(run..).unwrap_or_default();
+            continue;
+        }
+        // a literal of 1 to 128 bytes: up to the next pair of equal bytes, or the end of the row
+        let unpaired = rest.windows(2).take(128).take_while(|w| w.first() != w.get(1)).count();
+        let len = if unpaired.saturating_add(1) == rest.len() { rest.len() } else { unpaired };
+        let (lit, tail) = rest.split_at_checked(len.clamp(1, 128)).unwrap_or((rest, &[][..]));
+        out.push(lit.len().saturating_sub(1) as u8);
+        out.extend_from_slice(lit);
+        rest = tail;
+    }
 }
 
 /// Stored dimensions and EXIF orientation (resource 1058) from the header and image resources,
@@ -439,5 +565,56 @@ mod tests {
         let p = d.image.get(1, 1);
         let q = d.image.get(0, 0);
         assert!(p[0] > 0.0 && (p[0] - q[0]).abs() < 1e-6, "{p:?}");
+    }
+    #[test]
+    fn packbits_round_trips() {
+        let rows: [&[u8]; 6] = [&[], &[7], &[1, 1], &[1, 2, 3, 3, 3, 4, 5, 5], &[9; 300], &(0..=255u8).cycle().take(700).collect::<Vec<_>>()];
+        for row in rows {
+            let mut enc = Vec::new();
+            super::packbits(row, &mut enc);
+            let mut out = vec![0u8; row.len()];
+            unpackbits(&enc, &mut out).unwrap();
+            assert_eq!(out, row);
+        }
+    }
+
+    #[test]
+    fn flat_psd_round_trips_8_and_16_bit() {
+        let icc = crate::icc::write_named(crate::NamedSpace::AdobeRgb);
+        let meta = EncodeMeta { icc: Some(&icc), xmp: Some("<x:xmpmeta/>"), ppi: Some(300), ..Default::default() };
+        // 8-bit RGBA (alpha dropped), 5 × 3 with a flat run and a gradient
+        let px: Vec<u8> = (0..15u8).flat_map(|i| [i * 10, if i < 8 { 200 } else { i }, 255 - i, 255]).collect();
+        let b = encode(&EncodeImage::new(5, 3, 4, Samples::U8(&px)), &meta).unwrap();
+        assert_eq!(super::header(&b).unwrap(), (5, 3, 1));
+        let d = decode(&b, &DecodeOptions::default()).unwrap();
+        assert_eq!((d.width, d.height), (5, 3));
+        assert_eq!(d.icc.as_deref(), Some(&icc[..]), "the ICC profile is kept");
+        assert_eq!(d.xmp.as_deref(), Some("<x:xmpmeta/>"));
+        // 16-bit RGB, raw planes: the samples come back exactly
+        let px16: Vec<u16> = (0..4 * 2 * 3).map(|i| (i as u16) * 2731).collect();
+        let b = encode(&EncodeImage::new(4, 2, 3, Samples::U16(&px16)), &meta).unwrap();
+        assert_eq!(&b[22..24], &16u16.to_be_bytes());
+        let mut r = Rd { b: &b, p: 26 };
+        let cm = r.u32().unwrap() as usize;
+        r.take(cm).unwrap();
+        let res = r.u32().unwrap() as usize;
+        r.take(res).unwrap();
+        assert_eq!(r.u32().unwrap(), 0, "no layers");
+        assert_eq!(r.u16().unwrap(), 0, "16-bit planes are raw");
+        let red: Vec<u16> = (0..8).map(|_| r.u16().unwrap()).collect();
+        assert_eq!(red, px16.iter().step_by(3).copied().collect::<Vec<_>>());
+        assert!(decode(&b, &DecodeOptions::default()).is_ok());
+        // gray 16-bit
+        let g = encode(&EncodeImage::new(2, 2, 1, Samples::U16(&[0, 1000, 40000, 65535])), &EncodeMeta::default()).unwrap();
+        assert_eq!((&g[12..14], &g[24..26]), (&1u16.to_be_bytes()[..], &1u16.to_be_bytes()[..]), "one channel, grayscale mode");
+        assert!(decode(&g, &DecodeOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn flat_psd_refuses_what_it_cannot_hold() {
+        let e = encode(&EncodeImage::new(1, 1, 3, Samples::F32(&[0.5; 3])), &EncodeMeta::default()).unwrap_err();
+        assert!(e.to_string().contains("float"), "{e}");
+        let e = encode(&EncodeImage::new(MAX_SIDE + 1, 1, 1, Samples::U8(&vec![0; MAX_SIDE as usize + 1])), &EncodeMeta::default()).unwrap_err();
+        assert!(e.to_string().contains("TIFF"), "{e}");
     }
 }

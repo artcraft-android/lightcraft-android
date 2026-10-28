@@ -77,15 +77,22 @@ fn status_and_model_commands_without_the_model() {
 #[test]
 fn a_failing_download_ends_with_an_error_and_never_blocks() {
     use std::io::{BufRead, BufReader, Write};
-    // a local mirror that has nothing
+    // a local mirror that has nothing; its first answer waits until the test has made its second
+    // request, so the download is still running then however the threads are scheduled (a 404 at
+    // once could end it before, and the second request would rightly start a new one)
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/sam3", l.local_addr().unwrap());
+    let (release, released) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
+        let mut first = Some(released);
         for mut c in l.incoming().flatten() {
             let mut r = BufReader::new(c.try_clone().unwrap());
             let mut line = String::new();
             while r.read_line(&mut line).unwrap_or(0) > 2 {
                 line.clear();
+            }
+            if let Some(released) = first.take() {
+                let _ = released.recv_timeout(Duration::from_secs(10));
             }
             let _ = c.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n<h1>404</h1>\n");
         }
@@ -103,6 +110,7 @@ fn a_failing_download_ends_with_an_error_and_never_blocks() {
     // a second request while it runs starts nothing
     let again = s.execute("segment.model.download", &json!({"acknowledged": true})).unwrap();
     assert!(again["started"] == false || again["downloading"] == false);
+    let _ = release.send(());
     let t = Instant::now();
     while s.segmenter.download_status().running {
         assert!(t.elapsed() < Duration::from_secs(30), "the download never ended");
@@ -115,6 +123,7 @@ fn a_failing_download_ends_with_an_error_and_never_blocks() {
     }
     let st = s.segmenter.download_status();
     assert!(!st.finished);
+    assert!(!st.cancelled, "a failure is not a cancel");
     let e = st.error.unwrap();
     assert!(e.contains("not found"), "{e}");
     assert!(!s.segmenter.installed());
@@ -230,4 +239,78 @@ fn object_clicks_are_capped() {
     assert!(e.contains("at most"), "{e}");
     assert!(!s.segmenter.busy());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "sam")]
+#[test]
+fn a_running_model_download_shows_in_activity_and_cancels() {
+    use std::io::{BufRead, BufReader, Write};
+    // a local mirror that sends its files slowly, so the download is still running when it is cancelled
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/sam3", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut line = String::new();
+            while r.read_line(&mut line).unwrap_or(0) > 2 {
+                line.clear();
+            }
+            let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n");
+            for _ in 0..250 {
+                if c.write_all(&[b' '; 4000]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    });
+    let dir = tmp("download-activity");
+    let mirrors = dir.with_extension("activity-mirrors.txt");
+    std::fs::write(&mirrors, format!("# test mirror\n{base}\n")).unwrap();
+    let mut s = Session::with_demo();
+    s.segmenter.dir = Some(dir.clone());
+    s.segmenter.mirrors_file = Some(mirrors.clone());
+    assert_eq!(s.execute("segment.model.download", &json!({"acknowledged": true})).unwrap()["started"], true);
+    let rows = s.activity.list();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].kind, rows[0].label.as_str(), rows[0].detail.as_str()), ("download", "Downloading model", "SAM 3"));
+    assert_eq!(rows[0].unit, crate::activity::Unit::Bytes);
+    assert!(rows[0].cancellable);
+    s.execute("activity.cancel", &json!({"id": rows[0].id})).unwrap();
+    let t = Instant::now();
+    while s.segmenter.download_status().running || !s.activity.list().is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(10), "the download never stopped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let st = s.segmenter.download_status();
+    assert!(st.cancelled, "the app tells a cancel by the flag (#1046): {st:?}");
+    let e = st.error.unwrap_or_default();
+    assert!(e.contains("cancelled"), "{e}");
+    assert!(!s.segmenter.installed());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&mirrors);
+}
+
+/// Frontends decide on the error's kind, not its words (#1046): a missing model is
+/// `ModelMissing(Sam3)` whether the app queues requests (background) or a command waits (CLI, MCP);
+/// a build without AI masks is not a missing model (there is nothing to download).
+#[test]
+fn a_missing_model_is_model_missing_by_kind() {
+    use crate::{AiModel, ErrorKind};
+    for background in [true, false] {
+        let mut s = Session::with_demo();
+        s.segmenter.background = background;
+        s.segmenter.dir = Some(tmp(&format!("kind-{background}")));
+        for (cmd, p) in
+            [("mask.add", json!({"kind": "object"})), ("mask.add", json!({"kind": "prompt", "text": "sky"})), ("segment.prepare", json!({}))]
+        {
+            let e = s.execute(cmd, &p).unwrap_err();
+            if Segmenter::AVAILABLE {
+                assert_eq!(e.kind(), ErrorKind::ModelMissing(AiModel::Sam3), "{cmd} (background {background}): {e}");
+                assert!(e.to_string().starts_with(NOT_INSTALLED), "the message is unchanged: {e}");
+            } else {
+                assert_eq!(e.kind(), ErrorKind::Other, "{cmd}: {e}");
+            }
+        }
+    }
 }

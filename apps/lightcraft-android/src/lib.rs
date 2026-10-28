@@ -1231,13 +1231,16 @@ impl MobileSession {
         let p = s.catalog.photo(PhotoId(id))?;
         let c = &p.develop.curve;
         let flat = |v: &[lightcraft_geom::Point]| v.iter().flat_map(|q| [q.x, q.y]).collect::<Vec<f64>>();
-        let parametric = lightcraft_engine::pipeline::finish::parametric_curve(c, CURVE_SAMPLES);
+        // the parametric curve as the renderer models it, sampled evenly over the encoded domain
+        let curve = lightcraft_engine::pipeline::curve::ParametricCurve::new(c);
+        let last = CURVE_SAMPLES.saturating_sub(1).max(1) as f64;
+        let parametric: Vec<f64> = (0..CURVE_SAMPLES).map(|i| curve.at(i as f64 / last)).collect();
         Some(ToneCurveInfo {
             master: flat(&c.master),
             red: flat(&c.red),
             green: flat(&c.green),
             blue: flat(&c.blue),
-            parametric: parametric.v.iter().map(|v| f64::from(*v)).collect(),
+            parametric,
             preset: matching_preset(&s, c),
             presets: all_presets(&s).into_iter().map(|p| p.name).collect(),
         })

@@ -21,11 +21,22 @@ pub trait Real:
 {
     /// `if |v| < tiny { tiny } else { v }`: the guard of a denominator against zero ([`crate::Homography::apply`]).
     fn clamp_tiny(self, tiny: f64) -> Self;
+    /// The square root of a non-negative value (a negative one gives NaN, or for an [`Interval`] its lower bound
+    /// is taken as 0, since the value is a sum of squares).
+    fn sqrt_nonneg(self) -> Self;
+    /// `self` limited to `lo..=hi` (`lo <= hi`).
+    fn clamp_range(self, lo: f64, hi: f64) -> Self;
 }
 
 impl Real for f64 {
     fn clamp_tiny(self, tiny: f64) -> f64 {
         if self.abs() < tiny { tiny } else { self }
+    }
+    fn sqrt_nonneg(self) -> f64 {
+        self.sqrt()
+    }
+    fn clamp_range(self, lo: f64, hi: f64) -> f64 {
+        if lo <= hi { self.clamp(lo, hi) } else { self }
     }
 }
 
@@ -165,6 +176,23 @@ impl Real for Interval {
     fn clamp_tiny(self, tiny: f64) -> Interval {
         if self.lo >= tiny || self.hi <= -tiny { self } else { Interval::UNDECIDED }
     }
+
+    /// `sqrt` is monotonic and correctly rounded, so one ulp outward encloses the `f64` result.
+    fn sqrt_nonneg(self) -> Interval {
+        if !self.is_decided() || self.hi < 0.0 {
+            return Interval::UNDECIDED;
+        }
+        Interval::outward(self.lo.max(0.0).sqrt(), self.hi.sqrt())
+    }
+
+    /// Clamping is monotonic and exact.
+    fn clamp_range(self, lo: f64, hi: f64) -> Interval {
+        let ordered = lo <= hi;
+        if !self.is_decided() || !ordered {
+            return Interval::UNDECIDED;
+        }
+        Interval::new(self.lo.clamp(lo, hi), self.hi.clamp(lo, hi))
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +229,10 @@ mod tests {
             prop_assert!(k == 0.0 || contains(ia / k, a / k));
             let c = ib.clamp_tiny(1.0);
             prop_assert!(!c.is_decided() || contains(c, b.clamp_tiny(1.0)));
+            let sq = (ia * ia).sqrt_nonneg();
+            prop_assert!(!sq.is_decided() || contains(sq, (a * a).sqrt()));
+            let cl = ib.clamp_range(-1.0, 2.0);
+            prop_assert!(contains(cl, b.clamp_range(-1.0, 2.0)));
         }
     }
 

@@ -14,10 +14,12 @@ lightcraft-color = { workspace = true }
 lightcraft-raster = { workspace = true }
 lightcraft-develop = { workspace = true }
 lightcraft-raw = { workspace = true }
+lightcraft-inpaint = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
 lightcraft-scenes = { workspace = true }
 proptest = { workspace = true }
 image = { workspace = true }

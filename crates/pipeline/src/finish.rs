@@ -3,7 +3,7 @@
 use lightcraft_color::luminance_2020;
 use lightcraft_color::spline::{Lut1, MonotoneCurve};
 use lightcraft_color::transfer::linear_to_srgb;
-use lightcraft_develop::{DevelopSettings, LocalAdjustments, ToneCurve, VignetteStyle};
+use lightcraft_develop::{DevelopSettings, LocalAdjustments, Process, ToneCurve, VignetteStyle};
 use lightcraft_geom::Point;
 use lightcraft_raster::Rgba8;
 
@@ -20,34 +20,6 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The parametric region curve alone (its four regions and three splits) over `n` evenly spaced
-/// inputs in the encoded domain: what the pipeline applies, and what a curve editor draws.
-pub fn parametric_curve(c: &ToneCurve, n: usize) -> Lut1 {
-    let n = n.max(2);
-    let (s1, s2, s3) = ((c.split_shadows / 100.0) as f32, (c.split_mid / 100.0) as f32, (c.split_highlights / 100.0) as f32);
-    let regions = [(0.0, s1, c.shadows), (s1, s2, c.darks), (s2, s3, c.lights), (s3, 1.0, c.highlights)];
-    let mut base = Lut1::from_fn(n, |x| {
-        let mut d = 0.0;
-        for (a, b, amt) in regions {
-            if amt == 0.0 {
-                continue;
-            }
-            let (ctr, half) = ((a + b) / 2.0, (b - a) * 0.75 + 0.05);
-            let t = ((x - ctr) / half).clamp(-1.0, 1.0);
-            let win = 0.5 + 0.5 * (t * std::f32::consts::PI).cos();
-            d += (amt / 100.0) as f32 * 0.22 * win;
-        }
-        (x + d * 4.0 * x * (1.0 - x)).clamp(0.0, 1.0)
-    });
-    // keep monotone
-    let mut top = 0.0f32;
-    for v in &mut base.v {
-        top = top.max(*v);
-        *v = top;
-    }
-    base
-}
-
 /// Parametric region curve (encoded domain) composed with the master point curve.
 fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
@@ -57,13 +29,20 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
         return None;
     }
     const N: usize = 1024;
-    let mut base = parametric_curve(c, N);
+    let mut base = crate::curve::ParametricCurve::new(c).to_lut();
     let to_pts = |p: &[Point]| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
     if master {
         base = MonotoneCurve::new(&to_pts(&c.master)).to_lut(N).compose(&base);
     }
     let per = [&c.red, &c.green, &c.blue];
-    Some(std::array::from_fn(|i| if chans[i] { MonotoneCurve::new(&to_pts(per[i])).to_lut(N).compose(&base) } else { base.clone() }))
+    Some(std::array::from_fn(|i| {
+        if chans.get(i).copied().unwrap_or(false) {
+            let pts = per.get(i).map(|&p| to_pts(p)).unwrap_or_default();
+            MonotoneCurve::new(&pts).to_lut(N).compose(&base)
+        } else {
+            base.clone()
+        }
+    }))
 }
 
 /// Vignette (post-crop) parameters.
@@ -209,6 +188,9 @@ pub struct FinishParams {
     pub px_per_long: f64,
     /// The window's offset and the whole output's size (pixels): `(0, 0, w, h)` unless windowed.
     pub view: [f32; 4],
+    /// Peak linear output relative to SDR white: 1 for SDR renders; `2^max_ev` for an HDR render
+    /// ([`OutputDepth::F32Hdr`] with HDR on), which keeps values above 1 instead of clipping them.
+    pub peak: f32,
 }
 
 impl FinishParams {
@@ -237,17 +219,12 @@ impl FinishParams {
             ((s.grain.amount / 100.0) as f32 * 0.13, cell.max(0.6), (s.grain.roughness / 100.0) as f32, s.grain.seed)
         });
         let calibration = s.section_enabled("calibration");
+        let peak = s.hdr.peak();
         FinishParams {
+            peak,
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
-            tone: if let Some(curve) = info.camera_tone.as_ref().filter(|_| info.raw) {
-                ToneMap::camera(curve, s.light.whites, s.light.blacks)
-            } else if info.raw {
-                ToneMap::new(s.light.contrast, s.light.whites, s.light.blacks)
-            } else {
-                // a rendered photo was expanded onto the scene scale (`local::wb_gain`): back with its curve
-                ToneMap::jpeg(s.light.whites, s.light.blacks)
-            },
+            tone: base_tone(s, info, peak),
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
             curves: curve_luts(&s.curve),
@@ -281,12 +258,54 @@ impl FinishParams {
             view: frame.view.map_or([0.0, 0.0, w as f32, h as f32], |v| [v.x as f32, v.y as f32, v.full_w as f32, v.full_h as f32]),
         }
     }
+
+    /// Render into a display's primaries (sRGB curve) instead of the output space, soft proof
+    /// included (see [`crate::DisplaySpace`]).
+    pub fn for_display(&mut self, d: &crate::DisplaySpace, proof: Option<crate::Proof>) {
+        self.to_out = d.from_working;
+        self.out_luma = d.luma;
+        self.out_trc = OutputTrc::Srgb;
+        self.proof = proof.map(|pr| pr.params_display(d));
+    }
 }
 
-pub(crate) fn finish(p: &Prepared, s: &DevelopSettings, frame: &Frame, info: &SourceInfo, space: OutputSpace, proof: Option<crate::Proof>) -> Rgba8 {
+/// The base tone map (scene → display luminance, with Contrast, Whites and Blacks) of `s`'s
+/// rendering process. This is where a new tone model branches: a retuned default tone curve (issue
+/// #146) is a new [`Process`] with its own arm here, and V1's arm stays as it is, so photos edited
+/// under V1 keep their look (`docs/process-versions.md`). CPU and GPU both take it from here.
+/// `peak` is the HDR render's peak relative to SDR white ([`lightcraft_develop::Hdr::peak`]); at 1.0 (SDR)
+/// every arm is the SDR tone map. An HDR render keeps the camera's look through the midtones and
+/// lifts its highlights past white ([`ToneMap::camera_hdr`]), so it matches the SDR render below them.
+pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
+    let l = &s.light;
+    match s.process.process() {
+        // V2 changes the Highlights/Shadows base (`local::tone_base`), not the tone map
+        Process::V1 | Process::V2 => match info.camera_tone.as_ref().filter(|_| info.raw) {
+            // Contrast is per channel before the tone map ([`crate::tone::contrast_ev`]), except
+            // for `ToneMap::hdr` (a raw without a camera curve), which carries its own
+            Some(curve) => ToneMap::camera_hdr(curve, l.whites, l.blacks, peak),
+            None if info.raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
+            // a rendered photo was expanded onto the scene scale (`local::wb_gain`): back with its curve
+            None => ToneMap::jpeg_hdr(l.whites, l.blacks, peak),
+        },
+    }
+}
+
+pub(crate) fn finish(
+    p: &Prepared,
+    s: &DevelopSettings,
+    frame: &Frame,
+    info: &SourceInfo,
+    space: OutputSpace,
+    display: Option<&crate::DisplaySpace>,
+    proof: Option<crate::Proof>,
+) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
     fp.proof = proof.map(|pr| pr.params(space));
+    if let Some(d) = display {
+        fp.for_display(d, proof);
+    }
     let trc = fp.out_trc;
     let data = finish_with(p, &fp, false, |e| match trc {
         OutputTrc::Srgb => [enc(e[0]), enc(e[1]), enc(e[2]), 255],
@@ -317,6 +336,12 @@ pub(crate) fn finish_deep(
     let samples = match depth {
         OutputDepth::F32Linear => {
             let v = finish_with(p, &fp, true, |e| e.map(|v| srgb_to_linear(v.clamp(0.0, 1.0))));
+            DeepSamples::F32(v.into_flattened())
+        }
+        OutputDepth::F32Hdr => {
+            // the sRGB curve extended past 1 (it is unbounded), so values up to `peak` survive
+            let peak = fp.peak;
+            let v = finish_with(p, &fp, true, |e| e.map(|v| srgb_to_linear(v.max(0.0)).clamp(0.0, peak)));
             DeepSamples::F32(v.into_flattened())
         }
         _ => {
@@ -374,6 +399,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let aspect = vw / vh;
 
     let srgb = srgb_lut();
+    let peak = fp.peak;
+    let hdr = peak > 1.0;
     let mut out = vec![T::default(); w * h];
     for_rows(&mut out, w, |y, row| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -426,7 +453,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             if dz != 0.0
                 && let Some(dark) = &p.dark
             {
-                let d = (dark.data[i] / air_pre).clamp(0.0, 1.0);
+                // The dark channel is a blur, not a patch minimum: near bright neighbours it credits
+                // dark pixels with veil they don't hold (and a windowed render borrows the whole
+                // frame's airlight), so the subtraction went past zero and crushed them to black
+                // (#2504). Never attribute more veil than the pixel's own minimum channel.
+                let c_min = c[0].min(c[1]).min(c[2]);
+                let d = (if air_pre > 0.0 { dark.data[i] / air_pre } else { 0.0 }).min(if air > 0.0 { c_min / air } else { 0.0 }).clamp(0.0, 1.0);
                 if dz > 0.0 {
                     // the haze map is held to the pixel's own darkest channel: a pixel darker than its
                     // neighbourhood isn't haze, and capping it never takes away more than the pixel has, so
@@ -539,8 +571,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             };
             // (a rendered photo's channels were each rolled off already; the output clips the rest)
             let mx = d[0].max(d[1]).max(d[2]);
-            if mx > 1.0 && !fp.per_channel {
-                let t = ((mx - 1.0) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
+            if mx > peak && !fp.per_channel {
+                let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
                 d = d.map(|v| v + (o - v) * t);
             }
 
@@ -572,6 +604,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                         } else {
                             d = d.map(|c| c * f);
                         }
+                    } else if hdr {
+                        // lighten towards SDR white; never pull HDR highlights down to it
+                        d = d.map(|c| c + (1.0 - c).max(0.0) * v.amount * t * 0.85);
                     } else {
                         d = d.map(|c| c + (1.0 - c) * v.amount * t * 0.85);
                     }
@@ -582,9 +617,16 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             // proof space first and shows that in the output space
             let mut warn = None;
             let mut r = match &fp.proof {
+                Some(pp) if pp.table.is_some() => {
+                    let (q, dist) = pp.table.as_ref().map_or((d, 0.0), |t| t.sample(d));
+                    if pp.dest_warning && dist > crate::output::PROOF_GAMUT_TOLERANCE {
+                        warn = Some(crate::output::PROOF_DEST_WARNING);
+                    }
+                    mul3(to_out, q)
+                }
                 Some(pp) => {
                     let q0 = mul3(&pp.to_proof, d);
-                    let (q, t) = gamut_map(q0, pp.luma);
+                    let (q, t) = gamut_map_to(q0, pp.luma, peak);
                     if pp.dest_warning && out_of_gamut(q0, t) {
                         warn = Some(crate::output::PROOF_DEST_WARNING);
                     }
@@ -592,17 +634,37 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
                 None => mul3(to_out, d),
             };
-            let (mapped, t) = gamut_map(r, *out_luma);
-            if fp.proof.is_some_and(|pp| pp.display_warning) && warn.is_none() && out_of_gamut(r, t) {
+            let (mapped, t) = gamut_map_to(r, *out_luma, peak);
+            if fp.proof.as_ref().is_some_and(|pp| pp.display_warning) && warn.is_none() && out_of_gamut(r, t) {
                 warn = Some(crate::output::PROOF_DISPLAY_WARNING);
             }
             r = mapped;
 
             // --- encode, curves, grain
-            let mut e = if exact { r.map(|v| linear_to_srgb(v.clamp(0.0, 1.0))) } else { r.map(|v| encode_srgb(srgb, v)) };
+            let mut e = if hdr {
+                // HDR: the (unbounded) sRGB curve, so values above SDR white encode above 1
+                r.map(|v| {
+                    if v > 1.0 {
+                        linear_to_srgb(v)
+                    } else if exact {
+                        linear_to_srgb(v.max(0.0))
+                    } else {
+                        encode_srgb(srgb, v)
+                    }
+                })
+            } else if exact {
+                r.map(|v| linear_to_srgb(v.clamp(0.0, 1.0)))
+            } else {
+                r.map(|v| encode_srgb(srgb, v))
+            };
             if let Some(l) = curves {
                 let e0 = e;
-                e = [l[0].eval(e[0]), l[1].eval(e[1]), l[2].eval(e[2])];
+                e = if hdr {
+                    // above SDR white the curves continue with slope 1 from their end point
+                    std::array::from_fn(|k| if e[k] > 1.0 { l[k].eval(1.0) + (e[k] - 1.0) } else { l[k].eval(e[k]) })
+                } else {
+                    [l[0].eval(e[0]), l[1].eval(e[1]), l[2].eval(e[2])]
+                };
                 if fp.refine_sat < 1.0 {
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
@@ -613,11 +675,20 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let sc = fp.px_per_long as f32 / cell;
                 let mut g = grain_noise(gx * sc, gy * sc, seed);
                 g = g * (1.0 - rough * 0.5) + grain_noise(gx * sc * 2.3, gy * sc * 2.3, seed ^ 0x55) * rough * 0.7;
-                let lum = 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
+                let mut lum = 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
+                if hdr {
+                    lum = lum.clamp(0.0, 1.0);
+                }
                 let k = amt * g * (0.35 + 2.6 * lum * (1.0 - lum));
                 e = e.map(|v| v + k);
             }
             let e = match &p_lut {
+                Some((l, k)) if hdr => {
+                    // the LUT sees SDR values; the part above SDR white is carried over
+                    let c = e.map(|v| v.clamp(0.0, 1.0));
+                    let m = l.apply(c);
+                    [e[0] + (m[0] - c[0]) * k, e[1] + (m[1] - c[1]) * k, e[2] + (m[2] - c[2]) * k]
+                }
                 Some((l, k)) => {
                     let m = l.apply(e.map(|v| v.clamp(0.0, 1.0)));
                     [e[0] + (m[0] - e[0]) * k, e[1] + (m[1] - e[1]) * k, e[2] + (m[2] - e[2]) * k]
@@ -658,16 +729,23 @@ fn mul3(m: &[[f32; 3]; 3], d: [f32; 3]) -> [f32; 3] {
 /// which the gamut warnings use.
 #[inline]
 pub fn gamut_map(r: [f32; 3], luma: [f32; 3]) -> ([f32; 3], f32) {
-    let yy = (luma[0] * r[0] + luma[1] * r[1] + luma[2] * r[2]).clamp(0.0, 1.0);
+    gamut_map_to(r, luma, 1.0)
+}
+
+/// [`gamut_map`] into `0..peak` (an HDR render's range; `peak` = 1 is [`gamut_map`]): each channel
+/// clipped, with the desaturation scale the warnings use.
+#[inline]
+pub fn gamut_map_to(r: [f32; 3], luma: [f32; 3], peak: f32) -> ([f32; 3], f32) {
+    let yy = (luma[0] * r[0] + luma[1] * r[1] + luma[2] * r[2]).clamp(0.0, peak);
     let mut t = 1.0f32;
     for c in r {
         if c < 0.0 {
             t = t.min(yy / (yy - c).max(1e-9));
-        } else if c > 1.0 {
-            t = t.min((1.0 - yy) / (c - yy).max(1e-9));
+        } else if c > peak {
+            t = t.min((peak - yy) / (c - yy).max(1e-9));
         }
     }
-    (r.map(|c| c.clamp(0.0, 1.0)), t)
+    (r.map(|c| c.clamp(0.0, peak)), t)
 }
 
 /// Local Defringe weight of a scene-linear colour `c` whose log luminance differs by `det` from

@@ -27,7 +27,8 @@ struct P {
     cout: u32,
     leaky: u32,
     alpha: f32,
-    pad: u32,
+    // always 0: the output stores step by 1u + zero, see the end of main
+    zero: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: P;
@@ -44,8 +45,11 @@ const TX: u32 = BN / 4u;
 const A_ITEMS: u32 = BM * (BK / 4u);
 const B_ITEMS: u32 = BK * (BN / 4u);
 
-// A[k][m] four pixels to a vec4, B[k][n] four channels to a vec4
-var<workgroup> As: array<vec4<f32>, {{A_VECS}}>;
+// A[k][m] has one scalar per pixel; B[k][n] packs four channels per vec4.
+// Different invocations must not write lanes of the same shared vector: WGSL permits
+// a component write to access the entire vector. A later barrier cannot undo that race.
+// Each scalar below has one writer; gather four pixels only after the barrier.
+var<workgroup> As: array<f32, BK * BM>;
 var<workgroup> Bs: array<vec4<f32>, {{B_VECS}}>;
 
 @compute @workgroup_size(256)
@@ -88,12 +92,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
                         }
                     }
                 }
-                let base = (q * 4u) * (BM / 4u) + ml / 4u;
-                let lane = ml % 4u;
-                As[base][lane] = v.x;
-                As[base + BM / 4u][lane] = v.y;
-                As[base + 2u * (BM / 4u)][lane] = v.z;
-                As[base + 3u * (BM / 4u)][lane] = v.w;
+                let base = q * 4u * BM + ml;
+                As[base] = v.x;
+                As[base + BM] = v.y;
+                As[base + 2u * BM] = v.z;
+                As[base + 3u * BM] = v.w;
             }
             for (var item = tid; item < B_ITEMS; item += 256u) {
                 let r = item / (BN / 4u);
@@ -103,7 +106,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             }
             workgroupBarrier();
             for (var kk = 0u; kk < BK; kk++) {
-                let a = As[kk * (BM / 4u) + ty];
+                let ai = kk * BM + ty * 4u;
+                let a = vec4<f32>(As[ai], As[ai + 1u], As[ai + 2u], As[ai + 3u]);
                 let b = Bs[kk * TX + tx];
                 acc0 += a.x * b;
                 acc1 += a.y * b;
@@ -119,6 +123,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         return;
     }
     let bv = bias[n / 4u];
+    // Four channels that follow each other are stored one by one, `one` apart. With a literal 1u, FXC
+    // (DX12) merges them into one 16-byte store, and NVIDIA's DX12 driver ran mode 0's wrong on a
+    // GTX 1070: every second pixel's channels came out shifted. Mode 1's merged store ran right
+    // there, but it is the same instruction, so it steps the same way. FXC cannot see that `one` is 1.
+    let one = 1u + p.zero;
     for (var i = 0u; i < 4u; i++) {
         let m = m0 + ty * 4u + i;
         if (m >= hw) {
@@ -132,9 +141,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         if (p.mode == 0u) {
             let o = m * p.n + n;
             dst[o] = v.x;
-            dst[o + 1u] = v.y;
-            dst[o + 2u] = v.z;
-            dst[o + 3u] = v.w;
+            dst[o + one] = v.y;
+            dst[o + 2u * one] = v.z;
+            dst[o + 3u * one] = v.w;
         } else if (p.mode == 1u) {
             let q = n / p.cout;
             let co = n % p.cout;
@@ -143,9 +152,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             let opix = (2u * y + q / 2u) * (2u * p.w) + 2u * x + q % 2u;
             let o = opix * p.cout + co;
             dst[o] = v.x;
-            dst[o + 1u] = v.y;
-            dst[o + 2u] = v.z;
-            dst[o + 3u] = v.w;
+            dst[o + one] = v.y;
+            dst[o + 2u * one] = v.z;
+            dst[o + 3u * one] = v.w;
         } else {
             let c = n / 4u;
             let y = m / p.w;

@@ -1,6 +1,8 @@
 //! Read-only queries (not journaled): catalog, photos, develop state, controls, presets, albums.
 
-use lightcraft_catalog::{Album, Photo, PhotoId};
+use std::collections::HashMap;
+
+use lightcraft_catalog::{Album, AlbumId, Photo, PhotoId};
 use lightcraft_develop::{CONTROLS, controls};
 use serde_json::{Value, json};
 
@@ -31,30 +33,48 @@ pub fn photo_summary(p: &Photo) -> Value {
     })
 }
 
-fn album_json(a: &Album, all: &[Album], cat: &lightcraft_catalog::Catalog) -> Value {
+/// How deep [`album_json`] lists folders inside folders: a catalog that loops (an album inside
+/// itself, which [`lightcraft_catalog::Catalog::repair`] puts right on load) lists no further
+/// instead of overflowing the stack.
+const MAX_ALBUM_DEPTH: usize = 64;
+
+fn album_json(a: &Album, all: &[Album], counts: &HashMap<AlbumId, usize>, cat: &lightcraft_catalog::Catalog, depth: usize) -> Value {
+    let children: Vec<Value> = if depth < MAX_ALBUM_DEPTH {
+        all.iter().filter(|c| c.parent == Some(a.id)).map(|c| album_json(c, all, counts, cat, depth + 1)).collect()
+    } else {
+        Vec::new()
+    };
     let mut v = json!({
         "id": a.id.0,
         "name": a.name,
         "folder": a.folder,
-        "count": cat.album_count(a.id),
+        "count": counts.get(&a.id).copied().unwrap_or(0),
         "cover": a.cover.map(|c| c.0),
-        "children": all.iter().filter(|c| c.parent == Some(a.id)).map(|c| album_json(c, all, cat)).collect::<Vec<_>>(),
+        "children": children,
     });
     if let Some(rules) = &a.smart {
         v["smart"] = json!(true);
         v["rules"] = serde_json::to_value(rules).unwrap_or_default();
-        v["rulesText"] = json!(rules.describe());
+        v["rulesText"] = json!(rules.describe_with(cat));
+        // rules that no longer check (an album they test was deleted…), as `rule 1: …`
+        v["problems"] = json!(cat.smart_album_problems(a.id).iter().map(ToString::to_string).collect::<Vec<_>>());
     }
     v
 }
 
 /// The photo a query is about: `id` when given (which must be in the library), else the active one.
 fn photo_arg(s: &Session, p: &Value, c: &str) -> crate::Result<PhotoId> {
-    match p.get("id").and_then(Value::as_u64).map(PhotoId) {
+    match super::photo_id(p, c)? {
         Some(id) if s.catalog.photo(id).is_some() => Ok(id),
         Some(id) => Err(bad(c, format!("no such photo {}", id.0))),
         None => s.active().ok_or_else(|| bad(c, "no photo")),
     }
+}
+
+// Catalog queries also run in the 32-bit web build. A narrowing cast wraps
+// an out-of-range offset to zero, returning the first page instead of no photos.
+fn pagination_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -67,8 +87,8 @@ pub fn specs() -> Vec<CommandSpec> {
             } else {
                 s.visible_cloned()
             };
-            let off = p.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let lim = p.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+            let off = pagination_usize(p.get("offset").and_then(Value::as_u64).unwrap_or(0));
+            let lim = pagination_usize(p.get("limit").and_then(Value::as_u64).unwrap_or(200));
             let items: Vec<Value> = ids.iter().skip(off).take(lim).filter_map(|id| s.catalog.photo(*id)).map(|p| photo_summary(p)).collect();
             Ok(json!({"total": ids.len(), "photos": items}))
         }),
@@ -121,8 +141,11 @@ pub fn specs() -> Vec<CommandSpec> {
                 .into_iter()
                 .map(|r| json!({"group": r.group, "tag": r.tag, "name": r.name, "value": r.value}))
                 .collect();
-            // XMP: the sidecar if there is one, else the file's own packet
-            let packet = crate::sidecar::read_packet(path, ph.kind, s.sidecar_naming(ph.id)).map(|(x, _)| x).or_else(|| lightcraft_meta::embedded(&bytes).xmp);
+            // Keep sidecar precedence; reuse the loaded bytes for embedded XMP.
+            let packet = match crate::sidecar::find_sidecar(path, s.sidecar_naming(ph.id)) {
+                Some(sc) => std::fs::read_to_string(sc).ok(),
+                None => lightcraft_meta::embedded(&bytes).xmp,
+            };
             let xmp: Vec<Value> = packet
                 .and_then(|x| lightcraft_meta::parse_xmp(&x).ok())
                 .map(|d| d.properties.into_iter().filter(|(k, _)| !k.starts_with("lc:")).map(|(k, v)| json!({"name": k, "value": v.join("; ")})).collect())
@@ -131,7 +154,9 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!(query "albums.list", "List Albums", [], None, "{}", always, |s, _| {
             let all: Vec<Album> = s.catalog.albums().cloned().collect();
-            Ok(Value::Array(all.iter().filter(|a| a.parent.is_none()).map(|a| album_json(a, &all, &s.catalog)).collect()))
+            // every album counted in one pass, so a smart album tested by others is worked out once
+            let counts = lightcraft_catalog::tally::AlbumTally::of(&s.catalog);
+            Ok(Value::Array(all.iter().filter(|a| a.parent.is_none()).map(|a| album_json(a, &all, counts.counts(), &s.catalog, 0)).collect()))
         }),
         cmd!(query "photo.inspect", "Inspect Photo", [], None, "{id?}", always, |s, p| {
             let id = photo_arg(s, p, "photo.inspect")?;
@@ -149,9 +174,18 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(v)
         }),
-        cmd!(query "develop.get", "Get Develop Settings", [], None, "{id?}", always, |s, p| {
+        cmd!(query "develop.get", "Get Develop Settings", [], None, "{id?} → the photo's develop settings; `process` is the rendering process they are interpreted by (see develop.updateProcess)", always, |s, p| {
             let id = photo_arg(s, p, "develop.get")?;
-            Ok(s.develop_of(id).map(|d| d.to_json()).unwrap_or(Value::Null))
+            Ok(s.develop_of(id)
+                .map(|d| {
+                    let mut v = d.to_json();
+                    // saved settings leave V1 out (`ProcessVersion::is_legacy`); here it is always stated
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("process".into(), json!(d.process));
+                    }
+                    v
+                })
+                .unwrap_or(Value::Null))
         }),
         cmd!(query "develop.controls", "List Develop Controls", [], None, "{section?} — every slider with range, default and current value", always, |s, p| {
             let d = s.active().and_then(|id| s.develop_of(id)).unwrap_or_default();
@@ -178,20 +212,21 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "presets.list", "List Presets", [], None, "{}", always, |s, _| {
             Ok(Value::Array(s.presets.iter().map(|p| json!({"id": p.id, "name": p.name, "group": p.group, "favorite": p.favorite, "builtin": p.builtin})).collect()))
         }),
-        cmd!(query "profiles.list", "List Profiles", [], None, "{} — every profile with its group and favourite flag", always, |s, _| {
-            Ok(Value::Array(
-                crate::presets::PROFILES
-                    .iter()
-                    .map(|p| json!({"id": p.id, "name": p.name, "group": p.group, "favorite": s.profile_favorites.iter().any(|f| f == p.id)}))
-                    .collect(),
-            ))
+        cmd!(query "profiles.list", "List Profiles", [], None, "{} — every profile (built-in, then imported LUTs marked `imported`) with its group and favourite flag", always, |s, _| {
+            let favorite = |id: &str| s.profile_favorites.iter().any(|f| f == id);
+            let builtin = crate::presets::PROFILES.iter().map(|p| json!({"id": p.id, "name": p.name, "group": p.group, "favorite": favorite(p.id)}));
+            // imported LUT profiles too (#618), marked as in `profiles.menu`
+            let imported =
+                s.lut_profiles.iter().map(|p| json!({"id": p.id, "name": p.name, "group": p.group, "favorite": favorite(&p.id), "imported": true}));
+            Ok(Value::Array(builtin.chain(imported).collect()))
         }),
         cmd!(query "profiles.menu", "Profile Menu", [], None, "{} — favourites, recent (newest first) and groups", always, |s, _| Ok(s.profile_menu())),
-        cmd!(query "history.list", "List History", [], None, "{id?}", has_active, |s, p| {
+        cmd!(query "history.list", "List History", [], None, "{id?} — returns {history: labels oldest first, cursor: index of the step the settings are at (later steps can be returned to), versions}", has_active, |s, p| {
             let id = photo_arg(s, p, "history.list")?;
             let ph = s.catalog.photo(id).ok_or_else(|| bad("history.list", "no such photo"))?;
             Ok(json!({
                 "history": ph.history.iter().map(|h| h.label.clone()).collect::<Vec<_>>(),
+                "cursor": ph.history_index(),
                 "versions": ph.versions.iter().map(|v| json!({"name": v.name, "created": v.created})).collect::<Vec<_>>(),
             }))
         }),
@@ -225,4 +260,18 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(Value::Array(s.journal[start..].iter().map(|(c, p)| json!({"command": c, "params": p})).collect()))
         }),
     ]
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn offsets_and_limits_saturate_instead_of_wrapping_on_wasm() {
+        assert_eq!(pagination_usize(0), 0);
+        assert_eq!(pagination_usize(200), 200);
+        assert_eq!(pagination_usize(u64::MAX), usize::MAX);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(pagination_usize(u64::from(u32::MAX) + 1), usize::MAX);
+    }
 }

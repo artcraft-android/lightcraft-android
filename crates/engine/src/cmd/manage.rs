@@ -9,8 +9,13 @@ use crate::Result;
 
 fn rename_args(s: &crate::Session, p: &Value, c: &str) -> Result<(Vec<lightcraft_catalog::PhotoId>, String, usize)> {
     let template = str_param(p, "template").ok_or_else(|| bad(c, "missing `template`"))?.to_string();
-    let start = p.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
-    Ok((s.targets(p), template, start))
+    let start = p.get("start").and_then(Value::as_u64).unwrap_or(1);
+    let ids = s.targets(p)?;
+    // every number of the sequence `start..start + n` must fit
+    let last = start.checked_add((ids.len() as u64).saturating_sub(1));
+    let start = last.and_then(|l| usize::try_from(l).ok()).and_then(|_| usize::try_from(start).ok());
+    let start = start.ok_or_else(|| bad(c, "start out of range"))?;
+    Ok((ids, template, start))
 }
 
 /// A named set of colour-label names (red, yellow, green, blue, purple; empty = the colour's name).
@@ -96,7 +101,7 @@ fn auto_tag_tracklog(s: &mut crate::Session, p: &Value) -> Result<Value> {
     let (mut no_time, mut outside, mut has_gps, mut assumed_utc, mut interpolated) = (0, 0, 0, 0, 0);
     let mut ops = Vec::new();
     let mut photos = Vec::new();
-    for id in s.targets(p) {
+    for id in s.targets(p)? {
         let Some(ph) = s.catalog.photo(id) else { continue };
         if ph.meta.gps.is_some() && !replace {
             has_gps += 1;
@@ -178,18 +183,24 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Capture Time",
             [],
             None,
-            "{ids?, time?: `2026-09-30T14:05:00` (the active photo gets it, the others shift by the same amount), each?: bool (every photo gets `time`), shift?: seconds, hours?: time-zone shift in hours} → {changed, captured: [..]}",
+            "{ids?, time?: `2026-09-30T14:05:00` (the active photo gets it, the others shift by the same amount), each?: bool (every photo gets `time`), shift?: seconds, hours?: time-zone shift in hours} → {changed, captured: [..], unreadable: photos skipped because their capture time can't be read}",
             has_selection,
             |s, p| {
                 use lightcraft_catalog::dates::{iso_seconds, normalize_iso, shift_iso};
                 let c = "photo.setCaptureTime";
-                let targets: Vec<_> = s.targets(p).into_iter().filter(|id| s.catalog.photo(*id).is_some()).collect();
+                let targets: Vec<_> = s.targets(p)?.into_iter().filter(|id| s.catalog.photo(*id).is_some()).collect();
                 if targets.is_empty() {
                     return Err(bad(c, "no photos"));
                 }
                 // photos without a capture time start from their import time
                 let base = |s: &crate::Session, id| s.catalog.photo(id).map(|p| p.date().to_string()).unwrap_or_default();
-                let mut delta = (f64_or(p, "shift", 0.0) + f64_or(p, "hours", 0.0) * 3600.0).round() as i64;
+                // seconds; a shift beyond 10,000 years is a mistake (and would overflow), not a date
+                const MAX_SHIFT: f64 = 10_000.0 * 365.25 * 86_400.0;
+                let shift = f64_or(p, "shift", 0.0) + f64_or(p, "hours", 0.0) * 3600.0;
+                if shift.is_nan() || shift.abs() > MAX_SHIFT {
+                    return Err(bad(c, "the shift is more than 10,000 years"));
+                }
+                let mut delta = shift.round() as i64;
                 let mut each: Option<String> = None;
                 if let Some(t) = str_param(p, "time") {
                     let t = normalize_iso(t).ok_or_else(|| bad(c, format!("`{t}` is not a date (YYYY-MM-DDTHH:MM:SS)")))?;
@@ -197,28 +208,58 @@ pub fn specs() -> Vec<CommandSpec> {
                         each = Some(t);
                     } else {
                         let anchor = s.active().filter(|a| targets.contains(a)).unwrap_or(targets[0]);
-                        let from = iso_seconds(&base(s, anchor)).ok_or_else(|| bad(c, "the photo's date doesn't parse"))?;
-                        delta += iso_seconds(&t).unwrap_or(from) - from;
+                        let anchor_date = base(s, anchor);
+                        // An impossible calendar date cannot anchor changes to the other photos.
+                        let from = normalize_iso(anchor_date.trim().get(..10).unwrap_or(""))
+                            .and_then(|_| iso_seconds(&anchor_date))
+                            .ok_or_else(|| bad(c, "the photo's date doesn't parse"))?;
+                        // the others move by the anchor's change, so it must read in full, not just
+                        // its leading digits (a Lightroom catalog's capture time is copied verbatim);
+                        // alone, it simply gets the time, which repairs it
+                        if shift_iso(&anchor_date, 0).is_some() {
+                            delta += iso_seconds(&t).unwrap_or(from) - from;
+                        } else if targets.len() == 1 {
+                            each = Some(t);
+                        } else {
+                            return Err(bad(
+                                c,
+                                "the active photo's capture time can't be read, so the other photos can't move by the same amount; set its time with it selected alone",
+                            ));
+                        }
                     }
                 }
                 let mut ops = Vec::new();
                 let mut out = Vec::new();
+                let mut out_of_range = 0usize;
+                let mut unreadable = 0usize;
                 for id in &targets {
-                    let new = match &each {
-                        Some(t) => shift_iso(t, delta),
-                        None => shift_iso(&base(s, *id), delta),
+                    let from = match &each {
+                        Some(t) => t.clone(),
+                        None => base(s, *id),
                     };
-                    let Some(new) = new else { continue };
+                    let Some(new) = shift_iso(&from, delta) else {
+                        // a date that reads but would leave years 0000–9999 is refused below; one
+                        // that doesn't read is skipped and counted
+                        if shift_iso(&from, 0).is_some() {
+                            out_of_range += 1;
+                        } else {
+                            unreadable += 1;
+                        }
+                        continue;
+                    };
                     out.push(json!(new));
                     if s.catalog.photo(*id).and_then(|p| p.captured.as_deref()) != Some(new.as_str()) {
                         ops.push(Op::SetCaptured { id: *id, captured: Some(new) });
                     }
                 }
+                if out_of_range > 0 {
+                    return Err(bad(c, format!("the shift would take {out_of_range} photo(s) outside the years 0000–9999; nothing was changed")));
+                }
                 let n = ops.len();
                 if n > 0 {
                     s.commit("Edit Capture Time", Op::Batch { ops })?;
                 }
-                Ok(json!({"changed": n, "captured": out}))
+                Ok(json!({"changed": n, "captured": out, "unreadable": unreadable}))
             }
         ),
         cmd!(

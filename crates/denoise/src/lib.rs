@@ -12,6 +12,7 @@
 //!   blend with the plain demosaic that the Amount slider controls.
 //! - [`cpu`] and [`runtime`]: a single-thread pure-Rust CPU runner and its installation self-test.
 //! - [`net`] and [`onnx`]: checked plain network data and bounded ONNX decoding, shared by CPU and GPU.
+//! - [`remote`]: running tiles on another computer's graphics card over TCP (a [`run::TileRunner`] and its server).
 //!
 //! Everything here treats model files, manifests and cache files as hostile input: sizes are capped, numbers must
 //! be finite, and a malformed file is an error, never a panic.
@@ -26,6 +27,7 @@ pub mod onnx;
 mod onnx_proto;
 
 pub mod reference;
+pub mod remote;
 
 #[cfg(feature = "runtime")]
 pub mod runtime;

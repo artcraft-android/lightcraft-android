@@ -75,6 +75,38 @@ fn directional_sliders() {
     assert!(at("effects.dehaze", -100.0) != base);
 }
 
+/// Dehaze crushed dark regions next to bright ones to black: the dark channel is a blur, not a
+/// patch minimum, so near the boundary it credited the dark pixels with the bright side's veil and
+/// the subtraction went past zero (#2504). The veil credited to a pixel is now bounded by its own
+/// minimum channel, so a uniform dark region renders uniformly under dehaze.
+#[test]
+fn dehaze_does_not_crush_dark_regions_next_to_bright_ones() {
+    // a dark field against a bright hazy sky; the blur bleeds the sky's dark channel ~10 px into
+    // the field, which is where the blotches formed
+    let src = Rgb32f::from_fn(240, 160, |x, _| if x < 120 { [0.02, 0.03, 0.012] } else { [0.45, 0.5, 0.55] });
+    let mut s = DevelopSettings::default();
+    s.effects.dehaze = 80.0;
+    let r = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(240, 160)).image;
+    for ch in 0..3 {
+        let mut v: Vec<u8> = Vec::with_capacity(160 * 100);
+        for y in 0..160 {
+            for x in 0..100 {
+                v.push(r.get(x, y)[ch]);
+            }
+        }
+        v.sort_unstable();
+        let mid = v[v.len() / 2] as i32;
+        // a field rendered all black would pass the comparison below vacuously
+        assert!(mid > 2, "the dark field itself is crushed in ch {ch}: level {mid}");
+        for y in 0..160 {
+            for x in 0..120 {
+                let p = r.get(x, y)[ch] as i32;
+                assert!(p >= mid - 2, "crushed at {x},{y} ch {ch}: {p} vs field level {mid}");
+            }
+        }
+    }
+}
+
 #[test]
 fn resolution_independence_of_local_contrast() {
     // Clarity at two preview sizes should give similar results after downscaling.
@@ -138,7 +170,8 @@ fn perf_report() {
 
 #[test]
 fn unedited_rendered_source_is_passthrough() {
-    // An sRGB ramp decoded to linear Rec.2020 must render back to (almost) the same 8-bit values.
+    // An sRGB ramp decoded to linear Rec.2020 must render back to the same 8-bit values, white
+    // included (issue #1945: neutral 255, 254 and 253 came back one level darker).
     let src8 = lightcraft_raster::Rgba8::from_fn(256, 4, |x, y| [x as u8, (x as u8).wrapping_add(y as u8 * 40), 255 - x as u8, 255]);
     let m = lightcraft_color::SRGB.to_space(&lightcraft_color::REC2020);
     let src = src8.to_linear().map(|c| m.apply_f32(c));
@@ -149,7 +182,24 @@ fn unedited_rendered_source_is_passthrough() {
             worst = worst.max((a[c] as i32 - b[c] as i32).abs());
         }
     }
-    assert!(worst <= 3, "max error {worst}");
+    assert_eq!(worst, 0, "max error {worst}");
+}
+
+#[test]
+fn unedited_neutral_near_whites_are_passthrough() {
+    // Issue #1945: neutral 255, 254 and 253 rendered one level darker (the display tone map's
+    // shoulder ran at neutral settings), so a white background never exported as 255.
+    let vals = [255u8, 254, 253, 252, 250, 240, 200, 128, 0];
+    let src8 = lightcraft_raster::Rgba8::from_fn(vals.len(), 1, |x, _| {
+        let v = vals[x];
+        [v, v, v, 255]
+    });
+    let m = lightcraft_color::SRGB.to_space(&lightcraft_color::REC2020);
+    let src = src8.to_linear().map(|c| m.apply_f32(c));
+    let r = render(&src, &SourceInfo::default(), &DevelopSettings::default(), &RenderRequest::fit(vals.len(), 1)).image;
+    let got: Vec<[u8; 3]> = r.data.iter().map(|p| [p[0], p[1], p[2]]).collect();
+    let want: Vec<[u8; 3]> = vals.iter().map(|&v| [v, v, v]).collect();
+    assert_eq!(got, want);
 }
 
 fn typical_edits() -> DevelopSettings {
@@ -207,7 +257,13 @@ fn stage_cache_matches_uncached_render_through_a_slider_session() {
         for req in [&full, &draft] {
             let a = render_cached(&src, &info, &s, req, &cache).image;
             let b = render(&src, &info, &s, req).image;
-            assert_eq!(a, b, "step {i} {:?}", req.quality);
+            if req.quality == Quality::Draft && i == 6 {
+                // a draft while noise reduction changes keeps the wide planes of the image before it
+                let d = max_diff(&a, &b);
+                assert!(d <= 3, "step {i} draft: {d}");
+            } else {
+                assert_eq!(a, b, "step {i} {:?}", req.quality);
+            }
         }
     }
     assert_eq!(cache.len(), 2);
@@ -219,6 +275,35 @@ fn stage_cache_matches_uncached_render_through_a_slider_session() {
     // a different source buffer never hits another source's entries
     let other = Arc::new(Rgb32f::filled(src.width, src.height, [0.3, 0.3, 0.3]));
     assert_eq!(render_cached(&other, &info, &s, &full, &cache).image, render(&other, &info, &s, &full).image);
+}
+
+#[test]
+fn drafts_keep_wide_planes_across_a_noise_reduction_change_and_full_renders_do_not() {
+    use crate::{Quality, StageCache, render_cached};
+    use std::sync::Arc;
+    let src = Arc::new(scene());
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let cache = StageCache::default();
+    let draft = RenderRequest { quality: Quality::Draft, ..RenderRequest::fit(160, 160) };
+    let full = RenderRequest { quality: Quality::Full, ..draft };
+    let mut s = typical_edits();
+    s.effects.clarity = 60.0;
+    render_cached(&src, &info, &s, &draft, &cache);
+    let clarity_plane = |c: &StageCache| c.entries.lock().unwrap().first().and_then(|e| e.planes.clarity.clone()).unwrap().1;
+    let first = clarity_plane(&cache);
+    s.detail.nr_luminance = 50.0;
+    render_cached(&src, &info, &s, &draft, &cache);
+    assert!(Arc::ptr_eq(&first, &clarity_plane(&cache)), "a draft redid the clarity plane for a noise-reduction change");
+    for v in [10.0, 45.0, 80.0] {
+        s.detail.nr_luminance = v;
+        s.detail.nr_color = v / 2.0;
+        let a = render_cached(&src, &info, &s, &draft, &cache).image;
+        let d = max_diff(&a, &render(&src, &info, &s, &draft).image);
+        // close to the exact draft (a few levels at edges, where clarity is strong)
+        assert!(d <= 8, "nr {v}: {d}");
+        // a full-quality render after the drafts is exact (it never takes the stand-in planes)
+        assert_eq!(render_cached(&src, &info, &s, &full, &cache).image, render(&src, &info, &s, &full).image, "nr {v}");
+    }
 }
 
 #[test]
@@ -236,6 +321,62 @@ fn exposure_after_spatial_filters_equals_exposing_the_source() {
     let b = render(&scaled, &info, &s, &RenderRequest::fit(200, 200)).image;
     let d = max_diff(&a, &b);
     assert!(d <= 2, "max difference {d}");
+}
+
+#[test]
+fn color_range_sampling_respects_disabled_sections() {
+    use crate::{MaskView, Overlay, color_range_sample};
+    let src = Rgb32f::from_fn(32, 24, |_, _| [0.15, 0.25, 0.08]);
+    let info = SourceInfo::default();
+    let req = RenderRequest::fit(32, 24);
+    let point = lightcraft_geom::Point::new(0.5, 0.5);
+    let plain = color_range_sample(&src, &info, &DevelopSettings::default(), &req, point, false).unwrap();
+    for section in ["light", "color"] {
+        let mut s = DevelopSettings::default();
+        if section == "light" {
+            s.light.exposure = 3.0;
+        } else {
+            s.wb.mode = lightcraft_develop::WbMode::Custom;
+            s.wb.temp = 12000.0;
+            s.wb.tint = 100.0;
+        }
+        assert_ne!(color_range_sample(&src, &info, &s, &req, point, false).unwrap(), plain, "enabled {section}");
+        s.set_section_enabled(section, false);
+        let sample = color_range_sample(&src, &info, &s, &req, point, false).unwrap();
+        assert_eq!(sample, plain, "disabled {section} must not change the picked colour");
+        s.masks.push(lightcraft_develop::Mask {
+            id: 1,
+            components: vec![lightcraft_develop::MaskComponent {
+                name: None,
+                op: lightcraft_develop::MaskOp::Add,
+                invert: false,
+                hidden: false,
+                shape: lightcraft_develop::MaskShape::ColorRange { samples: vec![sample], refine: 0.0, area: None, picked: Vec::new(), hue_first: false },
+            }],
+            ..Default::default()
+        });
+        let overlay = RenderRequest { overlay: Overlay::Mask { id: 1, view: MaskView::WhiteOnBlack, color: [255, 0, 0], opacity: 100 }, ..req };
+        let img = render(&src, &info, &s, &overlay).image;
+        assert_eq!(img.data[12 * 32 + 16], [255; 4], "the sampled colour is selected with {section} off");
+    }
+}
+
+#[test]
+fn color_range_sampling_uses_the_requested_hdr_rendition() {
+    use crate::{OutputDepth, color_range_sample};
+    let src = Rgb32f::from_fn(32, 24, |_, _| [0.15, 0.25, 0.08]);
+    let info = SourceInfo::default();
+    let point = lightcraft_geom::Point::new(0.5, 0.5);
+    let mut s = DevelopSettings::default();
+    s.hdr.enabled = true;
+    s.hdr.sdr_brightness = 100.0;
+    let req = RenderRequest::fit(32, 24);
+    let expected = color_range_sample(&src, &info, &s.sdr_rendition(), &req, point, false).unwrap();
+    assert_eq!(color_range_sample(&src, &info, &s, &req, point, false).unwrap(), expected, "SDR preview brightness affects the picked colour");
+    let hdr = RenderRequest { depth: OutputDepth::F32Hdr, ..req };
+    let plain = color_range_sample(&src, &info, &DevelopSettings::default(), &hdr, point, false).unwrap();
+    assert_eq!(color_range_sample(&src, &info, &s, &hdr, point, false).unwrap(), plain, "HDR does not use the SDR offset");
+    assert_ne!(plain, expected);
 }
 
 /// A section whose eye is off renders as if it were at its defaults (issue #316): Light, Color
@@ -335,8 +476,13 @@ fn soft_proof_maps_into_the_proof_gamut_and_flags_what_does_not_fit() {
     let plain = render(&src, &info, &s, &req(OutputSpace::Srgb, None)).image;
     let same = render(&src, &info, &s, &req(OutputSpace::Srgb, Some(Proof { space: OutputSpace::Srgb, ..Default::default() }))).image;
     assert_eq!(plain, same);
-    let warned =
-        render(&src, &info, &s, &req(OutputSpace::Srgb, Some(Proof { space: OutputSpace::Srgb, dest_warning: true, display_warning: false }))).image;
+    let warned = render(
+        &src,
+        &info,
+        &s,
+        &req(OutputSpace::Srgb, Some(Proof { space: OutputSpace::Srgb, dest_warning: true, display_warning: false, profile: 0 })),
+    )
+    .image;
     let n = red(&warned);
     assert!(n > 0 && n < warned.len(), "{n}");
     // …and nothing is flagged on an unsaturated edit of a neutral ramp
@@ -345,7 +491,10 @@ fn soft_proof_maps_into_the_proof_gamut_and_flags_what_does_not_fit() {
         &grey,
         &info,
         &DevelopSettings::default(),
-        &RenderRequest { proof: Some(Proof { space: OutputSpace::Srgb, dest_warning: true, display_warning: true }), ..RenderRequest::fit(64, 8) },
+        &RenderRequest {
+            proof: Some(Proof { space: OutputSpace::Srgb, dest_warning: true, display_warning: true, profile: 0 }),
+            ..RenderRequest::fit(64, 8)
+        },
     );
     assert_eq!(red(&g.image) + blue(&g.image), 0);
 
@@ -354,11 +503,90 @@ fn soft_proof_maps_into_the_proof_gamut_and_flags_what_does_not_fit() {
     let proofed = render(&src, &info, &s, &req(OutputSpace::DisplayP3, Some(Proof { space: OutputSpace::Srgb, ..Default::default() }))).image;
     assert_ne!(wide, proofed);
     // proofing a wider space than the display: what the display can't show is flagged blue
-    let pro =
-        render(&src, &info, &s, &req(OutputSpace::Srgb, Some(Proof { space: OutputSpace::ProPhoto, dest_warning: true, display_warning: true })))
-            .image;
+    let pro = render(
+        &src,
+        &info,
+        &s,
+        &req(OutputSpace::Srgb, Some(Proof { space: OutputSpace::ProPhoto, dest_warning: true, display_warning: true, profile: 0 })),
+    )
+    .image;
     assert!(blue(&pro) > 0);
     assert!(red(&pro) < n, "ProPhoto holds more than sRGB");
+}
+
+/// A preview for a monitor with a display profile renders into the display's primaries: for a
+/// display that *is* a standard space, exactly what an 8-bit render into that space gives.
+#[test]
+fn display_space_renders_like_the_matching_output_space() {
+    use crate::{DisplaySpace, OutputSpace, Proof};
+    let src = scene();
+    let mut s = DevelopSettings::default();
+    s.color.saturation = 100.0;
+    s.color.vibrance = 100.0;
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let req = |space, display, proof| RenderRequest { space, display, proof, ..RenderRequest::fit(120, 120) };
+    for space in [OutputSpace::Srgb, OutputSpace::DisplayP3] {
+        let d = DisplaySpace::of(space, 7).unwrap();
+        let want = render(&src, &info, &s, &req(space, None, None)).image;
+        let got = render(&src, &info, &s, &req(OutputSpace::Srgb, Some(d), None)).image;
+        assert!(max_diff(&got, &want) <= 1, "{space:?}: {}", max_diff(&got, &want));
+    }
+    // a wide display shows the saturated colours sRGB clips
+    let srgb = render(&src, &info, &s, &req(OutputSpace::Srgb, None, None)).image;
+    let p3 = render(&src, &info, &s, &req(OutputSpace::Srgb, Some(DisplaySpace::of(OutputSpace::DisplayP3, 1).unwrap()), None)).image;
+    assert!(max_diff(&srgb, &p3) > 4);
+
+    // soft proofing on a display: the display gamut warning is about *this* display
+    let blue = |img: &lightcraft_raster::Rgba8| img.data.iter().filter(|p| p[2] == 255 && p[0] == 0 && p[1] < 80).count();
+    let pro = Some(Proof { space: OutputSpace::ProPhoto, dest_warning: false, display_warning: true, profile: 0 });
+    let on_srgb = blue(&render(&src, &info, &s, &req(OutputSpace::Srgb, Some(DisplaySpace::of(OutputSpace::Srgb, 2).unwrap()), pro)).image);
+    let on_wide = blue(&render(&src, &info, &s, &req(OutputSpace::Srgb, Some(DisplaySpace::of(OutputSpace::Rec2020, 3).unwrap()), pro)).image);
+    assert!(on_srgb > 0 && on_wide < on_srgb, "{on_srgb} {on_wide}");
+    let plain = blue(&render(&src, &info, &s, &req(OutputSpace::Srgb, None, pro)).image);
+    assert_eq!(plain, on_srgb, "an sRGB display warns like no display profile");
+}
+
+/// Proofing against an output-device table: the table's colours are what the render shows, and its
+/// gamut distances drive the destination warning.
+#[test]
+fn soft_proof_through_a_device_table() {
+    use crate::{OutputSpace, Proof, ProofLut, register_proof_profile};
+    let n = 5;
+    // a "paper" that dims everything to 80 % and calls every non-grey colour out of gamut
+    let data: Vec<[f32; 4]> = (0..n * n * n)
+        .map(|i| {
+            let c = [i / (n * n), (i / n) % n, i % n].map(|k| lightcraft_color::transfer::srgb_to_linear(k as f32 / (n - 1) as f32));
+            let grey = c[0] == c[1] && c[1] == c[2];
+            [c[0] * 0.8, c[1] * 0.8, c[2] * 0.8, if grey { 0.0 } else { 1.0 }]
+        })
+        .collect();
+    assert!(ProofLut::new(n, data[1..].to_vec()).is_none());
+    assert!(ProofLut::new(n, vec![[f32::NAN; 4]; n * n * n]).is_none());
+    let id = register_proof_profile(0xfeed, ProofLut::new(n, data).unwrap());
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let white = Rgb32f::from_fn(16, 4, |_, _| [100.0; 3]);
+    let req = |proof| RenderRequest { space: OutputSpace::Srgb, proof, ..RenderRequest::fit(16, 4) };
+    let plain = render(&white, &info, &DevelopSettings::default(), &req(None)).image;
+    let pr = Proof { profile: id, dest_warning: true, ..Default::default() };
+    let paper = render(&white, &info, &DevelopSettings::default(), &req(Some(pr))).image;
+    assert!(plain.data[0][0] > 250 && paper.data[0][0] < 240 && paper.data[0][0] > 200, "{:?} {:?}", plain.data[0], paper.data[0]);
+    // an unknown id falls back to the space proof (sRGB on sRGB: no change)
+    let none = render(&white, &info, &DevelopSettings::default(), &req(Some(Proof { profile: 12345, ..Default::default() }))).image;
+    assert_eq!(none, plain);
+    // saturated colours are flagged
+    let src = scene();
+    let mut s = DevelopSettings::default();
+    s.color.saturation = 100.0;
+    let warned = render(&src, &info, &s, &req(Some(pr))).image;
+    assert!(warned.data.iter().any(|p| p[..3] == [255, 0, 0]));
+}
+
+#[test]
+fn display_space_rejects_degenerate_matrices() {
+    use crate::DisplaySpace;
+    assert!(DisplaySpace::new(lightcraft_color::Mat3([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]]), 1).is_none());
+    assert!(DisplaySpace::new(lightcraft_color::Mat3([[f64::NAN, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]), 1).is_none());
+    assert!(DisplaySpace::new(lightcraft_color::Mat3::IDENTITY, 1).is_some());
 }
 
 #[test]
@@ -385,6 +613,114 @@ fn tint_negative_is_green_and_positive_is_magenta() {
             let magenta = (p[0] as f64 + p[2] as f64) / 2.0 - p[1] as f64;
             assert!(magenta * delta > 100.0, "delta {delta} must follow the green/magenta track, got {p:?}");
         }
+    }
+}
+
+/// Settings written on the relative scale (6500 K / 0 = as shot, no `WbScale`) for a raw whose camera matrices now
+/// give it a Kelvin scale render exactly as they did: the same white-balance matrix, and the same pixels, as the
+/// relative render; the Kelvin / tint they convert to renders the same again (issue #730, the class of bug of #510).
+#[test]
+fn legacy_relative_white_balance_renders_as_before_on_a_kelvin_raw() {
+    use crate::local::{effective_wb, legacy_to_kelvin, wb_matrix_for};
+    use lightcraft_develop::{WbMode, WbScale};
+    let old_info = SourceInfo { raw: true, relative_wb: true, as_shot_temp: 6500.0, as_shot_tint: 0.0, ..Default::default() };
+    let src = Rgb32f::filled(16, 16, [0.3, 0.18, 0.09]);
+    // (as-shot whites the ILCE-7M3 table of issue #730 reads, and the relative slider's whole reach: −100..+100 is
+    // 2000..13550 K around 6500 K; a white bluer than 50000 K after the composition has no Kelvin and clamps, so
+    // the blue end is paired with as-shot whites up to 7000 K only)
+    for (as_t, as_tint) in [(4986.0, -2.4), (2707.0, -4.0), (9338.0, 8.9), (6500.0, 0.0), (3157.0, 40.0), (7000.0, -20.0)] {
+        let new_info =
+            SourceInfo { raw: true, relative_wb: false, legacy_relative_wb: true, as_shot_temp: as_t, as_shot_tint: as_tint, ..Default::default() };
+        let blue_end = as_t <= 7000.0;
+        for (temp, tint) in [(6500.0, 0.0), (5800.0, 3.0), (7682.0, 10.0), (4000.0, -30.0), (2000.0, 150.0), (12000.0, 55.0), (13550.0, -150.0)] {
+            if temp > 10000.0 && !blue_end {
+                continue;
+            }
+            let mut s = DevelopSettings::default();
+            (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, temp, tint);
+            assert_eq!(s.wb.scale, WbScale::Legacy);
+            let old = wb_matrix_for(&old_info, &s);
+            let new = wb_matrix_for(&new_info, &s);
+            let near = |a: Option<[[f32; 3]; 3]>, b: Option<[[f32; 3]; 3]>, tol: f32| match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| (x - y).abs() <= tol * (1.0 + x.abs())),
+                _ => false,
+            };
+            // the same matrix to f32 precision: the white is composed, not read back through Kelvin / tint
+            assert!(near(old, new, 2e-6), "as shot {as_t}/{as_tint}, {temp}/{tint}: {old:?} vs {new:?}");
+            // the converted Kelvin values, once written, render the same again to the precision of the Kelvin /
+            // tint parametrisation (whose seam at 4000 K costs up to 0.01 %)
+            let (kt, ktint) = legacy_to_kelvin(temp, tint, (as_t, as_tint));
+            assert_eq!(effective_wb(&new_info, &s), (kt, ktint));
+            let mut k = s.clone();
+            (k.wb.temp, k.wb.tint, k.wb.scale) = (kt, ktint, WbScale::Kelvin);
+            assert!(near(old, wb_matrix_for(&new_info, &k), 3e-4), "as shot {as_t}/{as_tint}, {temp}/{tint} → {kt}/{ktint}");
+            // and the rendered pixels agree
+            let a = render(&src, &old_info, &s, &RenderRequest::fit(16, 16)).image;
+            let b = render(&src, &new_info, &s, &RenderRequest::fit(16, 16)).image;
+            let c = render(&src, &new_info, &k, &RenderRequest::fit(16, 16)).image;
+            for (x, (y, z)) in a.data.iter().zip(b.data.iter().zip(&c.data)) {
+                assert_eq!(x, y, "as shot {as_t}/{as_tint}, {temp}/{tint}");
+                assert!(x.iter().zip(z).all(|(p, q)| p.abs_diff(*q) <= 1), "{x:?} {z:?}");
+            }
+        }
+        // as shot on the relative scale is as shot on the Kelvin scale, exactly
+        assert_eq!(legacy_to_kelvin(6500.0, 0.0, (as_t, as_tint)), (as_t, as_tint));
+    }
+    // a preset stored on the relative scale keeps its old look, not the preset's Kelvin value
+    let new_info = SourceInfo { raw: true, legacy_relative_wb: true, as_shot_temp: 4986.0, as_shot_tint: -2.4, ..Default::default() };
+    let mut s = DevelopSettings::default();
+    (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Cloudy, 6500.0 * 6500.0 / 5500.0, 10.0);
+    assert_eq!(effective_wb(&new_info, &s), legacy_to_kelvin(s.wb.temp, s.wb.tint, (4986.0, -2.4)));
+    s.wb.scale = WbScale::Kelvin;
+    assert_eq!(effective_wb(&new_info, &s), WbMode::Cloudy.preset().unwrap());
+    // a raw whose file carries the matrices (DNG) never had a relative scale: its old values are Kelvin
+    let dng = SourceInfo { raw: true, as_shot_temp: 5100.0, as_shot_tint: 4.0, ..Default::default() };
+    s.wb.scale = WbScale::Legacy;
+    (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 3200.0, 10.0);
+    assert_eq!(effective_wb(&dng, &s), (3200.0, 10.0));
+    // hostile numbers come back unchanged
+    assert!(legacy_to_kelvin(f64::NAN, 0.0, (5000.0, 0.0)).0.is_nan());
+    assert_eq!(legacy_to_kelvin(5000.0, f64::INFINITY, (5000.0, 0.0)).1, f64::INFINITY);
+    assert_eq!(legacy_to_kelvin(5000.0, 0.0, (f64::NAN, 0.0)), (5000.0, 0.0));
+    assert_eq!(legacy_to_kelvin(6500.0, 0.0, (f64::NAN, 0.0)), (6500.0, 0.0));
+    assert_eq!(crate::local::legacy_white(f64::NAN, 0.0, (5000.0, 0.0)), None);
+    let hostile = SourceInfo { raw: true, legacy_relative_wb: true, as_shot_temp: f64::NAN, as_shot_tint: 0.0, ..Default::default() };
+    let _ = render(&Rgb32f::filled(4, 4, [0.2; 3]), &hostile, &s, &RenderRequest::fit(4, 4));
+}
+
+/// Before an edit, the settings' white balance is brought onto the source's scale: Kelvin raws mark it (converting
+/// relative values once, into a Custom value with the same look), everything else clears it.
+#[test]
+fn normalize_wb_marks_kelvin_raws_and_converts_relative_values_once() {
+    use crate::local::{legacy_to_kelvin, normalize_wb};
+    use lightcraft_develop::{WbMode, WbScale};
+    let kelvin = SourceInfo { raw: true, legacy_relative_wb: true, as_shot_temp: 4986.0, as_shot_tint: -2.4, ..Default::default() };
+    // as shot: marked, values untouched
+    let mut s = DevelopSettings::default();
+    normalize_wb(&mut s, &kelvin);
+    assert_eq!((s.wb.mode, s.wb.temp, s.wb.tint, s.wb.scale), (WbMode::AsShot, 6500.0, 0.0, WbScale::Kelvin));
+    // a relative custom value: converted, Custom, marked; a second pass changes nothing
+    let mut s = DevelopSettings::default();
+    (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Cloudy, 7682.0, 10.0);
+    normalize_wb(&mut s, &kelvin);
+    let (t, tint) = legacy_to_kelvin(7682.0, 10.0, (4986.0, -2.4));
+    assert_eq!((s.wb.mode, s.wb.temp, s.wb.tint, s.wb.scale), (WbMode::Custom, t, tint, WbScale::Kelvin));
+    let again = s.clone();
+    normalize_wb(&mut s, &kelvin);
+    assert_eq!(s, again);
+    // a DNG's old values are Kelvin already: marked, untouched
+    let dng = SourceInfo { raw: true, as_shot_temp: 5100.0, as_shot_tint: 4.0, ..Default::default() };
+    let mut s = DevelopSettings::default();
+    (s.wb.mode, s.wb.temp, s.wb.tint) = (WbMode::Custom, 3200.0, 10.0);
+    normalize_wb(&mut s, &dng);
+    assert_eq!((s.wb.mode, s.wb.temp, s.wb.tint, s.wb.scale), (WbMode::Custom, 3200.0, 10.0, WbScale::Kelvin));
+    // a rendered photo and a raw without matrices: the scale is cleared
+    for info in [SourceInfo::default(), SourceInfo { raw: true, relative_wb: true, ..Default::default() }] {
+        let mut s = DevelopSettings::default();
+        (s.wb.mode, s.wb.temp, s.wb.scale) = (WbMode::Custom, 5800.0, WbScale::Kelvin);
+        normalize_wb(&mut s, &info);
+        assert_eq!((s.wb.mode, s.wb.temp, s.wb.scale), (WbMode::Custom, 5800.0, WbScale::Legacy));
     }
 }
 
@@ -435,4 +771,74 @@ fn custom_white_balance_redevelops_in_camera_space() {
     // the as-shot white needs nothing
     s.wb.mode = WbMode::AsShot;
     assert!(wb_matrix_for(&info, &s).is_none());
+}
+
+/// Every stored process number renders with a process this build knows: settings saved before
+/// process versions existed exactly as V1, and a number from a newer LightCraft exactly as the
+/// latest process here (`docs/process-versions.md`). Raw (base tone curve), camera-tone and
+/// rendered sources, plain and edited, 8-bit and 16-bit.
+#[test]
+fn stored_process_numbers_render_with_a_known_process() {
+    use lightcraft_develop::{Process, ProcessVersion};
+    let src = scene();
+    let curve = crate::tone::CameraTone::new(std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    }))
+    .unwrap();
+    let infos = [
+        SourceInfo::default(),
+        SourceInfo { raw: true, as_shot_temp: 5200.0, as_shot_tint: 4.0, ..Default::default() },
+        SourceInfo { raw: true, relative_wb: true, camera_tone: Some(curve), ..Default::default() },
+    ];
+    let mut edited = DevelopSettings::for_raw(5200.0, 4.0);
+    for (id, v) in [("light.exposure", 0.4), ("light.contrast", 30.0), ("light.highlights", -60.0), ("light.whites", 15.0), ("light.blacks", -20.0)] {
+        controls::set(&mut edited, id, v);
+    }
+    let legacy = |s: &DevelopSettings| {
+        let mut v = s.to_json();
+        v.as_object_mut().unwrap().remove("process");
+        DevelopSettings::from_json(&v).unwrap()
+    };
+    let with = |s: &DevelopSettings, p: ProcessVersion| DevelopSettings { process: p, ..s.clone() };
+    let deep = RenderRequest { depth: crate::OutputDepth::U16, ..RenderRequest::fit(96, 96) };
+    for info in &infos {
+        for s in [DevelopSettings::default(), edited.clone()] {
+            for req in [RenderRequest::fit(96, 96), deep] {
+                let out = |s: &DevelopSettings| {
+                    let r = render(&src, info, s, &req);
+                    (r.image.data, r.deep)
+                };
+                let v1 = out(&with(&s, ProcessVersion::V1));
+                assert_eq!(legacy(&s).process, ProcessVersion::V1);
+                assert!(out(&legacy(&s)) == v1, "saved before process versions: rendered as V1");
+                let latest = out(&with(&s, Process::LATEST.version()));
+                assert!(out(&with(&s, ProcessVersion(Process::LATEST.version().0 + 7))) == latest, "newer than this build: as the latest");
+            }
+        }
+    }
+}
+
+/// A crop a hair wide (or of no size, as a command or a sidecar can set) shown to fit made the
+/// tone, clarity and dehaze stages blur with sigmas of millions of pixels (infinite for no size):
+/// the box width's square overflowed (a panic in debug builds, a radius of billions of pixels and
+/// a hung render in release ones). The blur is held to twice the picture's size: the render is
+/// quick and its pixels are numbers.
+#[test]
+fn sliver_crops_render_quickly_with_wide_stages_on() {
+    let src = scene();
+    for (rect, angle) in [([0.0, 0.0, 1e-9, 1.0], 45.0), ([0.5, 0.5, 0.5, 0.5], 0.0), ([0.0, 0.0, 1e-5, 1.0], -30.0)] {
+        let mut s = DevelopSettings::default();
+        s.crop.geometry.rect = lightcraft_geom::Rect::new(rect[0], rect[1], rect[2], rect[3]);
+        s.crop.geometry.angle = angle;
+        s.effects.clarity = 80.0;
+        s.effects.dehaze = 50.0;
+        s.effects.texture = 40.0;
+        s.light.highlights = -60.0;
+        s.light.shadows = 60.0;
+        let t = std::time::Instant::now();
+        let r = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(280, 180));
+        assert!(t.elapsed().as_secs_f64() < 20.0, "{rect:?}: {:?}", t.elapsed());
+        assert!(r.image.width >= 1 && r.image.height >= 1, "{rect:?}");
+    }
 }

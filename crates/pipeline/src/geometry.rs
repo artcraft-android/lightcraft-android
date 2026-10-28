@@ -16,7 +16,7 @@ use crate::optics::{Warp, reorient_lens};
 pub const BLANK: [f32; 3] = [0.55, 0.55, 0.55];
 
 /// The geometric frame of a render.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     /// Source (EXIF-oriented) dimensions in pixels.
     pub src_w: usize,
@@ -71,8 +71,9 @@ impl Frame {
             ow,
             oh,
             crop,
-            flip_h: apply_crop && s.crop.flip_h,
-            flip_v: apply_crop && s.crop.flip_v,
+            // a flip is not part of the crop: the crop tool's uncropped view shows it too
+            flip_h: s.crop.flip_h,
+            flip_v: s.crop.flip_v,
             warp: (!warp.is_identity()).then_some(warp),
             view: None,
         };
@@ -166,10 +167,12 @@ impl Frame {
         }
     }
 
-    /// Aspect ratio (w/h) of the output.
+    /// Aspect ratio (w/h) of the output. A crop narrower than a source pixel (or of no size, from
+    /// an agent or a sidecar) counts each side as one pixel, so the aspect stays finite: 0/0 made
+    /// it NaN, and the loupe laid the photo out at a NaN size.
     pub fn aspect(&self) -> f64 {
         let r = self.crop.rect_px(self.ow, self.oh);
-        r.width() / r.height()
+        r.width().max(1.0) / r.height().max(1.0)
     }
 
     /// Size of the (cropped) output at the source's own resolution, in pixels.
@@ -181,6 +184,11 @@ impl Frame {
     pub fn fit(&self, max_w: usize, max_h: usize) -> (usize, usize) {
         let a = self.aspect();
         let (mw, mh) = (max_w.max(1) as f64, max_h.max(1) as f64);
+        // a box that is already this aspect up to rounding (an export size) is the size: fitting
+        // into it again rounds twice and can lose a pixel of the edge that was asked for
+        if (mw - 0.5) / a <= mh + 0.5 && (mw + 0.5) / a >= mh - 0.5 {
+            return (max_w.max(1), max_h.max(1));
+        }
         let (w, h) = if mw / mh > a { (mh * a, mh) } else { (mw, mw / a) };
         ((w.round() as usize).max(1), (h.round() as usize).max(1))
     }
@@ -377,6 +385,25 @@ mod tests {
         assert!((back.x - 50.0).abs() < 1e-6 && (back.y - 50.0).abs() < 1e-6);
     }
 
+    /// A crop of no size (or under a pixel wide) gave a NaN or infinite aspect; each side now
+    /// counts as at least one source pixel.
+    #[test]
+    fn degenerate_crops_have_a_finite_aspect() {
+        let mut s = DevelopSettings::default();
+        for (rect, want) in [
+            (Rect::new(0.5, 0.5, 0.5, 0.5), 1.0),
+            (Rect::new(0.0, 0.0, 1e-9, 1.0), 1.0 / 200.0),
+            (Rect::new(0.0, 0.5, 1.0, 0.5), 400.0),
+            (Rect::new(0.25, 0.0, 0.75, 1.0), 1.0),
+        ] {
+            s.crop.geometry.rect = rect;
+            let f = Frame::new(400, 200, &s, true);
+            assert!((f.aspect() - want).abs() < 1e-9, "{rect:?}: {}", f.aspect());
+            let (w, h) = f.fit(1000, 1000);
+            assert!((1..=1000).contains(&w) && (1..=1000).contains(&h), "{rect:?}: {w}×{h}");
+        }
+    }
+
     #[test]
     fn flip_mirrors() {
         let mut s = DevelopSettings::default();
@@ -386,5 +413,23 @@ mod tests {
         let out = f.sample(&src, 4, 1);
         assert!((out.get(0, 0)[0] - 3.0).abs() < 1e-5);
         assert!((out.get(3, 0)[0] - 0.0).abs() < 1e-5);
+    }
+
+    /// The crop tool's uncropped frame keeps the flips: Flip H / Flip V show while cropping, and
+    /// screen points map back through the mirror (the crop box is drawn and dragged right).
+    #[test]
+    fn uncropped_frame_keeps_the_flips() {
+        let mut s = DevelopSettings::default();
+        s.crop.flip_h = true;
+        s.crop.flip_v = true;
+        s.crop.geometry.rect = Rect::new(0.1, 0.2, 0.6, 0.9);
+        let src = Rgb32f::from_fn(4, 2, |x, y| [x as f32, y as f32, 0.0]);
+        let f = Frame::new(4, 2, &s, false);
+        let out = f.sample(&src, 4, 2);
+        assert!((out.get(0, 0)[0] - 3.0).abs() < 1e-5 && (out.get(0, 0)[1] - 1.0).abs() < 1e-5, "{:?}", out.get(0, 0));
+        assert!((out.get(3, 1)[0] - 0.0).abs() < 1e-5 && (out.get(3, 1)[1] - 0.0).abs() < 1e-5, "{:?}", out.get(3, 1));
+        // the whole image, mirrored: output top-left is the image's bottom-right
+        let p = f.out_to_norm(400, 200).apply(Point::new(0.0, 0.0));
+        assert!((p.x - 1.0).abs() < 1e-9 && (p.y - 1.0).abs() < 1e-9, "{p:?}");
     }
 }

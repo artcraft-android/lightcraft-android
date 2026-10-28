@@ -303,9 +303,20 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
     if !src.extension().is_some_and(|e| e.eq_ignore_ascii_case("onnx")) {
         return Err(bad(C, "choose an .onnx file with denoise-model.json beside it"));
     }
-    let bytes = read_capped(&src.with_file_name("denoise-model.json"), MAX_MANIFEST_BYTES)
-        .ok_or_else(|| bad(C, "denoise-model.json is missing or too large"))?;
-    let m = manifest::parse(&bytes).map_err(|e| bad(C, e.to_string()))?;
+    let sibling = src.with_file_name("denoise-model.json");
+    let Some(bytes) = read_capped(&sibling, MAX_MANIFEST_BYTES) else {
+        let why = if sibling.is_file() {
+            "denoise-model.json could not be read or is too large"
+        } else if src.with_file_name("model.json").is_file() {
+            // other apps ship their models with a model.json of their own (#1381)
+            "No denoise-model.json beside this .onnx file. The model.json there is another app's description, which LightCraft \
+             does not read: it needs its own denoise-model.json (see docs/denoise.md)"
+        } else {
+            "No denoise-model.json beside this .onnx file: LightCraft needs one that says how to use the model (see docs/denoise.md)"
+        };
+        return Err(bad(C, why));
+    };
+    let m = manifest::parse(&bytes).map_err(|e| bad(C, format!("denoise-model.json: {e} (see docs/denoise.md)")))?;
     let dir = models_dir(s, C)?;
     Ok(json!({"kind": "model", "domain": "denoise", "path": path, "fileName": src.file_name().map(|n| n.to_string_lossy()), "model": m,
         "sizeBytes": std::fs::metadata(src).ok().map(|m| m.len()), "alreadyInstalled": dir.join(&m.id).join("model.onnx").is_file()}))
@@ -368,7 +379,7 @@ fn download(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "that model is already installed"));
     }
     let host = lightcraft_denoise::known::host(&spec.url).to_string();
-    s.denoise.downloads.start(spec, &dir).map_err(|e| bad(C, e))?;
+    s.denoise.downloads.start(spec, &dir, &s.activity, &k.manifest.name).map_err(|e| bad(C, e))?;
     Ok(json!({"started": id, "from": host}))
 }
 
@@ -502,10 +513,6 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"auto": st.auto(), "cacheGb": st.cache_bytes() >> 30, "threads": st.threads, "runOn": st.run_on().name()}))
 }
 
-fn ids_param(p: &Value) -> Option<Vec<PhotoId>> {
-    p.get("ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(PhotoId).collect())
-}
-
 fn status_json(s: &Session, photo: Option<PhotoId>) -> Value {
     let (files, bytes) = s.denoise_cache_usage();
     let st = &s.denoise.settings;
@@ -583,7 +590,7 @@ fn queue(s: &mut Session, p: &Value) -> Result<Value> {
     if s.denoise_products_dir().is_none() {
         return Err(bad(C, "denoise keeps its pictures in the library's folder: open a library on disk first"));
     }
-    let ids = match ids_param(p) {
+    let ids = match super::photo_ids(p, C)? {
         Some(ids) => ids,
         None => match str_param(p, "scope").unwrap_or("selected") {
             "selected" => s.selection.active.iter().chain(s.selection.ids.iter()).copied().collect(),
@@ -601,19 +608,20 @@ fn queue(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn cancel(s: &mut Session, p: &Value) -> Result<Value> {
-    let photo = p.get("id").and_then(Value::as_u64).map(PhotoId);
+    let photo = super::photo_id(p, "denoise.cancel")?;
     let n = s.denoise_cancel(photo, bool_or(p, "all", photo.is_none()));
     Ok(json!({"cancelled": n}))
 }
 
 fn status(s: &mut Session, p: &Value) -> Result<Value> {
     s.denoise_refresh_active(false);
-    Ok(status_json(s, p.get("id").and_then(Value::as_u64).map(PhotoId)))
+    Ok(status_json(s, super::photo_id(p, "denoise.status")?))
 }
 
 /// `denoise.pump {pace?}`: cheap to call every frame. Takes in what the background job has finished and keeps one going.
 fn pump(s: &mut Session, p: &Value) -> Result<Value> {
     s.denoise_pump(Pace::parse(p.get("pace").and_then(Value::as_str)));
+    s.denoise_track();
     Ok(json!({
         "active": s.denoise.active.is_some(),
         "running": s.denoise_running_json(),
@@ -652,7 +660,7 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(query "denoise.queue", "Denoise Photos", [], None, "{ids?: [photoId], scope?: selected | visible | withAmount, retry?: false} → {added, …status} — make the denoised pictures of raw photos that have none, in the background. `retry` tries photos that failed before", always, queue),
         cmd!(query "denoise.cancel", "Cancel Denoise", [], None, "{id?, all?} → {cancelled} — stop the photo being made and/or forget the ones waiting (all of them when `id` is omitted)", always, cancel),
-        cmd!(query "denoise.status", "Denoise Status", [], None, "{id?} → {enabled, model, runtime, productsDir, queued, running: {photo, done, total, seconds} | null, ready, made, auto, runOn, device: {kind: gpu | cpu | pending | none, adapter?, reason?, cardMs?, cpuMs?, fellBack?}, cache: {files, bytes, limitBytes}, generation, photo?: {state: notApplicable | noModel | ready | queued | running | failed | idle, …}}", always, status),
+        cmd!(query "denoise.status", "Denoise Status", [], None, "{id?} → {enabled, model, runtime, productsDir, queued, running: {photo, done, total, seconds} | null, ready, made, auto, runOn, device: {kind: gpu | cpu | pending | none, adapter?, reason?, cardMs?, cpuMs?, fellBack?, remote?: {address, state: pending | unavailable | used | idle | slower | given up, device?, remoteMs?, localMs?, reason?, failures?, lastError?}}, cache: {files, bytes, limitBytes}, generation, photo?: {state: notApplicable | noModel | ready | queued | running | failed | idle, …}}", always, status),
         cmd!(query "denoise.pump", "Denoise Pump", [], None, "{pace?: pause | light | normal | full} → {active, running, queued, ready, generation, downloading} — called every frame by the app: takes in finished work and keeps one photo going", always, pump),
         cmd!(query "denoise.clear", "Clear Denoise Cache", [], None, "{} → {deleted, bytes} — delete every cached denoised picture of this library (they are made again when wanted)", always, clear),
     ]
