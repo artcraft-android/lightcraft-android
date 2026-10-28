@@ -537,8 +537,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
                 (d, o)
             };
+            // (a rendered photo's channels were each rolled off already; the output clips the rest)
             let mx = d[0].max(d[1]).max(d[2]);
-            if mx > 1.0 {
+            if mx > 1.0 && !fp.per_channel {
                 let t = ((mx - 1.0) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
                 d = d.map(|v| v + (o - v) * t);
             }
