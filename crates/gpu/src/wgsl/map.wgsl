@@ -115,10 +115,14 @@ fn xguided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     dst[i] = max(c[i], clamp(b[2u * i] * a[i] + b[2u * i + 1u], 0.0, 1.0));
 }
 
-// One display-linear channel onto the scene scale (`JpegTone::to_scene`; P[12..15] = p, k, q, white).
+// One display-linear channel onto the scene scale (`JpegTone::to_scene`; P[12..19] = p, k, q, scale,
+// and the top's level, scene value and slope).
 fn jpeg_scene(y: f32) -> f32 {
     if (y <= 0.0) {
         return 0.0;
+    }
+    if (y > pf(16u)) {
+        return pf(17u) * pow(min(y, 1.0) / pf(16u), pf(18u));
     }
     let r = pow(min(y, 1.0), 1.0 / pf(14u));
     let u = pf(13u) * r / max(1.0 + pf(13u) - r, 1e-6);
@@ -136,7 +140,7 @@ fn p_mat(o: u32, c: vec3<f32>) -> vec3<f32> {
 
 // White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0. A rendered photo
 // (P[11] set) first goes onto the scene scale, as `JpegTone::expand`: each channel in the wide space
-// (P[16..25] Rec.2020 → wide, P[25..34] back) through the curve's inverse.
+// (P[19..28] Rec.2020 → wide, P[28..37] back) through the curve's inverse.
 @compute @workgroup_size(256)
 fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -145,8 +149,8 @@ fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
     }
     var c = rgb_a(i);
     if (pu(11u) != 0u) {
-        let w = p_mat(16u, c);
-        c = p_mat(25u, vec3<f32>(jpeg_scene(w.x), jpeg_scene(w.y), jpeg_scene(w.z)));
+        let w = p_mat(19u, c);
+        c = p_mat(28u, vec3<f32>(jpeg_scene(w.x), jpeg_scene(w.y), jpeg_scene(w.z)));
     }
     if (pu(1u) != 0u) {
         c = vec3<f32>(

@@ -447,10 +447,10 @@ mod tests {
         use crate::tone::{GREY, JpegTone, ToneMap};
         let s = DevelopSettings::default();
         let info = SourceInfo::default();
-        // display grey stays at scene grey; display white lands about 4.1 EV above it
+        // display grey stays at scene grey; display white lands about 3.5 EV above it
         assert!((JpegTone::to_scene(GREY) - GREY).abs() < 1e-5);
-        let white_ev = (JpegTone::scale() / GREY).log2();
-        assert!((3.9..4.4).contains(&white_ev), "{white_ev}");
+        let white_ev = (JpegTone::white() / GREY).log2();
+        assert!((3.3..3.8).contains(&white_ev), "{white_ev}");
         // expanded, then toned channel by channel in the wide space with neutral sliders: unchanged
         let tone = ToneMap::jpeg(0.0, 0.0);
         let w = crate::tone::wide();

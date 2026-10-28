@@ -91,28 +91,43 @@ impl CameraTone {
 
 /// The scene scale rendered (non-raw) photos are developed on, as a raw is. A decoded JPEG's
 /// display-linear luminance is expanded onto it ([`JpegTone::to_scene`]: display grey stays at
-/// [`GREY`], display white lands about 4.1 EV above), the develop works there (white balance,
+/// [`GREY`], display white lands about 3.5 EV above), the develop works there (white balance,
 /// exposure, the local tools), and [`ToneMap::jpeg`] brings the result back with the forward curve,
 /// so a photo with no edits comes out unchanged. The curve is a smooth shoulder,
 /// `y = ((1 + k)·u / (u + k))^q` with `u = (S / scale)^p`: exposure then rolls highlights off into
 /// white instead of clipping them, and white balance moves tones as far as the rendered photo's
 /// own curve allows. Its three numbers were fitted (issue 7) to how far edits move tones in
-/// Lightroom's output, measured on our own test chart; no curve or table is taken from it.
+/// Lightroom's output, measured on our own test chart; no curve or table is taken from it. Above
+/// [`JpegTone::TOP_Y`] the inverse goes on as a gentler power law: the shoulder's own inverse
+/// climbs so steeply into white that Exposure −2 left white at 225 where Lightroom shows 198.
 pub struct JpegTone;
 
 impl JpegTone {
     const P: f32 = 2.1634;
     const K: f32 = 0.0322;
     const Q: f32 = 0.6142;
+    /// Display-linear level (8-bit 243) above which the inverse is `S = S(TOP_Y)·(y / TOP_Y)^TOP_SLOPE`.
+    const TOP_Y: f32 = 0.8963;
+    const TOP_SLOPE: f32 = 4.49;
 
-    /// The shape's three numbers (`p`, `k`, `q`) and the scene value of display white, for the GPU.
-    pub fn params() -> [f32; 4] {
-        [Self::P, Self::K, Self::Q, Self::scale()]
+    /// The shape's three numbers (`p`, `k`, `q`), its scale, and the top's level, scene value and
+    /// slope, for the GPU.
+    pub fn params() -> [f32; 7] {
+        [Self::P, Self::K, Self::Q, Self::scale(), Self::TOP_Y, Self::top_scene(), Self::TOP_SLOPE]
+    }
+
+    /// The shoulder's scene unit (`u = 1`).
+    pub fn scale() -> f32 {
+        GREY / Self::unit_scene(GREY)
     }
 
     /// The scene value of display white.
-    pub fn scale() -> f32 {
-        GREY / Self::unit_scene(GREY)
+    pub fn white() -> f32 {
+        Self::to_scene(1.0)
+    }
+
+    fn top_scene() -> f32 {
+        Self::unit_scene(Self::TOP_Y) * Self::scale()
     }
 
     /// The inverse on a white = 1 scale.
@@ -124,13 +139,23 @@ impl JpegTone {
 
     /// Display-linear luminance (0..=1) → scene luminance.
     pub fn to_scene(y: f32) -> f32 {
-        if y > 0.0 { Self::unit_scene(y) * Self::scale() } else { 0.0 }
+        if y.is_nan() || y <= 0.0 {
+            0.0
+        } else if y <= Self::TOP_Y {
+            Self::unit_scene(y) * Self::scale()
+        } else {
+            Self::top_scene() * (y.min(1.0) / Self::TOP_Y).powf(Self::TOP_SLOPE)
+        }
     }
 
     /// Scene luminance → display-linear luminance (white and beyond: 1).
     pub fn to_display(s: f32) -> f32 {
         if s.is_nan() || s <= 0.0 {
             return 0.0;
+        }
+        let top = Self::top_scene();
+        if s > top {
+            return (Self::TOP_Y * (s / top).powf(1.0 / Self::TOP_SLOPE)).min(1.0);
         }
         let u = (s / Self::scale()).min(1.0).powf(Self::P);
         ((1.0 + Self::K) * u / (u + Self::K)).powf(Self::Q)
