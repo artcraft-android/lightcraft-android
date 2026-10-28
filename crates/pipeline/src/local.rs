@@ -450,18 +450,21 @@ mod tests {
         assert!((JpegTone::to_scene(GREY) - GREY).abs() < 1e-5);
         let white_ev = (JpegTone::scale() / GREY).log2();
         assert!((3.9..4.4).contains(&white_ev), "{white_ev}");
-        // expanded then toned with neutral sliders: unchanged, colour kept
+        // expanded, then toned channel by channel in the wide space with neutral sliders: unchanged
         let tone = ToneMap::jpeg(0.0, 0.0);
-        for c in [[0.02f32, 0.05, 0.01], [0.3, 0.2, 0.1], [0.18, 0.18, 0.18], [0.9, 0.95, 0.85], [1.0, 1.0, 1.0]] {
+        let w = crate::tone::wide();
+        for c in [[0.02f32, 0.05, 0.01], [0.3, 0.2, 0.1], [0.18, 0.18, 0.18], [0.9, 0.95, 0.85], [1.0, 1.0, 1.0], [0.6, 0.02, 0.03]] {
             let mut img = Rgb32f::filled(1, 1, c);
             scene_linear_pre(&mut img, &info, &s);
             let e = img.get(0, 0);
-            let (ye, yc) = (luminance_2020(e), luminance_2020(c));
-            let back = tone.apply(ye);
-            assert!((back - yc).abs() < 2e-4 * yc.max(0.05), "{c:?}: {back} vs {yc}");
-            // the same colour: all channels scaled alike
-            assert!((e[0] / e[1] - c[0] / c[1]).abs() < 1e-4, "{c:?}");
+            let back = w.from_wide(w.to_wide(e).map(|v| tone.apply(v)));
+            for k in 0..3 {
+                assert!((back[k] - c[k]).abs() < 5e-4 * c[k].max(0.05), "{c:?}: {back:?}");
+            }
         }
+        // a grey stays grey on the scene scale
+        let g = JpegTone::expand([0.3; 3]);
+        assert!((g[0] - g[1]).abs() < 1e-5 && (g[1] - g[2]).abs() < 1e-5, "{g:?}");
     }
 
     // Issue 7: exposure on a rendered photo rolls its highlights off into white instead of clipping

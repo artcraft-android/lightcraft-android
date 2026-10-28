@@ -136,17 +136,58 @@ impl JpegTone {
         ((1.0 + Self::K) * u / (u + Self::K)).powf(Self::Q)
     }
 
-    /// A display-linear Rec.2020 pixel on the scene scale: its luminance expanded, its colour kept
-    /// (all three channels scaled alike, as the tone map scales them back).
+    /// A display-linear Rec.2020 pixel on the scene scale: each of its channels in the [`wide`] space
+    /// through the curve's inverse (the finish tones them back the same way), so a grey stays grey.
     pub fn expand(c: [f32; 3]) -> [f32; 3] {
-        let y = c[0] * 0.2627 + c[1] * 0.6780 + c[2] * 0.0593;
-        if y.is_nan() || y <= 0.0 {
-            return c;
-        }
-        let yc = y.min(1.0);
-        let k = Self::to_scene(yc) / yc;
-        c.map(|v| v * k)
+        let w = wide();
+        w.from_wide(w.to_wide(c).map(Self::to_scene))
     }
+}
+
+/// Linear Rec.2020 ↔ the wide RGB space a rendered photo is toned in channel by channel: ProPhoto's
+/// primaries with Rec.2020's white (Bradford). A tone curve on each of these channels, as raw
+/// developers apply theirs, fades bright colours towards white yet keeps a saturated colour
+/// saturated, where a luminance curve can do only one of the two; on a grey it is the luminance
+/// curve. Chosen (issue 7) because it halves the colour error of Temp, Exposure and Contrast against
+/// Lightroom's output on our test chart (Rec.2020 or sRGB primaries do worse).
+pub struct Wide {
+    to: [[f32; 3]; 3],
+    from: [[f32; 3]; 3],
+}
+
+impl Wide {
+    pub fn to_wide(&self, c: [f32; 3]) -> [f32; 3] {
+        mul3(&self.to, c)
+    }
+
+    pub fn from_wide(&self, c: [f32; 3]) -> [f32; 3] {
+        mul3(&self.from, c)
+    }
+
+    /// Both matrices (Rec.2020 → wide, wide → Rec.2020), row-major, for the GPU.
+    pub fn words(&self) -> [f32; 18] {
+        let mut out = [0.0; 18];
+        for (o, v) in out.iter_mut().zip(self.to.iter().chain(&self.from).flatten()) {
+            *o = *v;
+        }
+        out
+    }
+}
+
+pub fn wide() -> &'static Wide {
+    static WIDE: std::sync::OnceLock<Wide> = std::sync::OnceLock::new();
+    WIDE.get_or_init(|| {
+        use lightcraft_color::{PROPHOTO, REC2020};
+        Wide { to: REC2020.to_space(&PROPHOTO).to_f32(), from: PROPHOTO.to_space(&REC2020).to_f32() }
+    })
+}
+
+fn mul3(m: &[[f32; 3]; 3], c: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * c[0] + m[0][1] * c[1] + m[0][2] * c[2],
+        m[1][0] * c[0] + m[1][1] * c[1] + m[1][2] * c[2],
+        m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2],
+    ]
 }
 
 #[derive(Clone, Debug)]

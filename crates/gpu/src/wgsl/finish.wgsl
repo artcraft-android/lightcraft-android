@@ -18,6 +18,17 @@ fn tone_apply(y: f32) -> f32 {
     return v;
 }
 
+// `lightcraft_pipeline::tone::wide`: linear Rec.2020 → the wide space (`off` 0) or back (`off` 9).
+fn wide_m(off: u32, c: vec3<f32>) -> vec3<f32> {
+    let o = F_WIDE + off;
+    let m = array<vec3<f32>, 3>(
+        vec3<f32>(pf(o), pf(o + 1u), pf(o + 2u)),
+        vec3<f32>(pf(o + 3u), pf(o + 4u), pf(o + 5u)),
+        vec3<f32>(pf(o + 6u), pf(o + 7u), pf(o + 8u)),
+    );
+    return mul3(m, c);
+}
+
 // `lightcraft_pipeline::tone::contrast_ev` on one scene-linear channel.
 fn contrast_px(c: f32, v: f32) -> f32 {
     if (v <= 0.0) {
@@ -425,22 +436,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         c = calibrate(c);
     }
 
-    // --- contrast, per channel in scene EV
+    // --- contrast, per channel of the wide space in scene EV
     let con = pf(F_CON);
     if (con != 0.0) {
-        c = vec3<f32>(contrast_px(con, c.x), contrast_px(con, c.y), contrast_px(con, c.z));
+        let w = wide_m(0u, c);
+        c = wide_m(9u, vec3<f32>(contrast_px(con, w.x), contrast_px(con, w.y), contrast_px(con, w.z)));
     }
 
-    // --- tone map on luminance, highlight desaturation
-    let yl = lum2020(c);
-    let o = tone_apply(yl);
+    // --- tone map: on each channel of the wide space for a rendered photo, on luminance with the
+    // camera's chroma curve otherwise; highlight desaturation
     var d = vec3<f32>(0.0);
-    if (yl > 1e-9) {
-        d = c * o / yl;
-    }
-    let k = chroma_scale(o);
-    if (k != 1.0) {
-        d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
+    var o = 0.0;
+    if (pu(F_PER_CHANNEL) != 0u) {
+        let w = wide_m(0u, c);
+        d = wide_m(9u, vec3<f32>(tone_apply(w.x), tone_apply(w.y), tone_apply(w.z)));
+        o = lum2020(d);
+    } else {
+        let yl = lum2020(c);
+        o = tone_apply(yl);
+        if (yl > 1e-9) {
+            d = c * o / yl;
+        }
+        let k = chroma_scale(o);
+        if (k != 1.0) {
+            d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
+        }
     }
     let mx = max(d.x, max(d.y, d.z));
     if (mx > 1.0) {

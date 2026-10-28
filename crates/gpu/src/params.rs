@@ -22,6 +22,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("AIR", 1),
     ("AIR_PRE", 1),
     ("CON", 1),
+    ("PER_CHANNEL", 1),
+    ("WIDE", 18),
     ("HL", 1),
     ("SH", 1),
     ("CLAR", 1),
@@ -173,6 +175,8 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.f("AIR", fp.air);
     p.f("AIR_PRE", fp.air_pre);
     p.f("CON", fp.con);
+    p.b("PER_CHANNEL", fp.per_channel);
+    p.fs("WIDE", &lightcraft_pipeline::tone::wide().words());
     p.f("HL", fp.hl);
     p.f("SH", fp.sh);
     p.f("CLAR", fp.clar);

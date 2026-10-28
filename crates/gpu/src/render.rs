@@ -761,6 +761,7 @@ fn linear(cx: &mut Cx<'_>, sampled: &Buf, info: &SourceInfo, plan: &Plan<'_>, ho
         // a rendered photo goes onto the scene scale first (`local::wb_gain`, `JpegTone::expand`)
         p.push(u32::from(!info.raw));
         p.extend(lightcraft_pipeline::tone::JpegTone::params().iter().map(|v| v.to_bits()));
+        p.extend(lightcraft_pipeline::tone::wide().words().iter().map(|v| v.to_bits()));
         let out = cx.gpu.buffer(n * 3);
         map(cx, "wb_k", n, &p, [Some(sampled), None, None], &out);
         if plan.eyes.is_empty() {

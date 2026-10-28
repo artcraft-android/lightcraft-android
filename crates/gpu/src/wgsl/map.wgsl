@@ -115,9 +115,28 @@ fn xguided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     dst[i] = max(c[i], clamp(b[2u * i] * a[i] + b[2u * i + 1u], 0.0, 1.0));
 }
 
+// One display-linear channel onto the scene scale (`JpegTone::to_scene`; P[12..15] = p, k, q, white).
+fn jpeg_scene(y: f32) -> f32 {
+    if (y <= 0.0) {
+        return 0.0;
+    }
+    let r = pow(min(y, 1.0), 1.0 / pf(14u));
+    let u = pf(13u) * r / max(1.0 + pf(13u) - r, 1e-6);
+    return pow(u, 1.0 / pf(12u)) * pf(15u);
+}
+
+// `P[o..o + 9]` (row-major) times `c`.
+fn p_mat(o: u32, c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        pf(o) * c.x + pf(o + 1u) * c.y + pf(o + 2u) * c.z,
+        pf(o + 3u) * c.x + pf(o + 4u) * c.y + pf(o + 5u) * c.z,
+        pf(o + 6u) * c.x + pf(o + 7u) * c.y + pf(o + 8u) * c.z,
+    );
+}
+
 // White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0. A rendered photo
-// (P[11] set) first goes onto the scene scale, as `JpegTone::expand`: its luminance through the
-// curve's inverse (P[12..15] = p, k, q, scene white), its colour kept.
+// (P[11] set) first goes onto the scene scale, as `JpegTone::expand`: each channel in the wide space
+// (P[16..25] Rec.2020 → wide, P[25..34] back) through the curve's inverse.
 @compute @workgroup_size(256)
 fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let i = lin_index(g, nw);
@@ -126,13 +145,8 @@ fn wb_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
     }
     var c = rgb_a(i);
     if (pu(11u) != 0u) {
-        let y = dot(c, vec3<f32>(0.2627, 0.6780, 0.0593));
-        if (y > 0.0) {
-            let yc = min(y, 1.0);
-            let r = pow(yc, 1.0 / pf(14u));
-            let u = pf(13u) * r / max(1.0 + pf(13u) - r, 1e-6);
-            c = c * (pow(u, 1.0 / pf(12u)) * pf(15u) / yc);
-        }
+        let w = p_mat(16u, c);
+        c = p_mat(25u, vec3<f32>(jpeg_scene(w.x), jpeg_scene(w.y), jpeg_scene(w.z)));
     }
     if (pu(1u) != 0u) {
         c = vec3<f32>(

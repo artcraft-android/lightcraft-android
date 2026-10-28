@@ -11,7 +11,7 @@ use crate::colorops::ColorOps;
 use crate::geometry::Frame;
 use crate::local::log_lum;
 use crate::output::{DeepImage, DeepSamples, OutputDepth, OutputSpace, OutputTrc};
-use crate::tone::{GREY, ToneMap, contrast_ev};
+use crate::tone::{GREY, ToneMap, contrast_ev, wide};
 use crate::{Prepared, SourceInfo, for_rows};
 
 #[inline]
@@ -184,6 +184,8 @@ pub struct FinishParams {
     pub proof: Option<crate::output::ProofParams>,
     /// Contrast (−1..=1), per channel before the tone map ([`crate::tone::contrast_ev`]).
     pub con: f32,
+    /// Tone each channel in [`crate::tone::wide`] (a rendered photo) rather than luminance.
+    pub per_channel: bool,
     pub hl: f32,
     pub sh: f32,
     pub clar: f32,
@@ -257,6 +259,7 @@ impl FinishParams {
             proof: None,
             // `ToneMap::new` (a raw without a camera curve) carries its own contrast
             con: if info.raw && info.camera_tone.is_none() { 0.0 } else { (s.light.contrast / 100.0) as f32 },
+            per_channel: !info.raw,
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
             clar,
@@ -511,19 +514,29 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 c = crate::colorops::calibrate(c, fp.calib.as_ref(), fp.shadow_tint);
             }
 
-            // --- contrast, per channel in scene EV (issue 7: Lightroom's spreads a colour's channels too)
+            // --- contrast, per channel of the wide space in scene EV (issue 7: Lightroom's spreads a
+            // colour's channels too)
             if con != 0.0 {
-                c = c.map(|v| if v > 0.0 { v * contrast_ev(con, (v / GREY).log2()).exp2() } else { v });
+                let w = wide();
+                c = w.from_wide(w.to_wide(c).map(|v| if v > 0.0 { v * contrast_ev(con, (v / GREY).log2()).exp2() } else { v }));
             }
 
-            // --- tone map on luminance, highlight desaturation
-            let yl = luminance_2020(c);
-            let o = tone.apply(yl);
-            let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
-            let k = tone.chroma_scale(o);
-            if k != 1.0 {
-                d = d.map(|v| o + (v - o) * k);
-            }
+            // --- tone map: on each channel of the wide space for a rendered photo (its expansion's
+            // inverse), on luminance with the camera's chroma curve otherwise; highlight desaturation
+            let (mut d, o) = if fp.per_channel {
+                let w = wide();
+                let d = w.from_wide(w.to_wide(c).map(|v| tone.apply(v)));
+                (d, luminance_2020(d))
+            } else {
+                let yl = luminance_2020(c);
+                let o = tone.apply(yl);
+                let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
+                let k = tone.chroma_scale(o);
+                if k != 1.0 {
+                    d = d.map(|v| o + (v - o) * k);
+                }
+                (d, o)
+            };
             let mx = d[0].max(d[1]).max(d[2]);
             if mx > 1.0 {
                 let t = ((mx - 1.0) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
