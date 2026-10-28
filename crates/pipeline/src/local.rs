@@ -37,12 +37,15 @@ pub fn wb_matrix_for(info: &SourceInfo, s: &DevelopSettings) -> Option<[[f32; 3]
     {
         return Some(m.to_f32());
     }
-    // A rendered photo's Temp: channel gains on its scene scale (`rendered_temp_gains`); its tint as before
+    // A rendered photo's Temp and Tint: channel gains on its scene scale (`rendered_temp_gains`,
+    // `rendered_tint_gains`), its white left as shot
     let (white, temp_gains) = if info.raw {
         (effective_white(info, s), [1.0; 3])
     } else {
         let relative = ((1e6 / info.as_shot_temp - 1e6 / t.max(1.0)) / 0.8).clamp(-100.0, 100.0);
-        (temp_tint_to_xy(info.as_shot_temp, tint), rendered_temp_gains(relative))
+        let [tr, tg, tb] = rendered_temp_gains(relative);
+        let [ir, ig, ib] = rendered_tint_gains((tint - info.as_shot_tint).clamp(-150.0, 150.0));
+        (temp_tint_to_xy(info.as_shot_temp, info.as_shot_tint), [tr * ir, tg * ig, tb * ib])
     };
     let set = wb_matrix(&REC2020, white);
     let shot = wb_matrix(&REC2020, temp_tint_to_xy(info.as_shot_temp, info.as_shot_tint));
@@ -66,6 +69,19 @@ pub(crate) fn rendered_temp_gains(relative: f64) -> [f64; 3] {
     const COOL: [[f64; 2]; 3] = [[-0.005, -0.21], [-0.3396, 0.528], [-2.0261, 1.5524]];
     let x = relative / 100.0;
     let ab = if x >= 0.0 { WARM } else { COOL };
+    ab.map(|[a, b]| (a * x + b * x * x).exp2())
+}
+
+/// A rendered photo's Tint (relative, −100…100: green … magenta) as linear Rec.2020 channel gains
+/// on its scene scale, as [`rendered_temp_gains`] does Temp: magenta lifts blue and red, green lifts
+/// green, and both brighten a little. Each channel's log₂ gain is `a·x + b·x²` (`x` = Tint / 100),
+/// fitted (issue 7) to how far Tint moves the greys and colour patches of our test chart in
+/// Lightroom's output (measured at −100, +34 and +100; the green side, measured once, is linear).
+pub(crate) fn rendered_tint_gains(relative: f64) -> [f64; 3] {
+    const MAGENTA: [[f64; 2]; 3] = [[0.3743, -0.0023], [-0.1025, 0.1285], [0.5285, 0.9365]];
+    const GREEN: [[f64; 2]; 3] = [[-0.347, 0.0], [-1.136, 0.0], [-0.069, 0.0]];
+    let x = relative / 100.0;
+    let ab = if x >= 0.0 { MAGENTA } else { GREEN };
     ab.map(|[a, b]| (a * x + b * x * x).exp2())
 }
 
