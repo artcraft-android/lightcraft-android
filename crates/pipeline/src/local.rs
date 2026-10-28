@@ -58,11 +58,12 @@ pub fn wb_matrix_for(info: &SourceInfo, s: &DevelopSettings) -> Option<[[f32; 3]
 /// A rendered photo's Temp (relative, −100…100) as linear Rec.2020 channel gains on its scene scale
 /// ([`crate::tone::JpegTone`]): warming lifts red and green, cooling lifts blue, both brighten a
 /// little, as the rendered photo's own curve then shows them. Each channel's log₂ gain is
-/// `a·x + b·x²` (`x` = Temp / 100) per side, fitted (issue 7) to how far Temp moves the greys of our
-/// test chart in Lightroom's output (measured at −66 … +100; no table is taken from it).
+/// `a·x + b·x²` (`x` = Temp / 100) per side, fitted (issue 7) to how far Temp moves the greys and
+/// colour patches of our test chart in Lightroom's output (measured at −100 … +100; no table is
+/// taken from it), with the rendered photo toned per channel ([`crate::tone::wide`]).
 pub(crate) fn rendered_temp_gains(relative: f64) -> [f64; 3] {
-    const WARM: [[f64; 2]; 3] = [[2.7018, -0.9033], [1.8949, -0.6041], [0.2741, -0.4116]];
-    const COOL: [[f64; 2]; 3] = [[0.38, 0.0], [-0.5238, 0.107], [-3.0805, 0.5513]];
+    const WARM: [[f64; 2]; 3] = [[2.6788, -1.0185], [1.9508, -0.7088], [0.1006, 0.0184]];
+    const COOL: [[f64; 2]; 3] = [[-0.005, -0.21], [-0.3396, 0.528], [-2.0261, 1.5524]];
     let x = relative / 100.0;
     let ab = if x >= 0.0 { WARM } else { COOL };
     ab.map(|[a, b]| (a * x + b * x * x).exp2())
