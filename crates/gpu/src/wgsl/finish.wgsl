@@ -512,26 +512,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // --- gamut map to the output space (desaturate towards luminance until in range)
+    // --- gamut map to the output space (clip each channel)
     let om = array<vec3<f32>, 3>(
         vec3<f32>(pf(F_OUT_M), pf(F_OUT_M + 1u), pf(F_OUT_M + 2u)),
         vec3<f32>(pf(F_OUT_M + 3u), pf(F_OUT_M + 4u), pf(F_OUT_M + 5u)),
         vec3<f32>(pf(F_OUT_M + 6u), pf(F_OUT_M + 7u), pf(F_OUT_M + 8u)),
     );
-    var r = mul3(om, d);
-    let yy = clamp(pf(F_OUT_Y) * r.x + pf(F_OUT_Y + 1u) * r.y + pf(F_OUT_Y + 2u) * r.z, 0.0, 1.0);
-    var tg = 1.0;
-    for (var k = 0u; k < 3u; k++) {
-        let cc = r[k];
-        if (cc < 0.0) {
-            tg = min(tg, yy / max(yy - cc, 1e-9));
-        } else if (cc > 1.0) {
-            tg = min(tg, (1.0 - yy) / max(cc - yy, 1e-9));
-        }
-    }
-    if (tg < 1.0) {
-        r = yy + (r - yy) * tg;
-    }
+    let r = clamp(mul3(om, d), vec3<f32>(0.0), vec3<f32>(1.0));
 
     // --- encode, curves, grain
     var e = vec3<f32>(encode_srgb(r.x), encode_srgb(r.y), encode_srgb(r.z));

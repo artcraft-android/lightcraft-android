@@ -577,8 +577,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
             }
 
-            // --- gamut map to the output space (desaturate towards luminance until in range);
-            // soft proofing maps into the proof space first and shows that in the output space
+            // --- gamut map to the output space (clip each channel); soft proofing maps into the
+            // proof space first and shows that in the output space
             let mut warn = None;
             let mut r = match &fp.proof {
                 Some(pp) => {
@@ -650,8 +650,11 @@ fn mul3(m: &[[f32; 3]; 3], d: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// Desaturate linear `r` towards its luminance (weights `luma`) until every channel is in 0..1;
-/// returns the mapped colour and the chroma scale used (1 = already in gamut).
+/// Bring linear `r` into 0..1 by clipping each channel, as Lightroom's output does (issue 7: on our
+/// test chart, Contrast +100 and warm Temps keep a saturated colour saturated where desaturating
+/// towards luminance turned it pale); returns the clipped colour and the chroma scale a
+/// desaturation towards its luminance (weights `luma`) would have needed (1 = already in gamut),
+/// which the gamut warnings use.
 #[inline]
 pub fn gamut_map(r: [f32; 3], luma: [f32; 3]) -> ([f32; 3], f32) {
     let yy = (luma[0] * r[0] + luma[1] * r[1] + luma[2] * r[2]).clamp(0.0, 1.0);
@@ -663,7 +666,7 @@ pub fn gamut_map(r: [f32; 3], luma: [f32; 3]) -> ([f32; 3], f32) {
             t = t.min((1.0 - yy) / (c - yy).max(1e-9));
         }
     }
-    if t < 1.0 { (r.map(|c| yy + (c - yy) * t), t) } else { (r, 1.0) }
+    (r.map(|c| c.clamp(0.0, 1.0)), t)
 }
 
 /// Local Defringe weight of a scene-linear colour `c` whose log luminance differs by `det` from
