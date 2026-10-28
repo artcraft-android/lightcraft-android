@@ -11,7 +11,7 @@ use crate::colorops::ColorOps;
 use crate::geometry::Frame;
 use crate::local::log_lum;
 use crate::output::{DeepImage, DeepSamples, OutputDepth, OutputSpace, OutputTrc};
-use crate::tone::ToneMap;
+use crate::tone::{GREY, ToneMap, contrast_ev};
 use crate::{Prepared, SourceInfo, for_rows};
 
 #[inline]
@@ -182,6 +182,8 @@ pub struct FinishParams {
     pub out_trc: OutputTrc,
     /// Soft proofing (CPU only; the GPU path declines proof renders).
     pub proof: Option<crate::output::ProofParams>,
+    /// Contrast (−1..=1), per channel before the tone map ([`crate::tone::contrast_ev`]).
+    pub con: f32,
     pub hl: f32,
     pub sh: f32,
     pub clar: f32,
@@ -237,12 +239,12 @@ impl FinishParams {
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
             tone: if let Some(curve) = info.camera_tone.as_ref().filter(|_| info.raw) {
-                ToneMap::camera(curve, s.light.contrast, s.light.whites, s.light.blacks)
+                ToneMap::camera(curve, s.light.whites, s.light.blacks)
             } else if info.raw {
                 ToneMap::new(s.light.contrast, s.light.whites, s.light.blacks)
             } else {
                 // a rendered photo was expanded onto the scene scale (`local::wb_gain`): back with its curve
-                ToneMap::jpeg(s.light.contrast, s.light.whites, s.light.blacks)
+                ToneMap::jpeg(s.light.whites, s.light.blacks)
             },
             lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
@@ -253,6 +255,8 @@ impl FinishParams {
             out_luma: space.luma(),
             out_trc: space.trc(),
             proof: None,
+            // `ToneMap::new` (a raw without a camera curve) carries its own contrast
+            con: if info.raw && info.camera_tone.is_none() { 0.0 } else { (s.light.contrast / 100.0) as f32 },
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
             clar,
@@ -342,6 +346,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         vig,
         to_out,
         out_luma,
+        con,
         hl,
         sh,
         clar,
@@ -356,8 +361,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         grain,
         ..
     } = fp;
-    let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
-        (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
+    let (con, hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
+        (*con, *hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
     let terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
     let out_to_norm = fp.out_to_norm;
     let long = fp.ow.max(fp.oh);
@@ -504,6 +509,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             // --- calibration (scene linear, before the tone map)
             if fp.calib.is_some() || fp.shadow_tint != 0.0 {
                 c = crate::colorops::calibrate(c, fp.calib.as_ref(), fp.shadow_tint);
+            }
+
+            // --- contrast, per channel in scene EV (issue 7: Lightroom's spreads a colour's channels too)
+            if con != 0.0 {
+                c = c.map(|v| if v > 0.0 { v * contrast_ev(con, (v / GREY).log2()).exp2() } else { v });
             }
 
             // --- tone map on luminance, highlight desaturation

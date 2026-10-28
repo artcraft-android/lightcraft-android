@@ -21,6 +21,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("EV", 1),
     ("AIR", 1),
     ("AIR_PRE", 1),
+    ("CON", 1),
     ("HL", 1),
     ("SH", 1),
     ("CLAR", 1),
@@ -171,6 +172,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.f("EV", fp.ev);
     p.f("AIR", fp.air);
     p.f("AIR_PRE", fp.air_pre);
+    p.f("CON", fp.con);
     p.f("HL", fp.hl);
     p.f("SH", fp.sh);
     p.f("CLAR", fp.clar);

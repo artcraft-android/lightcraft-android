@@ -18,6 +18,23 @@ fn tone_apply(y: f32) -> f32 {
     return v;
 }
 
+// `lightcraft_pipeline::tone::contrast_ev` on one scene-linear channel.
+fn contrast_px(c: f32, v: f32) -> f32 {
+    if (v <= 0.0) {
+        return v;
+    }
+    var p = vec4<f32>(0.615, 0.439, 1.167, 0.399);
+    if (c > 0.0) {
+        p = vec4<f32>(0.654, 0.658, 3.137, 0.664);
+    }
+    let x = log2(v / GREY) - p.x;
+    var reach = p.w;
+    if (x < 0.0) {
+        reach = p.z;
+    }
+    return v * exp2(c * reach * tanh(p.y * x / reach));
+}
+
 // The camera chroma curve follows the tone LUT in `aux` (`ToneMap::chroma_scale`).
 fn chroma_scale(o: f32) -> f32 {
     let f = clamp(o, 0.0, 1.0) * f32(CHROMA_N - 1u);
@@ -406,6 +423,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- calibration (scene linear, before the tone map)
     if (pu(F_CALIB) != 0u || pf(F_SHADOW_TINT) != 0.0) {
         c = calibrate(c);
+    }
+
+    // --- contrast, per channel in scene EV
+    let con = pf(F_CON);
+    if (con != 0.0) {
+        c = vec3<f32>(contrast_px(con, c.x), contrast_px(con, c.y), contrast_px(con, c.z));
     }
 
     // --- tone map on luminance, highlight desaturation

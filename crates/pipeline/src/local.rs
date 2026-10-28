@@ -451,7 +451,7 @@ mod tests {
         let white_ev = (JpegTone::scale() / GREY).log2();
         assert!((3.9..4.4).contains(&white_ev), "{white_ev}");
         // expanded then toned with neutral sliders: unchanged, colour kept
-        let tone = ToneMap::jpeg(0.0, 0.0, 0.0);
+        let tone = ToneMap::jpeg(0.0, 0.0);
         for c in [[0.02f32, 0.05, 0.01], [0.3, 0.2, 0.1], [0.18, 0.18, 0.18], [0.9, 0.95, 0.85], [1.0, 1.0, 1.0]] {
             let mut img = Rgb32f::filled(1, 1, c);
             scene_linear_pre(&mut img, &info, &s);
@@ -470,7 +470,7 @@ mod tests {
         use crate::tone::ToneMap;
         let mut s = DevelopSettings::default();
         s.light.exposure = 2.7;
-        let tone = ToneMap::jpeg(0.0, 0.0, 0.0);
+        let tone = ToneMap::jpeg(0.0, 0.0);
         let mut out = Vec::new();
         // display-linear 0.1, 0.2, 0.3 (8-bit 89, 124, 149): ×6.5 put all three past white before
         for v in [0.1f32, 0.2, 0.3] {

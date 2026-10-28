@@ -4,9 +4,11 @@
 //! whites move the shoulder (white point), blacks move the toe. The shoulder is an extended
 //! Reinhard curve so highlights roll off smoothly instead of clipping.
 //!
-//! Rendered (display-referred) sources such as JPEGs use [`ToneMap::display`] instead: identity at
-//! neutral settings (an unedited JPEG renders exactly as the file), with contrast/whites/blacks as
-//! S-curve adjustments in a gamma-2.2 perceptual domain and a short shoulder above 0.95.
+//! Rendered (display-referred) sources such as JPEGs use [`ToneMap::jpeg`] instead: [`JpegTone`]'s
+//! curve, identity at neutral settings (an unedited JPEG renders exactly as the file). With a camera
+//! curve or [`JpegTone`], Contrast is a per-channel shift in scene EV before the tone map
+//! ([`contrast_ev`], applied in `finish`) and Whites/Blacks are adjustments in a gamma-2.2 perceptual
+//! domain with a short shoulder above 0.95.
 
 pub const GREY: f32 = 0.18;
 /// The tone LUT spans `LUT_MIN_EV..LUT_MAX_EV` around grey in `LUT_N` steps.
@@ -154,9 +156,10 @@ pub struct ToneMap {
 }
 
 impl ToneMap {
-    pub fn camera(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64) -> ToneMap {
-        let adjustment = Self::display(contrast, whites, blacks);
-        let neutral = contrast == 0.0 && whites == 0.0 && blacks == 0.0;
+    /// A camera curve with Whites and Blacks on top (Contrast is per channel: [`contrast_ev`]).
+    pub fn camera(curve: &CameraTone, whites: f64, blacks: f64) -> ToneMap {
+        let adjustment = Self::display(whites, blacks);
+        let neutral = whites == 0.0 && blacks == 0.0;
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
@@ -200,10 +203,10 @@ impl ToneMap {
     }
 
     /// Tone map for rendered (non-raw) sources developed on [`JpegTone`]'s scene scale: its curve,
-    /// with Contrast, Whites and Blacks on top (identity with neutral sliders).
-    pub fn jpeg(contrast: f64, whites: f64, blacks: f64) -> ToneMap {
-        let adjustment = Self::display(contrast, whites, blacks);
-        let neutral = contrast == 0.0 && whites == 0.0 && blacks == 0.0;
+    /// with Whites and Blacks on top (identity with neutral sliders; Contrast: [`contrast_ev`]).
+    pub fn jpeg(whites: f64, blacks: f64) -> ToneMap {
+        let adjustment = Self::display(whites, blacks);
+        let neutral = whites == 0.0 && blacks == 0.0;
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
@@ -214,21 +217,15 @@ impl ToneMap {
         ToneMap { lut, chroma: NO_CHROMA }
     }
 
-    /// Tone map for display-referred sources: identity at neutral settings.
-    pub fn display(contrast: f64, whites: f64, blacks: f64) -> ToneMap {
-        let c = (contrast / 100.0) as f32;
+    /// Whites and Blacks on a display-linear value: identity at neutral settings.
+    pub fn display(whites: f64, blacks: f64) -> ToneMap {
         let w = (whites / 100.0) as f32;
         let b = (blacks / 100.0) as f32;
-        let m = GREY.powf(1.0 / 2.2);
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
                 let y = GREY * 2f32.powf(ev);
                 let mut p = y.powf(1.0 / 2.2);
-                if p <= 1.0 {
-                    // S-curve anchored at 0, grey and 1
-                    p += c * 0.35 * (p - m) * (1.0 - (2.0 * p - 1.0).powi(2));
-                }
                 // Blacks and Whites (issue 7), shapes of our own whose few numbers were fitted to how far
                 // Lightroom's sliders move the greys of our test chart. Blacks −: the black point moves up
                 // (a soft toe) and the rest stretches back to white; +: the shadows lift, black stays black.
@@ -301,6 +298,24 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Contrast (`c` in −1..=1) as a shift in scene EV, applied to each channel before the tone map, so
+/// that raising it also spreads a colour's channels apart and lowering it draws them together, as
+/// Lightroom's does. A soft S around a pivot ~0.6 EV above grey that reaches further into the shadows
+/// than into the highlights: a shape of our own whose numbers were fitted (issue 7) to how far
+/// Lightroom's Contrast moves the greys of our test chart. Raised, it crushes the shadows much harder
+/// than it lifts the highlights; lowered, it flattens both ends. Its slope stays above −1, so the
+/// curve never folds back.
+pub fn contrast_ev(c: f32, ev: f32) -> f32 {
+    if c == 0.0 {
+        return 0.0;
+    }
+    // pivot, slope at the pivot, the furthest shift below and above it
+    let (pivot, k, below, above) = if c > 0.0 { (0.654, 0.658, 3.137, 0.664) } else { (0.615, 0.439, 1.167, 0.399) };
+    let x = ev - pivot;
+    let reach = if x < 0.0 { below } else { above };
+    c * reach * (k * x / reach).tanh()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,7 +330,7 @@ mod tests {
     #[test]
     fn chroma_curve_is_identity_unless_set_and_survives_serde() {
         let plain = CameraTone::new(knots()).unwrap();
-        let map = ToneMap::camera(&plain, 0.0, 0.0, 0.0);
+        let map = ToneMap::camera(&plain, 0.0, 0.0);
         assert!([0.0, 0.3, 0.77, 1.0, 2.0].iter().all(|o| map.chroma_scale(*o) == 1.0));
         assert!([0.0, 0.5, 1.0].iter().all(|o| ToneMap::new(0.0, 0.0, 0.0).chroma_scale(*o) == 1.0));
         // smart previews written before the chroma curve existed still load (identity)
@@ -324,7 +339,7 @@ mod tests {
         let tone = plain.with_chroma([1.4, 1.3, 1.1, 1.0, 0.7, 0.4, 0.25, 0.2]).unwrap();
         let back: CameraTone = serde_json::from_value(serde_json::to_value(tone).unwrap()).unwrap();
         assert_eq!(back, tone);
-        let map = ToneMap::camera(&tone, 0.0, 0.0, 0.0);
+        let map = ToneMap::camera(&tone, 0.0, 0.0);
         assert!((map.chroma_scale(0.0) - 1.4).abs() < 1e-6 && (map.chroma_scale(1.0) - 0.2).abs() < 1e-6);
         assert!((map.chroma_scale(0.5 / 7.0) - 1.35).abs() < 1e-5, "interpolates between nodes");
         assert_eq!(map.chroma_scale(f32::NAN), 1.0);
@@ -342,7 +357,7 @@ mod tests {
             [x, 1.0 - (-3.0 * x).exp()]
         });
         let curve = CameraTone::new(knots).unwrap();
-        let base = ToneMap::camera(&curve, 0.0, 0.0, 0.0);
+        let base = ToneMap::camera(&curve, 0.0, 0.0);
         assert_eq!(base.apply(0.0), 0.0);
         assert!(base.apply(0.1) < base.apply(0.2));
         let mut previous = 0.0;
@@ -354,7 +369,7 @@ mod tests {
             previous = v;
         }
         assert!((base.apply(0.1) - curve.apply(0.1)).abs() < 0.001);
-        assert!(ToneMap::camera(&curve, 50.0, 0.0, 0.0).apply(0.3) > base.apply(0.3));
+        assert!(ToneMap::camera(&curve, 50.0, 0.0).apply(0.3) > base.apply(0.3));
         let mut invalid = knots;
         invalid[1][0] = invalid[0][0];
         assert!(CameraTone::new(invalid).is_none());
@@ -378,22 +393,34 @@ mod tests {
 
     #[test]
     fn display_identity_and_monotone() {
-        let t = ToneMap::display(0.0, 0.0, 0.0);
+        let t = ToneMap::display(0.0, 0.0);
         for i in 1..=95 {
             let y = i as f32 / 100.0;
             assert!((t.apply(y) - y).abs() < 2e-3, "{y} -> {}", t.apply(y));
         }
-        for (c, w, b) in [(100.0, 100.0, -100.0), (-100.0, -100.0, 100.0), (60.0, -40.0, 30.0)] {
-            let t = ToneMap::display(c, w, b);
+        for (w, b) in [(100.0, -100.0), (-100.0, 100.0), (-40.0, 30.0)] {
+            let t = ToneMap::jpeg(w, b);
             let mut prev = -1.0;
             for i in 0..1000 {
                 let o = t.apply(i as f32 / 500.0);
-                assert!(o >= prev - 1e-5, "{c} {w} {b}");
+                assert!(o >= prev - 1e-5, "{w} {b}");
                 prev = o;
             }
         }
-        let c = ToneMap::display(60.0, 0.0, 0.0);
-        assert!(c.apply(0.05) < 0.05 && c.apply(0.7) > 0.7);
+        // Contrast pivots a little above grey: + darkens grey and brightens what's above the pivot,
+        // − the reverse, and neither folds the curve back
+        let white = (1.0 / GREY).log2();
+        assert!(contrast_ev(0.6, 0.0) < 0.0 && contrast_ev(0.6, white) > 0.0);
+        assert!(contrast_ev(-0.6, 0.0) > 0.0 && contrast_ev(-0.6, white) < 0.0);
+        for c in [-1.0, 1.0] {
+            let mut prev = f32::MIN;
+            for i in 0..2000 {
+                let ev = -14.0 + i as f32 * 0.012;
+                let out = ev + contrast_ev(c, ev);
+                assert!(out > prev, "{c} at {ev}");
+                prev = out;
+            }
+        }
     }
 
     #[test]
