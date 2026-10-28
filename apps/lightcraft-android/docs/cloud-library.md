@@ -57,6 +57,11 @@ afterwards if you like; the app keeps its own.
 Do not use `~/.config/rclone/rclone.conf` itself: it holds every remote you have, including the
 PC's.
 
+**Encrypted library (rclone `crypt`):** the phone needs the crypt section as well as `phone`, and
+`rclone config show` prints its passwords as `*** ENCRYPTED ***`, which the app can't decrypt with.
+Copy that section from the config file instead, and pick the crypt remote in the app; see
+[Encrypting the remote](https://github.com/tinytom21/lightcraft-cloud#encrypting-the-remote).
+
 ## What the file lets the phone do
 
 The phone writes only to `inbox/<its name>/`, as new files that are never overwritten; the PC
