@@ -126,10 +126,37 @@ fn point_color(k: u32, lch: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(l, c, h);
 }
 
+// `colorops::vibrance`.
+fn vibrance_wide(rgb: vec3<f32>, v: f32) -> vec3<f32> {
+    let lab = oklab(rgb);
+    let c = sqrt(lab.y * lab.y + lab.z * lab.z);
+    var k = 0.8;
+    var cmax = 1.0;
+    var p = 1.0;
+    var skin = 1.0;
+    if (v > 0.0) {
+        k = 1.0;
+        cmax = 0.4;
+        p = 2.0;
+        let q = wrap_angle(atan2(lab.z, lab.y) - pf(F_SKIN)) / 0.35;
+        skin = 1.0 - 0.6 * exp(-(q * q));
+    }
+    let w = pow(1.0 - clamp(c / cmax, 0.0, 1.0), p);
+    let f = max(1.0 + v * k * w * skin, 0.0);
+    let x = wide_m(0u, rgb);
+    let m = (x.x + x.y + x.z) / 3.0;
+    return wide_m(9u, vec3<f32>(m) + (x - vec3<f32>(m)) * f);
+}
+
 // `ColorOps::apply`.
-fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
+fn color_ops(rgb0: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
     if (pu(F_OPS_IDENTITY) != 0u && local_sat == 0.0 && local_hue == 0.0) {
-        return rgb;
+        return rgb0;
+    }
+    var rgb = rgb0;
+    let vib = pf(F_VIBRANCE);
+    if (vib != 0.0) {
+        rgb = vibrance_wide(rgb0, vib);
     }
     let lab0 = oklab(rgb);
     var l = lab0.x;
@@ -155,16 +182,6 @@ fn color_ops(rgb: vec3<f32>, local_sat: f32, local_hue: f32) -> vec3<f32> {
         l = r.x;
         c = r.y;
         h = r.z;
-    }
-    let vib = pf(F_VIBRANCE);
-    if (vib != 0.0) {
-        let low = 1.0 - clamp(c / 0.22, 0.0, 1.0);
-        var skin = 1.0;
-        if (vib > 0.0) {
-            let q = wrap_angle(h - pf(F_SKIN)) / 0.35;
-            skin = 1.0 - 0.6 * exp(-(q * q));
-        }
-        c *= max(1.0 + vib * low * low * skin * 1.2, 0.0);
     }
     let sat = pf(F_SATURATION);
     if (sat != 0.0 || local_sat != 0.0) {

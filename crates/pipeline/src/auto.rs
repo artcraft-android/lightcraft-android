@@ -35,11 +35,12 @@ const EXPOSURE_AT_GREY: f64 = -0.58;
 const HIGHLIGHTS: f64 = -66.0;
 const SHADOWS: f64 = 52.0;
 /// Contrast is Lightroom's own average (+6): ours now follows Lightroom's curve (issue 7; upstream
-/// fitted +68 to make up for a weaker one). Vibrance is fitted (our Vibrance isn't calibrated to
-/// Lightroom's yet). Whites, Blacks and Saturation stay at 0 (Whites and Blacks made no difference to
+/// fitted +68 to make up for a weaker one). Vibrance is upstream's fitted +30 scaled to our Vibrance,
+/// which now moves colours as far as Lightroom's (about 2.6 times the slider upstream fitted it to).
+/// Whites, Blacks and Saturation stay at 0 (Whites and Blacks made no difference to
 /// the match; Lightroom leaves Saturation at about 0).
 const CONTRAST: f64 = 6.0;
-const VIBRANCE: f64 = 30.0;
+const VIBRANCE: f64 = 12.0;
 
 /// The scene's log-average luminance under the current white balance, in EV relative to middle grey
 /// (the mean of log2(Y / 0.18) over a 512 px proxy, scene-linear, before any tone curve). Pixels that

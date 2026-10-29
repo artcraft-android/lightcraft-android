@@ -23,6 +23,26 @@ pub fn band_hues() -> &'static [f32; 8] {
 }
 
 #[inline]
+/// Vibrance (`v`, −1..=1) on a display-linear Rec.2020 colour: its channels pushed away from (+) or
+/// drawn towards (−) their mean in the wide space ([`crate::tone::wide`]), the more the less
+/// colourful it is (OkLab chroma) and, raising it, less on skin tones. Unlike Saturation it moves
+/// lightness as Lightroom's does (a blue drawn towards grey lightens, an orange darkens). A shape of
+/// our own whose numbers were fitted (issue 7) to how far Lightroom's Vibrance moves the colour
+/// patches of our test chart at −100, +50 and +100; applied before the colour mixer, as there.
+pub fn vibrance(rgb: [f32; 3], v: f32, skin_hue: f32) -> [f32; 3] {
+    let lab = oklab_from_2020(rgb);
+    let c = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
+    // strength, the chroma where it fades out, and how fast it fades
+    let (k, cmax, p) = if v > 0.0 { (1.0, 0.4, 2.0) } else { (0.8, 1.0, 1.0) };
+    let w = (1.0 - (c / cmax).clamp(0.0, 1.0)).powf(p);
+    let skin = if v > 0.0 { 1.0 - 0.6 * (-(wrap(lab[2].atan2(lab[1]) - skin_hue) / 0.35).powi(2)).exp() } else { 1.0 };
+    let f = (1.0 + v * k * w * skin).max(0.0);
+    let wd = crate::tone::wide();
+    let x = wd.to_wide(rgb);
+    let m = (x[0] + x[1] + x[2]) / 3.0;
+    wd.from_wide(x.map(|c| m + (c - m) * f))
+}
+
 fn wrap(a: f32) -> f32 {
     (a + PI).rem_euclid(TAU) - PI
 }
@@ -190,18 +210,14 @@ impl ColorOps {
         if self.is_identity() && local_sat == 0.0 && local_hue == 0.0 {
             return rgb;
         }
+        let rgb = if self.vibrance != 0.0 { vibrance(rgb, self.vibrance, self.skin) } else { rgb };
         let lab = oklab_from_2020(rgb);
-        // only chroma changes (vibrance / saturation, maybe grading): scale a, b directly — the same
-        // result as the OkLCh round trip without its sin / cos (and atan2 unless vibrance needs the hue)
+        // only chroma changes (saturation, maybe grading): scale a, b directly — the same result as
+        // the OkLCh round trip without its sin / cos and atan2
         if !self.mixer && self.points.is_empty() && self.bw.is_none() && local_hue == 0.0 {
             let mut lab = lab;
             let c0 = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
             let mut c = c0;
-            if self.vibrance != 0.0 {
-                let low = 1.0 - (c / 0.22).clamp(0.0, 1.0);
-                let skin = if self.vibrance > 0.0 { 1.0 - 0.6 * (-(wrap(lab[2].atan2(lab[1]) - self.skin) / 0.35).powi(2)).exp() } else { 1.0 };
-                c *= (1.0 + self.vibrance * low * low * skin * 1.2).max(0.0);
-            }
             if self.saturation != 0.0 || local_sat != 0.0 {
                 c *= (1.0 + self.saturation + local_sat).max(0.0);
             }
@@ -228,11 +244,6 @@ impl ColorOps {
         }
         for p in &self.points {
             [l, c, h] = p.apply([l, c, h]);
-        }
-        if self.vibrance != 0.0 {
-            let low = 1.0 - (c / 0.22).clamp(0.0, 1.0);
-            let skin = if self.vibrance > 0.0 { 1.0 - 0.6 * (-(wrap(h - self.skin) / 0.35).powi(2)).exp() } else { 1.0 };
-            c *= (1.0 + self.vibrance * low * low * skin * 1.2).max(0.0);
         }
         if self.saturation != 0.0 || local_sat != 0.0 {
             c *= (1.0 + self.saturation + local_sat).max(0.0);
