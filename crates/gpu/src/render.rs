@@ -677,6 +677,7 @@ pub fn render(
 
     // 5. per-pixel stage
     let mut fp = FinishParams::new(s, &plan.frame, info, w, h, plan.px_per_long, prep.air, req.space);
+    fp.hs_adapt = plan.hs_adapt;
     // soft proofing as the CPU's `finish` sets it up (an output-device table never gets here: see `render`)
     fp.proof = req.proof.map(|pr| pr.params(req.space));
     if let Some(d) = &req.display {

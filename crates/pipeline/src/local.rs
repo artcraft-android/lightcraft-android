@@ -688,7 +688,7 @@ pub(crate) fn prepare(
     };
     let ev = s.light.exposure as f32;
     let masks = timed("masks", || masks::evaluate(&s.masks, frame, img.width, img.height, &img, &log_l, ev, mattes));
-    Prepared { img, log_l, base, clarity_blur, texture_blur, dark, chroma_blur, air, masks, px_per_long }
+    Prepared { img, log_l, base, clarity_blur, texture_blur, dark, chroma_blur, air, masks, px_per_long, hs_adapt: crate::finish::HS_NEUTRAL }
 }
 
 /// The airlight of the whole output frame, estimated on a small render of it (`proxy_w` px wide):

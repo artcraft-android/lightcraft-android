@@ -45,11 +45,13 @@ struct Error {
 
 impl Error {
     fn acceptable(&self) -> bool {
-        // Observed maxima on these fixtures: mean 6.057, pixel-max p99 37. Leave
+        // Observed maxima on these fixtures: mean 8.72 (Highlights and Shadows
+        // adapt to the scene, issue 7, and reach further on this wide-range
+        // one; an omitted control is still ~23), pixel-max p99 37. Leave
         // headroom for numerical variation, while bounding both widespread
         // drift and localized tails. These are fixture bounds, not a promise
         // for arbitrary photographs, settings, resamplers, or output depths.
-        self.mean < 8.0 && self.p99 <= 40
+        self.mean < 9.5 && self.p99 <= 40
     }
 }
 

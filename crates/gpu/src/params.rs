@@ -26,6 +26,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("WIDE", 18),
     ("HL", 1),
     ("SH", 1),
+    ("HS_ADAPT", 4),
     ("CLAR", 1),
     ("TEX", 1),
     ("DEHAZE", 1),
@@ -186,6 +187,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.fs("WIDE", &lightcraft_pipeline::tone::wide().words());
     p.f("HL", fp.hl);
     p.f("SH", fp.sh);
+    p.fs("HS_ADAPT", &fp.hs_adapt);
     p.f("CLAR", fp.clar);
     p.f("TEX", fp.tex);
     p.f("DEHAZE", fp.dehaze);

@@ -2108,7 +2108,9 @@ pub(crate) mod tests {
         use lightcraft_pipeline::{RenderRequest, render};
         let wb = [2.4f32, 1.0, 1.6];
         let colour = CameraColourModel { wb, matrix: yellowing_look(), gain: 1.0, tables: None, hue_sat: None };
-        // a grey wall (camera neutral) with a fully clipped light and a light clipped in green only
+        // a grey wall (camera neutral) with a fully clipped light and a light clipped in green only; the wall
+        // darkens downwards, so the scene spans a photo's range (Highlights adapt to it: a flat one is pulled only
+        // gently)
         let mut img = Rgb32f::from_fn(96, 64, |x, y| {
             let d = |cx: f32| ((x as f32 - cx).powi(2) + (y as f32 - 32.0).powi(2)).sqrt();
             if d(28.0) < 14.0 {
@@ -2116,7 +2118,8 @@ pub(crate) mod tests {
             } else if d(70.0) < 12.0 {
                 [0.6 / wb[0], 1.0, 0.7 / wb[2]]
             } else {
-                [0.3 / wb[0], 0.3, 0.3 / wb[2]]
+                let k = 0.3 * (-6.0 * y as f32 / 64.0).exp2();
+                [k / wb[0], k, k / wb[2]]
             }
         });
         colour.rebuild_highlights(&mut img);

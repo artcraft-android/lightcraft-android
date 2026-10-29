@@ -219,6 +219,8 @@ pub(crate) struct Prepared {
     pub masks: Vec<masks::Evaluated>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
+    /// See [`Plan::hs_adapt`].
+    pub hs_adapt: [f32; 4],
 }
 
 /// Output size for a source of `src_w × src_h` under `s`, fitting `max_w × max_h`.
@@ -389,6 +391,8 @@ pub struct Plan<'a> {
     pub keep: Option<PixelWindow>,
     /// The source's segmentation mattes ([`SourceInfo::mattes`]).
     pub mattes: Option<Arc<masks::Mattes>>,
+    /// Highlights and Shadows fitted to the whole photo ([`finish::hs_adapt`]).
+    pub hs_adapt: [f32; 4],
 }
 
 /// Long edge of the small render a windowed render estimates the whole frame's airlight from.
@@ -421,6 +425,9 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         }
     }
     let s = &*settings;
+    // Highlights and Shadows adapt to the whole photo (a window or tile sees only part of it)
+    let hs_on = s.light.highlights != 0.0 || s.light.shadows != 0.0 || s.masks.iter().any(|m| m.adjust.highlights != 0.0 || m.adjust.shadows != 0.0);
+    let hs_adapt = if hs_on { finish::hs_adapt(&luminance_ranks(src, info, s), s.light.exposure as f32) } else { finish::HS_NEUTRAL };
     let frame = frame_for(src, info, s, req.apply_crop);
     let (full_w, full_h) = frame.fit(req.max_w, req.max_h);
     // sizes and scale are those of the whole output; a window only narrows what is drawn
@@ -468,7 +475,23 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         [d.nr_luminance, d.nr_detail, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         detail_scale.to_bits(),
     ));
-    Plan { settings, frame, w, h, px_per_long, src_long, detail_scale, geo, lin_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
+    Plan {
+        settings,
+        frame,
+        w,
+        h,
+        px_per_long,
+        src_long,
+        detail_scale,
+        geo,
+        lin_key,
+        pre_nr_key,
+        eyes,
+        fixed_air,
+        keep,
+        mattes: info.mattes.clone(),
+        hs_adapt,
+    }
 }
 
 /// The last few [`luminance_ranks`] tables, by source and white balance.
@@ -632,6 +655,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     if let Some(a) = plan.fixed_air {
         prep.air = a;
     }
+    prep.hs_adapt = plan.hs_adapt;
     lap("prepare", &mut t);
     if let Some((a, c)) = shared {
         c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), planes });

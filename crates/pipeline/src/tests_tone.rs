@@ -101,8 +101,9 @@ fn highlights_keep_the_local_contrast_of_bright_areas() {
     let (bright, flat_dark) = ((40, 540), (700, 1160));
     let ((m0, c0), (mh, ch), (_, ce)) = (stats(&plain, bright.0, bright.1), stats(&hl, bright.0, bright.1), stats(&exp, bright.0, bright.1));
     let (k0, kh, ke) = (line_contrast(&plain, bright.0, bright.1), line_contrast(&hl, bright.0, bright.1), line_contrast(&exp, bright.0, bright.1));
-    // the sky comes down as much as with −1 EV or more…
-    assert!(mh < m0 - 25.0, "highlights −100 mean {mh} vs {m0}");
+    // the sky comes down clearly (a little less than with −1 EV: Highlights adapt to the scene, issue
+    // 7, and half of this one is far darker than the sky, its median on the stalks)…
+    assert!(mh < m0 - 15.0, "highlights −100 mean {mh} vs {m0}");
     // …and keeps its twigs as −1 EV does (the edge-aware base alone followed them: 0.73 of
     // Exposure's twig contrast and 0.79 of its local contrast were left)
     assert!(kh > 0.9 * ke && kh > 0.9 * k0, "highlights −100 twig contrast {kh} EV vs exposure −1 {ke}, plain {k0}");

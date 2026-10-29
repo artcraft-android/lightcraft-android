@@ -536,7 +536,8 @@ fn clipped_highlights_stay_neutral_on_both() {
     let n = look.inverse().unwrap().apply([1.0; 3]);
     let white = n.map(|v| (v * luma(look.apply([1.0; 3])) / luma(look.apply(n))) as f32);
     // a grey wall with a fully clipped light, a light clipped in green only, and a dark bar with a purple fringe
-    // in front of the second
+    // in front of the second; the wall darkens downwards, so the scene spans a photo's range (Highlights adapt to
+    // it: a flat one is pulled only gently)
     let mut cam = Rgb32f::from_fn(320, 240, |x, y| {
         let d = |cx: f32| ((x as f32 - cx).powi(2) + (y as f32 - 120.0).powi(2)).sqrt();
         if d(90.0) < 50.0 {
@@ -548,7 +549,8 @@ fn clipped_highlights_stay_neutral_on_both() {
         } else if d(228.0) < 50.0 {
             [0.6 / wb[0], 1.0, 0.7 / wb[2]]
         } else {
-            [0.3 / wb[0], 0.3, 0.3 / wb[2]]
+            let k = 0.3 * (-6.0 * y as f32 / 240.0).exp2();
+            [k / wb[0], k, k / wb[2]]
         }
     });
     lightcraft_raw::highlight::reconstruct_with(&mut cam, wb, 0.99, white);

@@ -444,9 +444,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hh = pf(F_HL) + lt[4];
     let ss = pf(F_SH) + lt[5];
     if (hh != 0.0 || ss != 0.0) {
-        let ws = 2.01 * (1.0 - sstep(-4.46, 1.66, base)) + 0.49 * (1.0 - sstep(-6.0, 8.48, base));
-        let wh = 0.436 * sstep(-7.6, 0.8, base) + 0.878 * sstep(0.2, 2.8, base);
-        delta += ss * ws + hh * wh;
+        // fitted to the photo (`finish::hs_adapt`): strength and shift of highlights, then shadows
+        let bs = base - pf(F_HS_ADAPT + 3u);
+        let bh = base - pf(F_HS_ADAPT + 1u);
+        let ws = 2.01 * (1.0 - sstep(-4.46, 1.66, bs)) + 0.49 * (1.0 - sstep(-6.0, 8.48, bs));
+        let wh = 0.436 * sstep(-7.6, 0.8, bh) + 0.878 * sstep(0.2, 2.8, bh);
+        delta += ss * pf(F_HS_ADAPT + 2u) * ws + hh * pf(F_HS_ADAPT) * wh;
     }
     if (lt[6] != 0.0) {
         delta += lt[6] * 0.8 * sstep(0.5, 3.0, l1);

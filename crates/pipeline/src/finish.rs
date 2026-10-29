@@ -167,6 +167,8 @@ pub struct FinishParams {
     pub per_channel: bool,
     pub hl: f32,
     pub sh: f32,
+    /// Highlights and Shadows fitted to the photo ([`hs_adapt`]); [`HS_NEUTRAL`] until set.
+    pub hs_adapt: [f32; 4],
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -239,6 +241,7 @@ impl FinishParams {
             per_channel: !info.raw,
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
+            hs_adapt: HS_NEUTRAL,
             clar,
             tex,
             dehaze,
@@ -267,6 +270,38 @@ impl FinishParams {
         self.out_trc = OutputTrc::Srgb;
         self.proof = proof.map(|pr| pr.params_display(d));
     }
+}
+
+/// Highlights and Shadows with no photo to fit them to: as on our reference chart.
+pub const HS_NEUTRAL: [f32; 4] = [1.0, 0.0, 1.0, 0.0];
+
+/// Lightroom's Highlights and Shadows adapt to the photo (issue 7): on a low-key portrait
+/// Highlights −100 pulls the face, its brightest part, far down and Shadows +100 barely lifts the
+/// dark suit, while on a bright, flat photo both do less than on our chart. Fitted on four photos
+/// (the chart, which the curves were fitted on, keeps strength 1): each one's strength follows the
+/// spread of the photo's luminance and its curve moves with the photo's brightness after
+/// exposure. From the photo's luminance table ([`crate::masks::luminance_ranks`]) and its exposure
+/// `ev`, as `[highlights strength, highlights shift (EV), shadows strength, shadows shift]`; a
+/// spread past those fitted is held to them.
+pub fn hs_adapt(ranks: &[f32], ev: f32) -> [f32; 4] {
+    if ranks.is_empty() {
+        return HS_NEUTRAL;
+    }
+    // log2 luminance over grey at share `q` of the photo, floored at -12 EV
+    let at = |q: f32| {
+        let x = q * (ranks.len() - 1) as f32;
+        let i = x as usize;
+        let a = ranks.get(i).copied().unwrap_or(0.0);
+        let b = ranks.get(i + 1).copied().unwrap_or(a);
+        (a + (b - a) * (x - i as f32)).max(-12.0)
+    };
+    let (p5, p50, p95) = (at(0.05), at(0.5), at(0.95));
+    [
+        1.0 + 0.2803 * ((p50 - p5).clamp(1.0, 5.0) - 3.389),
+        0.5589 * ((p95 + ev).clamp(-2.0, 3.5) - 2.56),
+        1.0 + 0.1829 * ((p95 - p5).clamp(2.5, 11.0) - 5.738),
+        0.7978 * ((p50 + ev).clamp(-8.0, 1.5) - 0.212),
+    ]
 }
 
 /// The base tone map (scene → display luminance, with Contrast, Whites and Blacks) of `s`'s
@@ -302,6 +337,7 @@ pub(crate) fn finish(
 ) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.hs_adapt = p.hs_adapt;
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -331,6 +367,7 @@ pub(crate) fn finish_deep(
     use lightcraft_color::transfer::srgb_to_linear;
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.hs_adapt = p.hs_adapt;
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -395,6 +432,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let out_to_norm = fp.out_to_norm;
     let long = fp.ow.max(fp.oh);
     let [vx, vy, vw, vh] = fp.view;
+    let [hl_k, hl_at, sh_k, sh_at] = fp.hs_adapt;
     // the vignette belongs to the whole output frame, not to the window being drawn
     let aspect = vw / vh;
 
@@ -494,10 +532,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             if hh != 0.0 || ss != 0.0 {
                 // EV at ±100, fitted (issue 7) to how far Lightroom moves each step of our grey chart:
                 // both reach well into the mid-tones (Shadows +100 lifts grey ~0.7 EV, Highlights moves it
-                // ~0.4 EV) and keep a little effect at the far end
-                let ws = 2.01 * (1.0 - smooth(-4.46, 1.66, base)) + 0.49 * (1.0 - smooth(-6.0, 8.48, base));
-                let wh = 0.436 * smooth(-7.6, 0.8, base) + 0.878 * smooth(0.2, 2.8, base);
-                delta += ss * ws + hh * wh;
+                // ~0.4 EV) and keep a little effect at the far end; then scaled and moved for the photo
+                let (bs, bh) = (base - sh_at, base - hl_at);
+                let ws = 2.01 * (1.0 - smooth(-4.46, 1.66, bs)) + 0.49 * (1.0 - smooth(-6.0, 8.48, bs));
+                let wh = 0.436 * smooth(-7.6, 0.8, bh) + 0.878 * smooth(0.2, 2.8, bh);
+                delta += ss * sh_k * ws + hh * hl_k * wh;
             }
             if l_wh != 0.0 {
                 delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
@@ -836,5 +875,33 @@ mod tests {
         assert!(worst < 2e-5, "{worst}");
         assert_eq!(encode_srgb(lut, -1.0), 0.0);
         assert!((encode_srgb(lut, 2.0) - 1.0).abs() < 1e-6);
+    }
+
+    // Issue 7: Lightroom's Highlights and Shadows adapt to the photo
+    #[test]
+    fn highlights_and_shadows_adapt_to_the_photo() {
+        // a luminance table through (rank, log2 luminance over grey) knots
+        let table = |knots: &[(f32, f32)]| -> Vec<f32> {
+            (0..=crate::masks::RANK_STEPS)
+                .map(|i| {
+                    let r = i as f32 / crate::masks::RANK_STEPS as f32;
+                    let k = knots.windows(2).find(|k| r <= k[1].0).unwrap_or(&knots[knots.len() - 2..]);
+                    k[0].1 + (k[1].1 - k[0].1) * (r - k[0].0) / (k[1].0 - k[0].0)
+                })
+                .collect()
+        };
+        // our chart's spread (which the curves were fitted on) keeps them as they are
+        let chart = hs_adapt(&table(&[(0.0, -3.554), (0.5, 0.212), (1.0, 2.821)]), 0.0);
+        assert!(chart.iter().zip(HS_NEUTRAL).all(|(a, b)| (a - b).abs() < 0.01), "{chart:?}");
+        // a low-key photo: both reach further and act lower down
+        let [hk, ha, sk, sa] = hs_adapt(&table(&[(0.0, -12.0), (1.0, 0.0)]), 0.0);
+        assert!(hk > 1.3 && ha < -1.5 && sk > 1.5 && sa < -4.0, "{:?}", [hk, ha, sk, sa]);
+        // a bright, flat one: both do much less
+        let [hk, _, sk, _] = hs_adapt(&table(&[(0.0, 0.0), (1.0, 2.0)]), 0.0);
+        assert!(hk < 0.5 && sk < 0.6, "{hk} {sk}");
+        // exposure moves the curves with the photo
+        let t = table(&[(0.0, -4.0), (1.0, 2.0)]);
+        assert!(hs_adapt(&t, -1.0)[1] < hs_adapt(&t, 0.0)[1] && hs_adapt(&t, -1.0)[3] < hs_adapt(&t, 0.0)[3]);
+        assert_eq!(hs_adapt(&[], 0.0), HS_NEUTRAL);
     }
 }
