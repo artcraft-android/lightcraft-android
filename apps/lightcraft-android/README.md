@@ -126,6 +126,19 @@ rebuilds only what changed. Gradle finds `cargo` in `~/.cargo/bin` (or `$CARGO`)
   masks on our test photos).
   The mask shows in red over the photo while you edit it. Sideways, the panel, the sections and the
   tools stand as columns to the right of the photo.
+- **Folder library (opt-in).** By default photos are copied into the app's own library. Preferences ▸
+  Library folder instead edits the photos of a folder where they are, with the edits in XMP sidecars
+  next to them (`IMG_1.xmp`), so other apps and sync tools such as Syncthing see them. It needs "All
+  files access" (`MANAGE_EXTERNAL_STORAGE`, which the app asks for only when this is turned on;
+  Android 11 or later), so the engine works on plain `/storage/emulated/0/…` paths. Turning it on adds
+  the folder and its subfolders in place, watches it (`library.autoImport`, add in place) and turns
+  on `library.xmpPreferences` auto-write; turning it off stops watching and leaves the photos in the
+  library and every file on disk alone. The app *synchronizes* whenever it comes to the front, and
+  from Preferences: `MobileSession::sync_folder` adds the photos that appeared (once their size has
+  stopped changing) and reads the sidecars that are new or changed since the last time
+  (`photo.readMetadataFromFile` with `onlyChanged`: a sidecar that says what the library has is no
+  undo step, and what is read is not written back, so a sidecar is never rewritten by reading it).
+  Photos that were deleted from the folder are not removed from the library.
 - **Anything else** is a command away: `MobileSession.execute(id, json)` runs any of the engine's
   commands with the parameters documented in `docs/control-protocol.md` and the MCP tools.
 
