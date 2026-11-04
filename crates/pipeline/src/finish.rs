@@ -21,6 +21,15 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// How much of the sharpening a pixel gets (0..1) under Masking `masking` (0..1), from its fine
+/// detail `det` (log luminance minus its texture blur): 1 everywhere at 0, only stronger edges
+/// as it rises. The GPU kernel (`finish.wgsl`) computes the same; Alt-drag on Masking shows it
+/// ([`crate::Overlay::SharpenMask`]).
+#[inline]
+pub fn sharpen_mask_weight(masking: f32, det: f32) -> f32 {
+    if masking > 0.0 { smooth(masking * 0.25, masking * 0.25 + 0.15, det.abs()) } else { 1.0 }
+}
+
 /// Parametric region curve (encoded domain) composed with the master point curve.
 fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
@@ -79,6 +88,10 @@ pub const GRAIN_HASH: [u32; 4] = [0x8da6_b343, 0xd816_3841, 0xcb1a_b31f, 0x5bd1_
 
 #[inline]
 fn grain_noise(x: f32, y: f32, seed: u32) -> f32 {
+    // A degenerate frame (zero-width crop) maps pixels to NaN/inf coordinates: no grain there.
+    if !x.is_finite() || !y.is_finite() {
+        return 0.0;
+    }
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = (x - x0, y - y0);
     let h = |i: i32, j: i32| {
@@ -200,19 +213,21 @@ pub struct FinishParams {
     pub peak: f32,
 }
 
+/// What [`FinishParams::new`] is built from.
+pub struct FinishParamsInput<'a> {
+    pub settings: &'a DevelopSettings,
+    pub frame: &'a Frame,
+    pub info: &'a SourceInfo,
+    pub image_size: (usize, usize),
+    pub px_per_long: f64,
+    pub air_pre: f32,
+    pub space: OutputSpace,
+}
+
 impl FinishParams {
     /// Parameters for a `w × h` render into `space`; `ev`/`air_pre` as in [`crate::Prepared`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        s: &DevelopSettings,
-        frame: &Frame,
-        info: &SourceInfo,
-        w: usize,
-        h: usize,
-        px_per_long: f64,
-        air_pre: f32,
-        space: OutputSpace,
-    ) -> FinishParams {
+    pub fn new(input: FinishParamsInput<'_>) -> FinishParams {
+        let FinishParamsInput { settings: s, frame, info, image_size: (w, h), px_per_long, air_pre, space } = input;
         let effects = s.section_enabled("effects");
         let (clar, tex, dehaze) = if effects {
             ((s.effects.clarity / 100.0) as f32, (s.effects.texture / 100.0) as f32, (s.effects.dehaze / 100.0) as f32)
@@ -221,7 +236,14 @@ impl FinishParams {
         };
         let ev = s.light.exposure as f32;
         let gain = 2f32.powf(ev);
-        let grain = (s.grain.amount > 0.0 && effects).then(|| {
+        let out_to_norm = frame.out_to_norm(w, h);
+        let finite_frame = px_per_long.is_finite()
+            && px_per_long > 0.0
+            && frame.ow.is_finite()
+            && frame.oh.is_finite()
+            && frame.ow.max(frame.oh) > 0.0
+            && out_to_norm.0.iter().all(|v| v.is_finite());
+        let grain = (s.grain.amount > 0.0 && effects && finite_frame).then(|| {
             let cell = (0.0006 + (s.grain.size / 100.0) as f32 * 0.0024) * px_per_long as f32;
             ((s.grain.amount / 100.0) as f32 * 0.13, cell.max(0.6), (s.grain.roughness / 100.0) as f32, s.grain.seed)
         });
@@ -259,7 +281,7 @@ impl FinishParams {
             gain,
             ev,
             grain,
-            out_to_norm: frame.out_to_norm(w, h),
+            out_to_norm,
             ow: frame.ow,
             oh: frame.oh,
             w,
@@ -277,6 +299,213 @@ impl FinishParams {
         self.out_trc = OutputTrc::Srgb;
         self.proof = proof.map(|pr| pr.params_display(d));
     }
+}
+
+/// One output pixel of [`finish_with`]: its index and position in the image, its log luminance
+/// before exposure, after it and after the scene adjustments, and its highlights/shadows base.
+#[derive(Clone, Copy)]
+struct Px {
+    i: usize,
+    x: usize,
+    y: usize,
+    l_pre: f32,
+    l0: f32,
+    l1: f32,
+    base: f32,
+}
+
+/// The scene-linear adjustments before the local tone: local Moiré (and Noise's colour part),
+/// Defringe, Dehaze and the masks' Exposure, Temp and Tint (`l`: the masks' summed terms; `raw`:
+/// the pixel before exposure). Also whether they moved its luminance (Dehaze, local Exposure).
+fn adjust_scene(p: &Prepared, fp: &FinishParams, i: usize, raw: [f32; 3], mut c: [f32; 3], l: &[f32; MASK_SUMS]) -> ([f32; 3], bool) {
+    let [l_exp, l_temp, l_tint, _, _, _, _, _, _, _, l_dehaze, _, _, _, l_noise, l_moire, l_defringe] = *l;
+    let (air, air_pre) = (fp.air, fp.air_pre);
+    // --- local Moiré (and the colour part of Noise): chromaticity towards its blur
+    let mt = (l_moire + 0.5 * l_noise.max(0.0)).clamp(-1.0, 1.0);
+    if mt != 0.0
+        && let Some(cb) = &p.chroma_blur
+    {
+        let (y, ch0, cb) = (luminance_2020(c), crate::masks::chromaticity(raw), cb.data[i]);
+        c = std::array::from_fn(|k| ((ch0[k] + (cb[k] - ch0[k]) * mt) * y).max(0.0));
+    }
+    // --- local Defringe: desaturate purple / green fringes along edges
+    let df = l_defringe.clamp(0.0, 1.0);
+    if df > 0.0
+        && let Some(b) = &p.texture_blur
+    {
+        let k = df * defringe_weight(c, p.log_l.data[i] - b.data[i]);
+        if k > 0.0 {
+            let y = luminance_2020(c);
+            c = c.map(|v| v + (y - v) * k);
+        }
+    }
+
+    // --- dehaze (scene linear)
+    let dz = fp.dehaze + l_dehaze;
+    if dz != 0.0
+        && let Some(dark) = &p.dark
+    {
+        // The dark channel is a blur, not a patch minimum: near bright neighbours it credits
+        // dark pixels with veil they don't hold (and a windowed render borrows the whole
+        // frame's airlight), so the subtraction went past zero and crushed them to black
+        // (#2504). Never attribute more veil than the pixel's own minimum channel.
+        let c_min = c[0].min(c[1]).min(c[2]);
+        let d = (if air_pre > 0.0 { dark.data[i] / air_pre } else { 0.0 }).min(if air > 0.0 { c_min / air } else { 0.0 }).clamp(0.0, 1.0);
+        if dz > 0.0 {
+            // the haze map is held to the pixel's own darkest channel: a pixel darker than its
+            // neighbourhood isn't haze, and capping it never takes away more than the pixel has, so
+            // shadows keep their steps instead of crushing to black (issue 7); the strength (0.78 at
+            // +100) sits between what matches Lightroom on our chart (0.7) and on a hazy photo (0.85)
+            let own = (c[0].min(c[1]).min(c[2]) / air.max(1e-6)).clamp(0.0, 1.0);
+            let t = (1.0 - DEHAZE_STRENGTH * dz.min(1.0) * d.min(own)).max(0.12);
+            c = c.map(|v| ((v - air * (1.0 - t)) / t).max(0.0));
+        } else {
+            let k = (-dz).min(1.0) * 0.7 * (0.35 + 0.65 * d);
+            c = c.map(|v| v + (air * 0.9 - v) * k);
+        }
+    }
+
+    // --- local exposure / temp / tint
+    if l_exp != 0.0 {
+        let g = l_exp.exp2();
+        c = c.map(|v| v * g);
+    }
+    if l_temp != 0.0 || l_tint != 0.0 {
+        let y0 = luminance_2020(c);
+        c = [c[0] * (1.0 + 0.3 * l_temp), c[1] * (1.0 - 0.22 * l_tint), c[2] * (1.0 - 0.3 * l_temp).max(0.0)];
+        let y1 = luminance_2020(c).max(1e-9);
+        c = c.map(|v| v * y0 / y1);
+    }
+
+    (c, dz != 0.0 || l_exp != 0.0)
+}
+
+/// The local tone in log luminance, as an EV shift: Highlights and Shadows (fitted to the photo),
+/// the masks' Whites, Blacks and Contrast, Clarity, Texture, sharpening and local Noise.
+fn local_tone_delta(p: &Prepared, fp: &FinishParams, px: &Px, l: &[f32; MASK_SUMS]) -> f32 {
+    let [_, _, _, l_con, l_hl, l_sh, l_wh, l_bl, l_tex, l_clar, _, _, _, l_sharp, l_noise, _, _] = *l;
+    let Px { i, x, y, l_pre, l0, l1, base } = *px;
+    let [hl_k, hl_at, sh_k, sh_at] = fp.hs_adapt;
+    let [vx, vy, vw, vh] = fp.view;
+    let mut delta = 0.0f32;
+    let (hh, ss) = (fp.hl + l_hl, fp.sh + l_sh);
+    if hh != 0.0 || ss != 0.0 {
+        // EV at ±100, fitted (issue 7) to how far Lightroom moves each step of our grey chart:
+        // both reach well into the mid-tones (Shadows +100 lifts grey ~0.7 EV, Highlights moves it
+        // ~0.4 EV) and keep a little effect at the far end; then scaled and moved for the photo
+        let (bs, bh) = (base - sh_at, base - hl_at);
+        let ws = 2.01 * (1.0 - smooth(-4.46, 1.66, bs)) + 0.49 * (1.0 - smooth(-6.0, 8.48, bs));
+        let wh = 0.436 * smooth(-7.6, 0.8, bh) + 0.878 * smooth(0.2, 2.8, bh);
+        delta += ss * sh_k * ws + hh * hl_k * wh;
+    }
+    if l_wh != 0.0 {
+        delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
+    }
+    if l_bl != 0.0 {
+        delta += l_bl * 0.8 * (1.0 - smooth(-6.0, -1.5, l1));
+    }
+    if l_con != 0.0 {
+        delta += l_con * 0.14 * l1.clamp(-6.0, 4.0);
+    }
+    let cl = fp.clar + l_clar;
+    if cl != 0.0
+        && let Some(b) = &p.clarity_blur
+    {
+        let det = (l_pre - b.data[i]).clamp(-2.5, 2.5);
+        let mid = (-(base / 3.2).powi(2)).exp();
+        // Clarity + (issue 7, fitted to Lightroom's on four photos): a finer detail boost, and a
+        // local contrast against the frame's wide surround that leaves the highlights alone;
+        // Clarity − only softens the detail
+        delta += cl * if cl > 0.0 { 0.6 } else { 0.85 } * det * (0.35 + 0.65 * mid);
+        if cl > 0.0
+            && let Some(g) = fp.surround.as_deref()
+        {
+            let around = surround_at(g, vx + x as f32 + 0.5, vy + y as f32 + 0.5, vw, vh);
+            let wide = (l_pre.max(SURROUND_FLOOR) - around).clamp(-2.0, 2.0);
+            delta += cl * 0.7 * wide * (1.0 - smooth(-2.0, 1.0, l0));
+        }
+    }
+    let tx = fp.tex + l_tex;
+    let sp = l_sharp * 0.6 + fp.sharpen;
+    if (tx != 0.0 || sp != 0.0)
+        && let Some(b) = &p.texture_blur
+    {
+        let det = l_pre - b.data[i];
+        let tame = 1.0 - 0.6 * smooth(0.4, 1.6, det.abs());
+        delta += tx * 1.1 * det.clamp(-1.0, 1.0) * tame;
+        if sp != 0.0 {
+            let m = sharpen_mask_weight(fp.sharpen_mask, det);
+            delta += sp * 1.3 * det.clamp(-0.8, 0.8) * m;
+        }
+    }
+    // local Noise: smooth (or, negative, boost) small-amplitude detail, keep edges
+    if l_noise != 0.0
+        && let Some(b) = &p.texture_blur
+    {
+        let det = l_pre - b.data[i];
+        delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
+    }
+    delta
+}
+
+/// The vignette on the display-linear `d` at `(u, vv)` (−1..1 across the whole output frame, whose
+/// width to height is `aspect`).
+fn vignette_px(v: &Vig, mut d: [f32; 3], (u, vv): (f32, f32), aspect: f32, hdr: bool) -> [f32; 3] {
+    let sx = 1.0 + (aspect - 1.0) * v.aspect_mix;
+    let sy = 1.0 + (1.0 / aspect - 1.0) * v.aspect_mix;
+    let (ax, ay) = ((u * sx.max(1.0) / sx.max(sy)).abs(), (vv * sy.max(1.0) / sx.max(sy)).abs());
+    let dist = (ax.powf(v.power) + ay.powf(v.power)).powf(1.0 / v.power);
+    let t = smooth(v.start, v.start + v.width, dist);
+    if t > 0.0 {
+        let lum = luminance_2020(d).clamp(0.0, 1.0);
+        if v.amount < 0.0 {
+            let mut f = 1.0 + v.amount * t;
+            if v.style == VignetteStyle::HighlightPriority {
+                f += (1.0 - f) * v.highlights * smooth(0.4, 1.0, lum);
+            }
+            if v.style == VignetteStyle::PaintOverlay {
+                d = d.map(|c| c * (1.0 - (-v.amount) * t) + 0.0);
+            } else {
+                d = d.map(|c| c * f);
+            }
+        } else if hdr {
+            // lighten towards SDR white; never pull HDR highlights down to it
+            d = d.map(|c| c + (1.0 - c).max(0.0) * v.amount * t * 0.85);
+        } else {
+            d = d.map(|c| c + (1.0 - c) * v.amount * t * 0.85);
+        }
+    }
+    d
+}
+
+/// `d` in the output space, each channel clipped into its gamut (soft proofing maps into the proof
+/// space first and shows that in the output space), with the gamut warning's colour when one shows.
+fn to_output(fp: &FinishParams, d: [f32; 3], peak: f32) -> ([f32; 3], Option<[f32; 3]>) {
+    let mut warn = None;
+    let mut r = match &fp.proof {
+        Some(pp) if pp.table.is_some() => {
+            let (q, dist) = pp.table.as_ref().map_or((d, 0.0), |t| t.sample(d));
+            if pp.dest_warning && dist > crate::output::PROOF_GAMUT_TOLERANCE {
+                warn = Some(crate::output::PROOF_DEST_WARNING);
+            }
+            mul3(&fp.to_out, q)
+        }
+        Some(pp) => {
+            let q0 = mul3(&pp.to_proof, d);
+            let (q, t) = gamut_map_to(q0, pp.luma, peak);
+            if pp.dest_warning && out_of_gamut(q0, t) {
+                warn = Some(crate::output::PROOF_DEST_WARNING);
+            }
+            mul3(&pp.proof_to_out, q)
+        }
+        None => mul3(&fp.to_out, d),
+    };
+    let (mapped, t) = gamut_map_to(r, fp.out_luma, peak);
+    if fp.proof.as_ref().is_some_and(|pp| pp.display_warning) && warn.is_none() && out_of_gamut(r, t) {
+        warn = Some(crate::output::PROOF_DISPLAY_WARNING);
+    }
+    r = mapped;
+    (r, warn)
 }
 
 /// [`crate::local::frame_surround`] at output position `(x, y)` (pixels) of the whole `vw × vh` frame, bilinear.
@@ -358,7 +587,8 @@ pub(crate) fn finish(
     proof: Option<crate::Proof>,
 ) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
-    let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    let mut fp =
+        FinishParams::new(FinishParamsInput { settings: s, frame, info, image_size: (w, h), px_per_long: p.px_per_long, air_pre: p.air, space });
     fp.hs_adapt = p.hs_adapt;
     fp.surround = p.surround.clone();
     fp.proof = proof.map(|pr| pr.params(space));
@@ -389,7 +619,8 @@ pub(crate) fn finish_deep(
 ) -> DeepImage {
     use lightcraft_color::transfer::srgb_to_linear;
     let (w, h) = (p.img.width, p.img.height);
-    let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    let mut fp =
+        FinishParams::new(FinishParamsInput { settings: s, frame, info, image_size: (w, h), px_per_long: p.px_per_long, air_pre: p.air, space });
     fp.hs_adapt = p.hs_adapt;
     fp.surround = p.surround.clone();
     fp.proof = proof.map(|pr| pr.params(space));
@@ -428,36 +659,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
 ) -> Vec<T> {
     let (w, h) = (p.img.width, p.img.height);
     let p_lut = fp.lut.clone();
-    let FinishParams {
-        tone,
-        ops,
-        curves,
-        vig,
-        to_out,
-        out_luma,
-        con,
-        hl,
-        sh,
-        clar,
-        tex,
-        dehaze,
-        sharpen,
-        sharpen_mask,
-        air,
-        air_pre,
-        gain,
-        ev,
-        grain,
-        ..
-    } = fp;
-    let (con, hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
-        (*con, *hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
+    let FinishParams { tone, ops, curves, vig, con, gain, ev, grain, .. } = fp;
+    let (con, gain, ev) = (*con, *gain, *ev);
     let terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
     let out_to_norm = fp.out_to_norm;
     let long = fp.ow.max(fp.oh);
     let [vx, vy, vw, vh] = fp.view;
-    let [hl_k, hl_at, sh_k, sh_at] = fp.hs_adapt;
-    let surround = fp.surround.as_deref();
     // the vignette belongs to the whole output frame, not to the window being drawn
     let aspect = vw / vh;
 
@@ -488,128 +695,14 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     tint_col = Some(([t[MASK_SUMS + 1], t[MASK_SUMS + 2], 0.0], a * t[MASK_SUMS + 3]));
                 }
             }
-            let [l_exp, l_temp, l_tint, l_con, l_hl, l_sh, l_wh, l_bl, l_tex, l_clar, l_dehaze, l_sat, l_hue, l_sharp, l_noise, l_moire, l_defringe] =
-                l;
-
-            // --- local Moiré (and the colour part of Noise): chromaticity towards its blur
-            let mt = (l_moire + 0.5 * l_noise.max(0.0)).clamp(-1.0, 1.0);
-            if mt != 0.0
-                && let Some(cb) = &p.chroma_blur
-            {
-                let (y, ch0, cb) = (luminance_2020(c), crate::masks::chromaticity(raw), cb.data[i]);
-                c = std::array::from_fn(|k| ((ch0[k] + (cb[k] - ch0[k]) * mt) * y).max(0.0));
-            }
-            // --- local Defringe: desaturate purple / green fringes along edges
-            let df = l_defringe.clamp(0.0, 1.0);
-            if df > 0.0
-                && let Some(b) = &p.texture_blur
-            {
-                let k = df * defringe_weight(c, p.log_l.data[i] - b.data[i]);
-                if k > 0.0 {
-                    let y = luminance_2020(c);
-                    c = c.map(|v| v + (y - v) * k);
-                }
-            }
-
-            // --- dehaze (scene linear)
-            let dz = dehaze + l_dehaze;
-            if dz != 0.0
-                && let Some(dark) = &p.dark
-            {
-                // The dark channel is a blur, not a patch minimum: near bright neighbours it credits
-                // dark pixels with veil they don't hold (and a windowed render borrows the whole
-                // frame's airlight), so the subtraction went past zero and crushed them to black
-                // (#2504). Never attribute more veil than the pixel's own minimum channel.
-                let c_min = c[0].min(c[1]).min(c[2]);
-                let d = (if air_pre > 0.0 { dark.data[i] / air_pre } else { 0.0 }).min(if air > 0.0 { c_min / air } else { 0.0 }).clamp(0.0, 1.0);
-                if dz > 0.0 {
-                    // the haze map is held to the pixel's own darkest channel: a pixel darker than its
-                    // neighbourhood isn't haze, and capping it never takes away more than the pixel has, so
-                    // shadows keep their steps instead of crushing to black (issue 7); the strength (0.78 at
-                    // +100) sits between what matches Lightroom on our chart (0.7) and on a hazy photo (0.85)
-                    let own = (c[0].min(c[1]).min(c[2]) / air.max(1e-6)).clamp(0.0, 1.0);
-                    let t = (1.0 - DEHAZE_STRENGTH * dz.min(1.0) * d.min(own)).max(0.12);
-                    c = c.map(|v| ((v - air * (1.0 - t)) / t).max(0.0));
-                } else {
-                    let k = (-dz).min(1.0) * 0.7 * (0.35 + 0.65 * d);
-                    c = c.map(|v| v + (air * 0.9 - v) * k);
-                }
-            }
-
-            // --- local exposure / temp / tint
-            if l_exp != 0.0 {
-                let g = l_exp.exp2();
-                c = c.map(|v| v * g);
-            }
-            if l_temp != 0.0 || l_tint != 0.0 {
-                let y0 = luminance_2020(c);
-                c = [c[0] * (1.0 + 0.3 * l_temp), c[1] * (1.0 - 0.22 * l_tint), c[2] * (1.0 - 0.3 * l_temp).max(0.0)];
-                let y1 = luminance_2020(c).max(1e-9);
-                c = c.map(|v| v * y0 / y1);
-            }
+            let (l_sat, l_hue) = (l[11], l[12]);
+            let moved;
+            (c, moved) = adjust_scene(p, fp, i, raw, c, &l);
 
             // --- local tone in log luminance
-            let l1 = if dz != 0.0 || l_exp != 0.0 { log_lum(c) } else { l0 };
-            let shift = l1 - l0;
-            let base = p.base.data[i] + ev + shift;
-            let mut delta = 0.0f32;
-            let (hh, ss) = (hl + l_hl, sh + l_sh);
-            if hh != 0.0 || ss != 0.0 {
-                // EV at ±100, fitted (issue 7) to how far Lightroom moves each step of our grey chart:
-                // both reach well into the mid-tones (Shadows +100 lifts grey ~0.7 EV, Highlights moves it
-                // ~0.4 EV) and keep a little effect at the far end; then scaled and moved for the photo
-                let (bs, bh) = (base - sh_at, base - hl_at);
-                let ws = 2.01 * (1.0 - smooth(-4.46, 1.66, bs)) + 0.49 * (1.0 - smooth(-6.0, 8.48, bs));
-                let wh = 0.436 * smooth(-7.6, 0.8, bh) + 0.878 * smooth(0.2, 2.8, bh);
-                delta += ss * sh_k * ws + hh * hl_k * wh;
-            }
-            if l_wh != 0.0 {
-                delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
-            }
-            if l_bl != 0.0 {
-                delta += l_bl * 0.8 * (1.0 - smooth(-6.0, -1.5, l1));
-            }
-            if l_con != 0.0 {
-                delta += l_con * 0.14 * l1.clamp(-6.0, 4.0);
-            }
-            let cl = clar + l_clar;
-            if cl != 0.0
-                && let Some(b) = &p.clarity_blur
-            {
-                let det = (l_pre - b.data[i]).clamp(-2.5, 2.5);
-                let mid = (-(base / 3.2).powi(2)).exp();
-                // Clarity + (issue 7, fitted to Lightroom's on four photos): a finer detail boost, and a
-                // local contrast against the frame's wide surround that leaves the highlights alone;
-                // Clarity − only softens the detail
-                delta += cl * if cl > 0.0 { 0.6 } else { 0.85 } * det * (0.35 + 0.65 * mid);
-                if cl > 0.0
-                    && let Some(g) = surround
-                {
-                    let around = surround_at(g, vx + x as f32 + 0.5, vy + y as f32 + 0.5, vw, vh);
-                    let wide = (l_pre.max(SURROUND_FLOOR) - around).clamp(-2.0, 2.0);
-                    delta += cl * 0.7 * wide * (1.0 - smooth(-2.0, 1.0, l0));
-                }
-            }
-            let tx = tex + l_tex;
-            let sp = l_sharp * 0.6 + sharpen;
-            if (tx != 0.0 || sp != 0.0)
-                && let Some(b) = &p.texture_blur
-            {
-                let det = l_pre - b.data[i];
-                let tame = 1.0 - 0.6 * smooth(0.4, 1.6, det.abs());
-                delta += tx * 1.1 * det.clamp(-1.0, 1.0) * tame;
-                if sp != 0.0 {
-                    let m = if sharpen_mask > 0.0 { smooth(sharpen_mask * 0.25, sharpen_mask * 0.25 + 0.15, det.abs()) } else { 1.0 };
-                    delta += sp * 1.3 * det.clamp(-0.8, 0.8) * m;
-                }
-            }
-            // local Noise: smooth (or, negative, boost) small-amplitude detail, keep edges
-            if l_noise != 0.0
-                && let Some(b) = &p.texture_blur
-            {
-                let det = l_pre - b.data[i];
-                delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
-            }
+            let l1 = if moved { log_lum(c) } else { l0 };
+            let base = p.base.data[i] + ev + (l1 - l0);
+            let delta = local_tone_delta(p, fp, &Px { i, x, y, l_pre, l0, l1, base }, &l);
             if delta != 0.0 {
                 let g = delta.exp2();
                 c = c.map(|v| v * g);
@@ -667,58 +760,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             if let Some(v) = vig {
                 let u = (vx + x as f32 + 0.5) / vw * 2.0 - 1.0;
                 let vv = (vy + y as f32 + 0.5) / vh * 2.0 - 1.0;
-                let sx = 1.0 + (aspect - 1.0) * v.aspect_mix;
-                let sy = 1.0 + (1.0 / aspect - 1.0) * v.aspect_mix;
-                let (ax, ay) = ((u * sx.max(1.0) / sx.max(sy)).abs(), (vv * sy.max(1.0) / sx.max(sy)).abs());
-                let dist = (ax.powf(v.power) + ay.powf(v.power)).powf(1.0 / v.power);
-                let t = smooth(v.start, v.start + v.width, dist);
-                if t > 0.0 {
-                    let lum = luminance_2020(d).clamp(0.0, 1.0);
-                    if v.amount < 0.0 {
-                        let mut f = 1.0 + v.amount * t;
-                        if v.style == VignetteStyle::HighlightPriority {
-                            f += (1.0 - f) * v.highlights * smooth(0.4, 1.0, lum);
-                        }
-                        if v.style == VignetteStyle::PaintOverlay {
-                            d = d.map(|c| c * (1.0 - (-v.amount) * t) + 0.0);
-                        } else {
-                            d = d.map(|c| c * f);
-                        }
-                    } else if hdr {
-                        // lighten towards SDR white; never pull HDR highlights down to it
-                        d = d.map(|c| c + (1.0 - c).max(0.0) * v.amount * t * 0.85);
-                    } else {
-                        d = d.map(|c| c + (1.0 - c) * v.amount * t * 0.85);
-                    }
-                }
+                d = vignette_px(v, d, (u, vv), aspect, hdr);
             }
 
             // --- gamut map to the output space (clip each channel); soft proofing maps into the
             // proof space first and shows that in the output space
-            let mut warn = None;
-            let mut r = match &fp.proof {
-                Some(pp) if pp.table.is_some() => {
-                    let (q, dist) = pp.table.as_ref().map_or((d, 0.0), |t| t.sample(d));
-                    if pp.dest_warning && dist > crate::output::PROOF_GAMUT_TOLERANCE {
-                        warn = Some(crate::output::PROOF_DEST_WARNING);
-                    }
-                    mul3(to_out, q)
-                }
-                Some(pp) => {
-                    let q0 = mul3(&pp.to_proof, d);
-                    let (q, t) = gamut_map_to(q0, pp.luma, peak);
-                    if pp.dest_warning && out_of_gamut(q0, t) {
-                        warn = Some(crate::output::PROOF_DEST_WARNING);
-                    }
-                    mul3(&pp.proof_to_out, q)
-                }
-                None => mul3(to_out, d),
-            };
-            let (mapped, t) = gamut_map_to(r, *out_luma, peak);
-            if fp.proof.as_ref().is_some_and(|pp| pp.display_warning) && warn.is_none() && out_of_gamut(r, t) {
-                warn = Some(crate::output::PROOF_DISPLAY_WARNING);
-            }
-            r = mapped;
+            let (r, warn) = to_output(fp, d, peak);
 
             // --- encode, curves, grain
             let mut e = if hdr {

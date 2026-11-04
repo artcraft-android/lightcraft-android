@@ -12,7 +12,9 @@ Third-party material
 This product bundles third-party material under its own licenses, listed below. The per-file
 list (author, source, license) is in assets/ATTRIBUTION.md.
 
-Inter (assets/fonts/Inter-*.ttf) — SIL Open Font License 1.1. See assets/fonts/OFL-Inter.txt.
+Inter (assets/fonts/Inter-*.ttf) — SIL Open Font License 1.1. The licence text is
+assets/fonts/OFL-Inter.txt in the source tree; release packages ship it beside NOTICE as
+OFL-Inter.txt (Windows installers include it in FONT-LICENCES.txt).
 Showcase photographs by Ansel Adams, Dorothea Lange and NASA (docs/images/) — public domain. See assets/ATTRIBUTION.md.
 
 crates/segment (lightcraft-segment) ports the SAM 3 model code of Hugging Face Transformers
