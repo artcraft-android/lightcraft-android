@@ -285,7 +285,9 @@ fun rememberGalleryPickers(vm: AppViewModel): GalleryPickers {
                 withApp.launch(android.content.Intent(android.content.Intent.ACTION_GET_CONTENT).setType("image/*").addCategory(android.content.Intent.CATEGORY_OPENABLE).setComponent(app.component))
             }.onFailure { vm.tell("${app.label} couldn't be opened") }
         },
-        browse = { runCatching { browse.launch(arrayOf("image/*")) } },
+        // Android types some raws (Canon's CR3, for one) as plain data, not images: the system's
+        // picker lists them only when it is asked for that too
+        browse = { runCatching { browse.launch(arrayOf("image/*", "application/octet-stream")) } },
     )
 }
 
