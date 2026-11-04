@@ -1,0 +1,6 @@
+* Edits on JPEGs now follow Lightroom: Exposure, Contrast, Highlights, Shadows, Whites, Blacks, Temp, Tint, Vibrance, Clarity and Dehaze
+* Crop keeps its place when you lock, swap, straighten or rotate it
+* Zoomed photos show under the bars, and the home tabs are centred
+* The Gallery's Browse lists CR3 and other raws
+* An Original export no longer becomes the default
+* LightCraft engine 0.18.0
