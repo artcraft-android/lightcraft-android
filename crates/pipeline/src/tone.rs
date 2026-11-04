@@ -418,6 +418,54 @@ impl ToneMap {
     }
 }
 
+/// Whites − and Blacks + on a rendered photo (issue 7). Lightroom's act like an exposure that
+/// follows the pixel's brightness, before the photo's curve: a colour keeps its hue and
+/// saturation as it dims or lifts, where toning each channel drifted a saturated one towards its
+/// primaries (a red's green and blue sank, a violet turned purple). A gain per [`LUT_N`] steps of
+/// scene EV around grey (as [`ToneMap::apply`]) that takes a grey there to where
+/// [`ToneMap::display`] puts it, so greys move exactly as before. Whites + and Blacks − stay in the
+/// curve ([`ToneMap::jpeg_hdr`]): spreading each channel matches Lightroom's colours better there.
+pub struct RangeGain {
+    lut: Vec<f32>,
+}
+
+impl RangeGain {
+    /// The gain for a rendered photo's Whites and Blacks (−100…100): `None` unless one of them
+    /// narrows the range (Whites < 0, Blacks > 0).
+    pub fn jpeg(whites: f64, blacks: f64) -> Option<RangeGain> {
+        let (w, b) = (whites.min(0.0), blacks.max(0.0));
+        if w == 0.0 && b == 0.0 {
+            return None;
+        }
+        let curve = ToneMap::display(w, b);
+        let white = JpegTone::white();
+        let lut = (0..LUT_N)
+            .map(|i| {
+                let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
+                // past display white the curve can't tell scene values apart: they keep white's gain
+                let s = (GREY * 2f32.powf(ev)).min(white);
+                JpegTone::to_scene(curve.apply(JpegTone::to_display(s))) / s
+            })
+            .collect();
+        Some(RangeGain { lut })
+    }
+
+    /// The table (`LUT_N` entries over `LUT_MIN_EV..LUT_MAX_EV`), for the GPU.
+    pub fn lut(&self) -> &[f32] {
+        &self.lut
+    }
+
+    /// The gain for a pixel of scene luminance `y` (held at the table's ends).
+    #[inline]
+    pub fn at(&self, y: f32) -> f32 {
+        let ev = if y > 0.0 { (y / GREY).log2() } else { LUT_MIN_EV };
+        let f = ((ev - LUT_MIN_EV) / (LUT_MAX_EV - LUT_MIN_EV)).clamp(0.0, 1.0) * (LUT_N - 1) as f32;
+        let i = (f as usize).min(LUT_N - 2);
+        let t = f - i as f32;
+        self.lut[i] + (self.lut[i + 1] - self.lut[i]) * t
+    }
+}
+
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -652,5 +700,26 @@ mod tests {
         assert!(ToneMap::new(0.0, 60.0, 0.0).apply(0.8) > base.apply(0.8));
         assert!(ToneMap::new(0.0, 0.0, -60.0).apply(0.01) < base.apply(0.01));
         assert!(ToneMap::new(0.0, 0.0, 60.0).apply(0.01) > base.apply(0.01));
+    }
+
+    // Issue 7: a rendered photo's Whites − / Blacks + act as a gain before its curve, and move its
+    // greys exactly where the curve with them did
+    #[test]
+    fn range_gain_moves_greys_as_the_curve_did() {
+        assert!(RangeGain::jpeg(0.0, 0.0).is_none() && RangeGain::jpeg(60.0, -40.0).is_none());
+        for (w, b) in [(-100.0, 0.0), (0.0, 100.0), (-50.0, 30.0)] {
+            let gain = RangeGain::jpeg(w, b).unwrap();
+            let (before, after) = (ToneMap::jpeg(w, b), ToneMap::jpeg(0.0, 0.0));
+            for ev in [-6.0f32, -3.0, -1.0, 0.0, 1.0, 2.0, 3.0] {
+                let s = GREY * ev.exp2();
+                let (want, got) = (before.apply(s), after.apply(s * gain.at(s)));
+                assert!((want - got).abs() < 0.004, "Whites {w} Blacks {b} at {ev} EV: {got} vs {want}");
+            }
+            // past white the gain holds: over-exposed pixels dim (or lift) as white does
+            assert_eq!(gain.at(JpegTone::white() * 4.0), gain.at(JpegTone::white() * 64.0));
+        }
+        // Whites − dims the highlights, Blacks + lifts the shadows
+        assert!(RangeGain::jpeg(-100.0, 0.0).unwrap().at(GREY * 8.0) < 0.9);
+        assert!(RangeGain::jpeg(0.0, 100.0).unwrap().at(GREY / 16.0) > 1.2);
     }
 }

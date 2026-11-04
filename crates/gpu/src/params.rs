@@ -23,6 +23,9 @@ const FIELDS: &[(&str, usize)] = &[
     ("AIR_PRE", 1),
     ("CON", 1),
     ("PER_CHANNEL", 1),
+    // a rendered photo's Whites − / Blacks + gain (`RangeGain`): on, and its table's offset in aux
+    ("RANGE", 1),
+    ("RANGE_OFF", 1),
     ("WIDE", 18),
     ("HL", 1),
     ("SH", 1),
@@ -151,7 +154,7 @@ pub struct Present {
 }
 
 /// The `finish` kernel's parameter block and auxiliary table (tone LUT | chroma curve | sRGB LUT | curve LUTs |
-/// mask terms) for `fp` with `masks` (their local adjustments' terms).
+/// mask terms | range gain) for `fp` with `masks` (their local adjustments' terms).
 pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Present) -> (Vec<u32>, Vec<f32>) {
     let mut aux: Vec<f32> = fp.tone.lut().to_vec();
     aux.extend_from_slice(fp.tone.chroma_lut());
@@ -167,6 +170,10 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     let mask_off = aux.len();
     for m in masks {
         aux.extend_from_slice(m);
+    }
+    let range_off = aux.len();
+    if let Some(g) = &fp.range_gain {
+        aux.extend_from_slice(g.lut());
     }
 
     let mut p = Block::new();
@@ -184,6 +191,8 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.f("AIR_PRE", fp.air_pre);
     p.f("CON", fp.con);
     p.b("PER_CHANNEL", fp.per_channel);
+    p.b("RANGE", fp.range_gain.is_some());
+    p.u("RANGE_OFF", range_off as u32);
     p.fs("WIDE", &lightcraft_pipeline::tone::wide().words());
     p.f("HL", fp.hl);
     p.f("SH", fp.sh);

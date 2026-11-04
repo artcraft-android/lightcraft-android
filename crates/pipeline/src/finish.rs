@@ -11,7 +11,7 @@ use crate::colorops::ColorOps;
 use crate::geometry::Frame;
 use crate::local::log_lum;
 use crate::output::{DeepImage, DeepSamples, OutputDepth, OutputSpace, OutputTrc};
-use crate::tone::{GREY, ToneMap, contrast_ev, wide};
+use crate::tone::{GREY, RangeGain, ToneMap, contrast_ev, wide};
 use crate::{Prepared, SourceInfo, for_rows};
 
 #[inline]
@@ -165,6 +165,8 @@ pub struct FinishParams {
     pub con: f32,
     /// Tone each channel in [`crate::tone::wide`] (a rendered photo) rather than luminance.
     pub per_channel: bool,
+    /// A rendered photo's Whites − / Blacks +, as a gain before its tone map ([`RangeGain`]).
+    pub range_gain: Option<RangeGain>,
     pub hl: f32,
     pub sh: f32,
     /// Highlights and Shadows fitted to the photo ([`hs_adapt`]); [`HS_NEUTRAL`] until set.
@@ -239,6 +241,7 @@ impl FinishParams {
             // `ToneMap::new` (a raw without a camera curve) carries its own contrast
             con: if info.raw && info.camera_tone.is_none() { 0.0 } else { (s.light.contrast / 100.0) as f32 },
             per_channel: !info.raw,
+            range_gain: if info.raw { None } else { RangeGain::jpeg(s.light.whites, s.light.blacks) },
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
             hs_adapt: HS_NEUTRAL,
@@ -321,7 +324,8 @@ pub fn base_tone(s: &DevelopSettings, info: &SourceInfo, peak: f32) -> ToneMap {
             Some(curve) => ToneMap::camera_hdr(curve, l.whites, l.blacks, peak),
             None if info.raw => ToneMap::hdr(l.contrast, l.whites, l.blacks, peak),
             // a rendered photo was expanded onto the scene scale (`local::wb_gain`): back with its curve
-            None => ToneMap::jpeg_hdr(l.whites, l.blacks, peak),
+            // (Whites − and Blacks + act before it: `FinishParams::range_gain`)
+            None => ToneMap::jpeg_hdr(l.whites.max(0.0), l.blacks.min(0.0), peak),
         },
     }
 }
@@ -590,6 +594,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             if con != 0.0 {
                 let w = wide();
                 c = w.from_wide(w.to_wide(c).map(|v| if v > 0.0 { v * contrast_ev(con, (v / GREY).log2()).exp2() } else { v }));
+            }
+
+            // --- a rendered photo's Whites − / Blacks +: an exposure by the pixel's brightness
+            if let Some(g) = &fp.range_gain {
+                let k = g.at(luminance_2020(c));
+                c = c.map(|v| v * k);
             }
 
             // --- tone map: on each channel of the wide space for a rendered photo (its expansion's

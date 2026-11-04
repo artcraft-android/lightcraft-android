@@ -18,6 +18,20 @@ fn tone_apply(y: f32) -> f32 {
     return v;
 }
 
+// `lightcraft_pipeline::tone::RangeGain::at`: the gain of a rendered photo's Whites − / Blacks + for scene
+// luminance `y`, from its table at `RANGE_OFF` in `aux`.
+fn range_gain(y: f32) -> f32 {
+    var ev = TONE_MIN_EV;
+    if (y > 0.0) {
+        ev = log2(y / GREY);
+    }
+    let f = clamp((ev - TONE_MIN_EV) / (TONE_MAX_EV - TONE_MIN_EV), 0.0, 1.0) * f32(TONE_N - 1u);
+    let i = min(u32(f), TONE_N - 2u);
+    let t = f - f32(i);
+    let o = pu(F_RANGE_OFF);
+    return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
+}
+
 // `lightcraft_pipeline::tone::wide`: linear Rec.2020 → the wide space (`off` 0) or back (`off` 9).
 fn wide_m(off: u32, c: vec3<f32>) -> vec3<f32> {
     let o = F_WIDE + off;
@@ -501,6 +515,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (con != 0.0) {
         let w = wide_m(0u, c);
         c = wide_m(9u, vec3<f32>(contrast_px(con, w.x), contrast_px(con, w.y), contrast_px(con, w.z)));
+    }
+
+    // --- a rendered photo's Whites − / Blacks +: an exposure by the pixel's brightness
+    if (pu(F_RANGE) != 0u) {
+        c = c * range_gain(lum2020(c));
     }
 
     // --- tone map: on each channel of the wide space for a rendered photo, on luminance with the
