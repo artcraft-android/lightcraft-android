@@ -423,7 +423,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var exportChoice by mutableStateOf(loadExportChoice())
         private set
 
-    private fun loadExportChoice(): ExportChoice = ExportChoice.fromPrefs(prefs.getString("export", null))
+    private fun loadExportChoice(): ExportChoice =
+        // (an Original remembered by an earlier version starts from the default file type instead, see export)
+        ExportChoice.fromPrefs(prefs.getString("export", null)).let { if (it.format == "original") it.copy(format = ExportChoice().format) else it }
 
     /** [ed]'s photo exported small as [choice] asks (its watermark, say), for a preview (null: it failed). */
     suspend fun exportPreview(ed: EditorState, choice: ExportChoice): ImageBitmap? {
@@ -3479,8 +3481,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val e = engine ?: return
         if (ed.exporting) return
         ed.exporting = true
-        exportChoice = choice
-        prefs.edit().putString("export", choice.prefs()).apply()
+        // an Original export is a one-off: the next export and the quick shares start from the last
+        // rendered file type again (a remembered Original quietly exported unedited photos, #14)
+        val remembered = if (choice.format == "original") choice.copy(format = exportChoice.format.takeIf { it != "original" } ?: ExportChoice().format) else choice
+        exportChoice = remembered
+        prefs.edit().putString("export", remembered.prefs()).apply()
         val options = choice.json()
         viewModelScope.launch {
             val result = runCatching {
