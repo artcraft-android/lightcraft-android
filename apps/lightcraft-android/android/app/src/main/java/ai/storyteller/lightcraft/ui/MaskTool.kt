@@ -295,7 +295,9 @@ fun MaskColumn(vm: AppViewModel, ed: EditorState, modifier: Modifier) {
                 .background(Lc.masksColumn)
                 .heightIn(max = 420.dp)
                 .verticalScroll(rememberScrollState())
-                .padding(top = 15.6.dp, bottom = 7.8.dp),
+                // with no mask under it the + is the whole column: equal gaps above and below it
+                // keep it on the column's centre instead of 7.8 dp low
+                .padding(top = 15.6.dp, bottom = if (ed.masks.isEmpty()) 15.6.dp else 7.8.dp),
         ) {
             Row(Modifier.padding(start = 16.dp).height(44.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(
