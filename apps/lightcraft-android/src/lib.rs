@@ -421,6 +421,19 @@ pub struct ImportReport {
     pub failed: Vec<String>,
 }
 
+/// What a folder synchronization did.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct FolderSync {
+    /// Ids of the photos found in the folder that the library did not have.
+    pub added: Vec<u64>,
+    /// Ids of the photos whose edits and metadata were read again from a sidecar that changed.
+    pub updated: Vec<u64>,
+    /// Sidecars looked at (new or changed since the last synchronization, of those that exist).
+    pub checked: u32,
+    /// `path: why` for each file or sidecar that could not be used.
+    pub failed: Vec<String>,
+}
+
 /// The engine version (`0.4.0`).
 #[uniffi::export]
 pub fn engine_version() -> String {
@@ -447,6 +460,10 @@ pub struct MobileSession {
     /// library's own steps (a delete, a restore, an album) stay out of its reach, as in the
     /// reference app.
     edit_floor: Mutex<Option<usize>>,
+    /// The sidecars [`MobileSession::sync_folder`] has read, by path: (modified time, size) when it
+    /// did. Not the time of the last synchronization: a sync tool keeps the modified time of the
+    /// device that wrote a file, so a sidecar can arrive "older" than the last synchronization.
+    sidecars_seen: Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::SystemTime, u64)>>,
 }
 
 struct ViewStages {
@@ -457,7 +474,7 @@ struct ViewStages {
 
 impl MobileSession {
     fn wrap(session: Session) -> Self {
-        MobileSession { session: Mutex::new(session), view_stages: Mutex::new(None), edit_floor: Mutex::new(None) }
+        MobileSession { session: Mutex::new(session), view_stages: Mutex::new(None), edit_floor: Mutex::new(None), sidecars_seen: Mutex::default() }
     }
 
     fn lock(&self) -> MutexGuard<'_, Session> {
@@ -492,6 +509,28 @@ impl MobileSession {
     /// was opened.
     fn may_undo(&self, s: &Session) -> bool {
         !s.undo.is_empty() && self.floor().is_none_or(|f| s.undo_dropped + s.undo.len() > f)
+    }
+
+    /// One pass of the watched folder's scan over its photos, subfolders included (the engine's own
+    /// listing is of the folder's top level) → (ids imported, whether files wait for the next
+    /// pass). A file is added once its size has stayed the same between two scans, so one still
+    /// being copied waits.
+    fn scan_folder(&self, folder: &str) -> Result<(Vec<u64>, bool), MobileError> {
+        let files = lightcraft_engine::import::expand(&[folder.to_string()], None);
+        let listing: Vec<Value> = files.iter().filter_map(|f| Some(json!([f, std::fs::metadata(f).ok()?.len()]))).collect();
+        let r = self.run("library.autoImportScan", json!({"listing": listing}))?;
+        let imported = r["imported"].as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+        let s = self.lock();
+        let known: std::collections::HashSet<&str> = s
+            .catalog
+            .photos()
+            .filter_map(|p| match &p.source {
+                catalog::Source::File { path } => Some(path.as_str()),
+                catalog::Source::Demo { .. } => None,
+            })
+            .collect();
+        let waiting = files.iter().any(|f| !known.contains(f.as_str()) && s.auto_import_seen.get(f) != Some(&u64::MAX));
+        Ok((imported, waiting))
     }
 }
 
@@ -921,6 +960,56 @@ impl MobileSession {
                 })
                 .unwrap_or_default(),
         })
+    }
+
+    /// Bring the library up to date with a folder it edits in place (the app's folder library):
+    /// photos that appeared in `folder` (or below it) are added, and the edits and metadata of
+    /// photos in it are read again from their XMP sidecars when a sidecar is new or changed since
+    /// the last call (another app, or a sync tool, wrote it). A sidecar that says what the library
+    /// already has changes nothing, and what is read is not written back, so this never rewrites
+    /// a sidecar. Needs `library.autoImport` pointed at `folder` (the scan works from it). Blocks
+    /// while files that just appeared settle (about a second), so call it off the main thread.
+    pub fn sync_folder(&self, folder: String) -> Result<FolderSync, MobileError> {
+        let (added, waiting) = self.scan_folder(&folder)?;
+        let mut report = FolderSync { added, ..Default::default() };
+        if waiting {
+            // files seen for the first time: give them a moment instead of waiting for the next launch
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            report.added.extend(self.scan_folder(&folder)?.0);
+        }
+        let root = std::path::Path::new(&folder);
+        let stat = |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        let mut changed = Vec::new();
+        {
+            let s = self.lock();
+            let mut seen = self.sidecars_seen.lock().unwrap_or_else(PoisonError::into_inner);
+            for (id, sidecar) in s.existing_sidecars() {
+                let under = s.catalog.photo(id).is_some_and(|p| matches!(&p.source, catalog::Source::File { path } if std::path::Path::new(path).starts_with(root)));
+                let now = stat(&sidecar);
+                if under && now.is_some() && seen.get(&sidecar) != now.as_ref() {
+                    if let Some(now) = now {
+                        seen.insert(sidecar, now);
+                    }
+                    changed.push(id);
+                }
+            }
+        }
+        report.checked = u32::try_from(changed.len()).unwrap_or(u32::MAX);
+        if changed.is_empty() {
+            return Ok(report);
+        }
+        // the command acts on the selection, whatever ids it is given and even when it is empty: borrow it
+        let selection = lightcraft_engine::Selection { ids: changed.clone(), active: changed.first().copied() };
+        let kept = std::mem::replace(&mut self.lock().selection, selection);
+        let r = self.run("photo.readMetadataFromFile", json!({"ids": changed.iter().map(|id| id.0).collect::<Vec<_>>(), "onlyChanged": true}));
+        self.lock().selection = kept;
+        let r = r?;
+        report.updated = r["read"].as_array().map(|a| a.iter().filter_map(|e| e["id"].as_u64()).collect()).unwrap_or_default();
+        report.failed = r["failed"]
+            .as_array()
+            .map(|a| a.iter().map(|e| format!("{}: {}", e["id"], e["error"].as_str().unwrap_or("unreadable"))).collect())
+            .unwrap_or_default();
+        Ok(report)
     }
 
     /// Take photo `id` out of the library for good, and delete its file when the library holds it

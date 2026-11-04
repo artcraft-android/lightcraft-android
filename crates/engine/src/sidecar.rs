@@ -821,6 +821,19 @@ impl Session {
         Ok(SidecarSaved { path, merged, backup })
     }
 
+    /// Every catalogued file's existing sidecar, the one [`Session::read_sidecar_op`] would read
+    /// (photos without one are left out). Worked out for all photos at once: asking
+    /// [`Session::sidecar_naming`] photo by photo is quadratic in the library's size.
+    pub fn existing_sidecars(&self) -> Vec<(PhotoId, PathBuf)> {
+        let ids: Vec<PhotoId> = self.catalog.photos().map(|p| p.id).collect();
+        let owners = StemOwners::among(&self.catalog, &ids);
+        self.catalog
+            .photos()
+            .filter(|p| p.copy_of.is_none())
+            .filter_map(|p| Some((p.id, find_sidecar(file_path(p)?, owners.naming(p, self.xmp.naming))?)))
+            .collect()
+    }
+
     /// The op that applies a photo's sidecar (or embedded XMP) to the catalog, if there is one.
     pub fn read_sidecar_op(&self, id: PhotoId) -> Result<Option<(Op, PathBuf)>> {
         self.read_sidecar_op_with_warnings(id).map(|result| result.map(|(op, from, _)| (op, from)))

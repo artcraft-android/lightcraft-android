@@ -1,7 +1,15 @@
 package ai.storyteller.lightcraft.ui
 
 import ai.storyteller.lightcraft.core.engineVersion
+import ai.storyteller.lightcraft.engine.LibraryFolder
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -41,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
@@ -48,6 +57,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import java.util.Locale
 import org.json.JSONObject
 
@@ -197,9 +207,16 @@ fun PreferencesPage(vm: AppViewModel, onBack: () -> Unit) {
         ImportOptionsPage(vm) { sub = null }
         return
     }
+    if (sub == "folder") {
+        FolderLibraryPage(vm) { sub = null }
+        return
+    }
     DrawerPage("Preferences", onBack) {
         // the reference's rows that open pages come first
-        PageGroup { PageRow("Photo import options", null) { sub = "import" } }
+        PageGroup {
+            PageRow("Photo import options", null) { sub = "import" }
+            PageRow("Library folder", if (vm.folderLibrary.enabled) "On" else "Off") { sub = "folder" }
+        }
         gpu?.let { on ->
             PageGroup {
                 PageHeading("Rendering")
@@ -209,6 +226,92 @@ fun PreferencesPage(vm: AppViewModel, onBack: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+/**
+ * Library folder: edit the photos of a folder where they are, instead of in LightCraft's own copy.
+ * The edits are saved in XMP sidecars next to the photos, which other apps and sync tools see.
+ * Needs "All files access" (the system's page for it opens from the switch) and a folder.
+ */
+@Composable
+private fun FolderLibraryPage(vm: AppViewModel, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val f = vm.folderLibrary
+    // turning on takes up to two steps away from the page (the permission, the folder): the switch carries on after each
+    var turningOn by remember { mutableStateOf(false) }
+    var allowed by remember { mutableStateOf(LibraryFolder.allowed()) }
+    val carryOn = {
+        when {
+            !LibraryFolder.allowed() -> Unit
+            vm.folderLibrary.folder == null -> Unit
+            else -> {
+                turningOn = false
+                vm.setFolderLibrary(true)
+            }
+        }
+    }
+    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        // a folder picked from the Folder row while the switch is off is only remembered
+        if (uri != null && vm.chooseLibraryFolder(uri) && turningOn) carryOn() else turningOn = false
+    }
+    // back from the system's page for All files access
+    LifecycleResumeEffect(Unit) {
+        allowed = LibraryFolder.allowed()
+        if (turningOn) {
+            // not given: the switch goes back off
+            if (!allowed) turningOn = false else if (vm.folderLibrary.folder == null) pickFolder.launch(null) else carryOn()
+        }
+        onPauseOrDispose {}
+    }
+    DrawerPage("Library folder", onBack) {
+        PageGroup {
+            PageSwitch(
+                "Edit photos in place in a folder",
+                "Photos stay in the folder and LightCraft saves its edits in XMP sidecars next to them, where other apps and sync tools see them. " +
+                    "Turning it off keeps the photos in the library and deletes nothing.",
+                f.enabled || turningOn,
+            ) { on ->
+                when {
+                    !on -> {
+                        turningOn = false
+                        vm.setFolderLibrary(false)
+                    }
+                    !LibraryFolder.supported -> vm.tell("Editing in place needs Android 11 or later")
+                    !allowed -> {
+                        turningOn = true
+                        openAllFilesAccess(context)
+                    }
+                    f.folder == null -> {
+                        turningOn = true
+                        pickFolder.launch(null)
+                    }
+                    else -> vm.setFolderLibrary(true)
+                }
+            }
+        }
+        PageGroup {
+            PageRow("Folder", f.folder?.let { it.substringAfterLast('/') } ?: "Choose") { pickFolder.launch(null) }
+            f.folder?.let { Text(it, color = pageNote, fontFamily = Inter, fontSize = 13.sp, lineHeight = 16.sp, modifier = Modifier.fillMaxWidth().padding(start = 13.7.dp, end = 12.7.dp, bottom = 12.dp)) }
+            if (f.enabled) PageRow("Synchronize folder", if (vm.folderSyncing) "Working…" else null) { vm.syncFolder(manual = true) }
+        }
+        val note = when {
+            f.enabled && !allowed -> "LightCraft no longer has All files access, so the folder isn't read. Turn it back on in the system's settings."
+            f.enabled && f.syncedAt > 0L -> "Synchronized ${DateUtils.getRelativeTimeSpanString(f.syncedAt, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS)}: ${f.result.orEmpty()}"
+            f.enabled -> f.result
+            else -> "Synchronizing adds the folder's new photos and reads edits other apps saved to sidecars. It runs whenever LightCraft opens."
+        }
+        note?.let {
+            Text(it, color = pageNote, fontFamily = Inter, fontSize = 13.sp, lineHeight = 16.sp, modifier = Modifier.padding(horizontal = 26.3.dp, vertical = 10.dp).widthIn(max = 474.dp))
+        }
+    }
+}
+
+/** The system's page where the person gives LightCraft "All files access" (this app's own page, else the list of apps). */
+private fun openAllFilesAccess(context: Context) {
+    val own = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.fromParts("package", context.packageName, null))
+    runCatching { context.startActivity(own) }.onFailure {
+        runCatching { context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
     }
 }
 

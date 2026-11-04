@@ -649,3 +649,146 @@ fn a_view_window_is_that_part_of_the_whole_frame() {
     assert_eq!((edge.width, edge.height), (50, 40));
     assert!(matches!(s.render_view_window(u64::MAX, w, h, 0, 0, 10, 10, false, None), Err(MobileError::NoPhoto(_))));
 }
+
+/// The folder library: a photo file from the demo library (the `n`th photo, so each file differs).
+fn demo_file(dir: &std::path::Path, name: &str, n: usize) -> std::path::PathBuf {
+    let demo = MobileSession::demo();
+    let jpeg = demo.export(demo.photos()[n].id, r#"{"format": "jpeg", "longEdge": 64}"#.into()).unwrap();
+    let file = dir.join(name);
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(&file, &jpeg.bytes).unwrap();
+    file
+}
+
+/// A library on disk that writes sidecars and watches `folder`, as the app sets it up.
+fn folder_library(tag: &str, folder: &std::path::Path) -> Arc<MobileSession> {
+    let lib = temp_dir(tag).join("library").to_string_lossy().to_string();
+    let s = MobileSession::open(lib, false).unwrap();
+    s.execute("library.xmpPreferences".into(), r#"{"autoWrite": true}"#.into()).unwrap();
+    s.execute("library.autoImport".into(), json!({"folder": folder, "copy": false}).to_string()).unwrap();
+    s
+}
+
+fn exposure_of(s: &MobileSession, name: &str) -> f64 {
+    let id = s.photos().into_iter().find(|p| p.file_name == name).unwrap().id;
+    s.open_photo(id).unwrap();
+    let v = control(s, "light.exposure").value;
+    s.close_editor();
+    v
+}
+
+#[test]
+fn an_in_place_import_leaves_the_files_and_reads_their_sidecars() {
+    let dir = temp_dir("inplace");
+    let folder = dir.join("Camera");
+    let (a, b) = (demo_file(&folder, "a.jpg", 0), demo_file(&folder.join("trip"), "b.jpg", 1));
+    // a's sidecar comes from another library that edited it
+    {
+        let other = folder_library("inplace-other", &folder);
+        other.import(vec![a.to_string_lossy().to_string()], false, false).unwrap();
+        let id = other.photos()[0].id;
+        other.open_photo(id).unwrap();
+        other.set_control("light.exposure".into(), 0.75).unwrap();
+    }
+    assert!(folder.join("a.xmp").is_file(), "the other library wrote a sidecar next to the photo");
+    let s = folder_library("inplace-lib", &folder);
+    let report = s.import(vec![folder.to_string_lossy().to_string()], false, false).unwrap();
+    assert_eq!(report.imported.len(), 2, "subfolders too: {report:?}");
+    assert!(a.is_file() && b.is_file(), "nothing moved");
+    assert!(!dir.join("inplace-lib").join("library").join("Originals").exists(), "and nothing copied into the library");
+    assert!((exposure_of(&s, "a.jpg") - 0.75).abs() < 1e-6, "the sidecar's lc:settings");
+    assert!(exposure_of(&s, "b.jpg").abs() < 1e-6, "no sidecar: untouched");
+}
+
+#[test]
+fn with_auto_write_an_edit_goes_to_the_sidecar_next_to_the_photo() {
+    let dir = temp_dir("autowrite");
+    let folder = dir.join("Camera");
+    let a = demo_file(&folder, "a.jpg", 0);
+    let s = folder_library("autowrite-lib", &folder);
+    let id = s.import(vec![a.to_string_lossy().to_string()], false, false).unwrap().imported[0];
+    s.open_photo(id).unwrap();
+    s.set_control("light.exposure".into(), 0.5).unwrap();
+    let xmp = std::fs::read_to_string(folder.join("a.xmp")).unwrap();
+    assert!(xmp.contains("lc:settings"), "{xmp}");
+    // and another library reading it gets the edit
+    let other = folder_library("autowrite-other", &folder);
+    other.import(vec![a.to_string_lossy().to_string()], false, false).unwrap();
+    assert!((exposure_of(&other, "a.jpg") - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn a_sidecar_changed_from_outside_is_read_by_the_sync_and_an_unchanged_one_is_not() {
+    let dir = temp_dir("sync");
+    let folder = dir.join("Camera");
+    let a = demo_file(&folder, "a.jpg", 0);
+    let b = demo_file(&folder, "b.jpg", 1);
+    let s = folder_library("sync-lib", &folder);
+    let first = s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    assert_eq!(first.added.len(), 2, "{first:?}");
+    assert!(first.updated.is_empty(), "no sidecar yet: {first:?}");
+    // an edit here writes a.xmp; the sync looks at it once and finds nothing new in it
+    let a_id = s.photos().into_iter().find(|p| p.file_name == "a.jpg").unwrap().id;
+    s.open_photo(a_id).unwrap();
+    s.set_control("light.exposure".into(), 0.5).unwrap();
+    s.close_editor();
+    let depth = s.history_depth();
+    let again = s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    assert_eq!((again.checked, again.updated.len(), again.added.len()), (1, 0, 0), "{again:?}");
+    assert_eq!(s.history_depth(), depth, "nothing read: no undo step");
+    let none = s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    assert_eq!((none.checked, none.updated.len()), (0, 0), "an unchanged sidecar is not looked at again: {none:?}");
+    // another app edits a.xmp (lc:settings from another library) and b.xmp (a foreign crs: edit)
+    {
+        let other = folder_library("sync-other", &folder);
+        other.import(vec![a.to_string_lossy().to_string()], false, false).unwrap();
+        let id = other.photos()[0].id;
+        other.open_photo(id).unwrap();
+        other.set_control("light.exposure".into(), -0.25).unwrap();
+    }
+    std::fs::write(
+        b.with_extension("xmp"),
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmp:Rating="4" crs:Exposure2012="+1.10"/>
+</rdf:RDF></x:xmpmeta>"#,
+    )
+    .unwrap();
+    let synced = s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    assert_eq!(synced.updated.len(), 2, "{synced:?}");
+    assert!((exposure_of(&s, "a.jpg") + 0.25).abs() < 1e-6, "lc:settings");
+    assert!((exposure_of(&s, "b.jpg") - 1.1).abs() < 1e-6, "crs:Exposure2012");
+    assert_eq!(s.photos().into_iter().find(|p| p.file_name == "b.jpg").unwrap().rating, 4);
+    // the change is one undo step, and syncing again finds nothing more
+    assert_eq!(s.history_depth(), depth + 1);
+    let quiet = s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    assert!(quiet.updated.is_empty() && quiet.added.is_empty(), "{quiet:?}");
+}
+
+/// A sidecar another app or a sync tool just wrote must not be rewritten by reading it: the sync
+/// tool would see a new version, hand it back, and the two would keep passing it to each other.
+#[test]
+fn reading_a_sidecar_in_the_sync_does_not_write_it_back() {
+    let dir = temp_dir("pingpong");
+    let folder = dir.join("Camera");
+    let a = demo_file(&folder, "a.jpg", 0);
+    let s = folder_library("pingpong-lib", &folder);
+    s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    // a foreign sidecar with something of its own in it, and a rating different from the library's
+    let foreign = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmp:Rating="2" crs:Exposure2012="+0.65"/>
+</rdf:RDF></x:xmpmeta>"#;
+    let sidecar = a.with_extension("xmp");
+    std::fs::write(&sidecar, foreign).unwrap();
+    let mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let synced = s.sync_folder(folder.to_string_lossy().to_string()).unwrap();
+    assert_eq!(synced.updated.len(), 1, "{synced:?}");
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), foreign, "byte for byte what the other app wrote");
+    assert_eq!(std::fs::metadata(&sidecar).unwrap().modified().unwrap(), mtime);
+    // while an edit made here is written, as before
+    let id = s.photos()[0].id;
+    s.open_photo(id).unwrap();
+    s.set_control("light.exposure".into(), 0.1).unwrap();
+    assert_ne!(std::fs::read_to_string(&sidecar).unwrap(), foreign);
+}
