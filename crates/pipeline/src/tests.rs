@@ -79,6 +79,42 @@ fn directional_sliders() {
 /// patch minimum, so near the boundary it credited the dark pixels with the bright side's veil and
 /// the subtraction went past zero (#2504). The veil credited to a pixel is now bounded by its own
 /// minimum channel, so a uniform dark region renders uniformly under dehaze.
+// Issue 7: Lightroom's Clarity + reaches beyond the subject's own edges: a dim subject on a black ground lifts
+// (it is far brighter than its wide surround), while a light patch on mid grey keeps its highlights
+#[test]
+fn clarity_lifts_a_subject_on_a_black_ground_and_spares_highlights() {
+    let lum_in = |img: &lightcraft_raster::Rgba8, x0: usize, x1: usize, y0: usize, y1: usize| {
+        let (mut sum, mut n) = (0.0, 0.0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = img.get(x, y);
+                sum += 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let shot = |src: &Rgb32f, clarity: f64| {
+        let mut s = DevelopSettings::default();
+        controls::set(&mut s, "effects.clarity", clarity);
+        render(src, &SourceInfo::default(), &s, &RenderRequest::fit(240, 160)).image
+    };
+    // a dim square, a little textured, on black
+    let subject = Rgb32f::from_fn(240, 160, |x, y| {
+        let inside = (80..160).contains(&x) && (40..120).contains(&y);
+        [if inside { 0.03 * (1.0 + 0.1 * ((x * 7 + y * 3) % 5) as f32 / 4.0) } else { 0.0 }; 3]
+    });
+    let (plain, clear) = (shot(&subject, 0.0), shot(&subject, 100.0));
+    let (a, b) = (lum_in(&plain, 95, 145, 55, 105), lum_in(&clear, 95, 145, 55, 105));
+    assert!(b > a + 10.0, "subject {a} -> {b}");
+    assert!(lum_in(&clear, 0, 40, 0, 30) < 3.0, "the black ground stays black");
+    // a light square on mid grey: the highlights barely move
+    let light = Rgb32f::from_fn(240, 160, |x, y| [if (80..160).contains(&x) && (40..120).contains(&y) { 0.7 } else { 0.18 }; 3]);
+    let (plain, clear) = (shot(&light, 0.0), shot(&light, 100.0));
+    let (a, b) = (lum_in(&plain, 95, 145, 55, 105), lum_in(&clear, 95, 145, 55, 105));
+    assert!((b - a).abs() < 6.0, "light square {a} -> {b}");
+}
+
 #[test]
 fn dehaze_does_not_crush_dark_regions_next_to_bright_ones() {
     // a dark field against a bright hazy sky; the blur bleeds the sky's dark channel ~10 px into

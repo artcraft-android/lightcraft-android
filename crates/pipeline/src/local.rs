@@ -688,7 +688,20 @@ pub(crate) fn prepare(
     };
     let ev = s.light.exposure as f32;
     let masks = timed("masks", || masks::evaluate(&s.masks, frame, img.width, img.height, &img, &log_l, ev, mattes));
-    Prepared { img, log_l, base, clarity_blur, texture_blur, dark, chroma_blur, air, masks, px_per_long, hs_adapt: crate::finish::HS_NEUTRAL }
+    Prepared {
+        img,
+        log_l,
+        base,
+        clarity_blur,
+        texture_blur,
+        dark,
+        chroma_blur,
+        air,
+        masks,
+        px_per_long,
+        hs_adapt: crate::finish::HS_NEUTRAL,
+        surround: None,
+    }
 }
 
 /// The airlight of the whole output frame, estimated on a small render of it (`proxy_w` px wide):
@@ -698,6 +711,25 @@ pub(crate) fn frame_airlight(src: &Rgb32f, info: &SourceInfo, s: &DevelopSetting
     white_balance(&mut img, info, s);
     let sigma = (0.02 * frame.px_per_long(proxy_w)).max(1.0) as f32;
     airlight(&gaussian(&img.map(dark_of), sigma))
+}
+
+/// Long edge (px) of the whole-frame proxy Clarity's wide surround ([`frame_surround`]) is taken from.
+pub const SURROUND_EDGE: usize = 160;
+/// Radius of Clarity's wide surround, as a fraction of the long edge.
+pub const SURROUND_SIGMA: f32 = 0.16;
+/// The darkest log luminance (EV below grey) the surround and the pixel it is compared with count.
+pub const SURROUND_FLOOR: f32 = -12.0;
+
+/// Clarity's wide surround (issue 7): Lightroom's Clarity + also lifts or deepens a pixel against a wide, plain
+/// (not edge-aware) blur of its frame, so a subject on a black ground brightens and a dark patch between light
+/// lines darkens. The log luminance (floored at [`SURROUND_FLOOR`]) of a `proxy_w × proxy_h` copy of the whole
+/// frame, white-balanced, before exposure, blurred over [`SURROUND_SIGMA`] of the long edge: a window or tile of a
+/// render reads the same surround as the whole of it.
+pub(crate) fn frame_surround(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, proxy_w: usize, proxy_h: usize) -> Plane {
+    let mut img = Rgb32f::clone(&frame_proxy(src, frame, proxy_w, proxy_h));
+    white_balance(&mut img, info, s);
+    let sigma = (SURROUND_SIGMA * frame.px_per_long(proxy_w) as f32).max(1.0);
+    gaussian(&img.map(|c| log_lum(c).max(SURROUND_FLOOR)), sigma)
 }
 
 /// How many airlight proxies [`frame_proxy`] keeps (one per photo and frame being zoomed into; each ≤ 1.8 MB).

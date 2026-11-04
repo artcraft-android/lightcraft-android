@@ -221,6 +221,8 @@ pub(crate) struct Prepared {
     pub px_per_long: f64,
     /// See [`Plan::hs_adapt`].
     pub hs_adapt: [f32; 4],
+    /// See [`Plan::surround`].
+    pub surround: Option<Arc<Plane>>,
 }
 
 /// Output size for a source of `src_w × src_h` under `s`, fitting `max_w × max_h`.
@@ -393,6 +395,8 @@ pub struct Plan<'a> {
     pub mattes: Option<Arc<masks::Mattes>>,
     /// Highlights and Shadows fitted to the whole photo ([`finish::hs_adapt`]).
     pub hs_adapt: [f32; 4],
+    /// Clarity's wide surround of the whole frame ([`local::frame_surround`]), when Clarity is used.
+    pub surround: Option<Arc<Plane>>,
 }
 
 /// Long edge of the small render a windowed render estimates the whole frame's airlight from.
@@ -432,6 +436,12 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     let (full_w, full_h) = frame.fit(req.max_w, req.max_h);
     // sizes and scale are those of the whole output; a window only narrows what is drawn
     let px_per_long = frame.px_per_long(full_w);
+    // Clarity reads a wide surround of the whole frame (a window sees only part of it)
+    let surround = (s.section_enabled("effects") && (s.effects.clarity != 0.0 || s.masks.iter().any(|m| m.adjust.clarity != 0.0))).then(|| {
+        let k = (local::SURROUND_EDGE as f64 / full_w.max(full_h) as f64).min(1.0);
+        let (pw, ph) = (((full_w as f64 * k).round() as usize).max(1), ((full_h as f64 * k).round() as usize).max(1));
+        Arc::new(local::frame_surround(src, info, s, &frame, pw, ph))
+    });
     let mut fixed_air = None;
     let mut keep = None;
     let (frame, w, h) = match req.window {
@@ -491,6 +501,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         keep,
         mattes: info.mattes.clone(),
         hs_adapt,
+        surround,
     }
 }
 
@@ -656,6 +667,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         prep.air = a;
     }
     prep.hs_adapt = plan.hs_adapt;
+    prep.surround = plan.surround.clone();
     lap("prepare", &mut t);
     if let Some((a, c)) = shared {
         c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), planes });

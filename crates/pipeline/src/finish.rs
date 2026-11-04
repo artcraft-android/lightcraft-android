@@ -5,11 +5,12 @@ use lightcraft_color::spline::{Lut1, MonotoneCurve};
 use lightcraft_color::transfer::linear_to_srgb;
 use lightcraft_develop::{DevelopSettings, LocalAdjustments, Process, ToneCurve, VignetteStyle};
 use lightcraft_geom::Point;
-use lightcraft_raster::Rgba8;
+use lightcraft_raster::{Plane, Rgba8};
+use std::sync::Arc;
 
 use crate::colorops::ColorOps;
 use crate::geometry::Frame;
-use crate::local::log_lum;
+use crate::local::{SURROUND_FLOOR, log_lum};
 use crate::output::{DeepImage, DeepSamples, OutputDepth, OutputSpace, OutputTrc};
 use crate::tone::{GREY, RangeGain, ToneMap, contrast_ev, wide};
 use crate::{Prepared, SourceInfo, for_rows};
@@ -171,6 +172,8 @@ pub struct FinishParams {
     pub sh: f32,
     /// Highlights and Shadows fitted to the photo ([`hs_adapt`]); [`HS_NEUTRAL`] until set.
     pub hs_adapt: [f32; 4],
+    /// Clarity's wide surround of the whole frame ([`crate::local::frame_surround`]), when set.
+    pub surround: Option<Arc<Plane>>,
     pub clar: f32,
     pub tex: f32,
     pub dehaze: f32,
@@ -245,6 +248,7 @@ impl FinishParams {
             hl: (s.light.highlights / 100.0) as f32,
             sh: (s.light.shadows / 100.0) as f32,
             hs_adapt: HS_NEUTRAL,
+            surround: None,
             clar,
             tex,
             dehaze,
@@ -273,6 +277,20 @@ impl FinishParams {
         self.out_trc = OutputTrc::Srgb;
         self.proof = proof.map(|pr| pr.params_display(d));
     }
+}
+
+/// [`crate::local::frame_surround`] at output position `(x, y)` (pixels) of the whole `vw × vh` frame, bilinear.
+fn surround_at(g: &Plane, x: f32, y: f32, vw: f32, vh: f32) -> f32 {
+    let (gw, gh) = (g.width.max(1), g.height.max(1));
+    let gx = (x / vw * gw as f32 - 0.5).clamp(0.0, (gw - 1) as f32);
+    let gy = (y / vh * gh as f32 - 0.5).clamp(0.0, (gh - 1) as f32);
+    let (x0, y0) = (gx as usize, gy as usize);
+    let (x1, y1) = ((x0 + 1).min(gw - 1), (y0 + 1).min(gh - 1));
+    let (tx, ty) = (gx - x0 as f32, gy - y0 as f32);
+    let at = |x: usize, y: usize| g.data.get(y * gw + x).copied().unwrap_or(0.0);
+    let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+    let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+    top + (bottom - top) * ty
 }
 
 /// Highlights and Shadows with no photo to fit them to: as on our reference chart.
@@ -342,6 +360,7 @@ pub(crate) fn finish(
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
     fp.hs_adapt = p.hs_adapt;
+    fp.surround = p.surround.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -372,6 +391,7 @@ pub(crate) fn finish_deep(
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
     fp.hs_adapt = p.hs_adapt;
+    fp.surround = p.surround.clone();
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -437,6 +457,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let long = fp.ow.max(fp.oh);
     let [vx, vy, vw, vh] = fp.view;
     let [hl_k, hl_at, sh_k, sh_at] = fp.hs_adapt;
+    let surround = fp.surround.as_deref();
     // the vignette belongs to the whole output frame, not to the window being drawn
     let aspect = vw / vh;
 
@@ -557,7 +578,17 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             {
                 let det = (l_pre - b.data[i]).clamp(-2.5, 2.5);
                 let mid = (-(base / 3.2).powi(2)).exp();
-                delta += cl * 0.85 * det * (0.35 + 0.65 * mid);
+                // Clarity + (issue 7, fitted to Lightroom's on four photos): a finer detail boost, and a
+                // local contrast against the frame's wide surround that leaves the highlights alone;
+                // Clarity − only softens the detail
+                delta += cl * if cl > 0.0 { 0.6 } else { 0.85 } * det * (0.35 + 0.65 * mid);
+                if cl > 0.0
+                    && let Some(g) = surround
+                {
+                    let around = surround_at(g, vx + x as f32 + 0.5, vy + y as f32 + 0.5, vw, vh);
+                    let wide = (l_pre.max(SURROUND_FLOOR) - around).clamp(-2.0, 2.0);
+                    delta += cl * 0.7 * wide * (1.0 - smooth(-2.0, 1.0, l0));
+                }
             }
             let tx = tex + l_tex;
             let sp = l_sharp * 0.6 + sharpen;

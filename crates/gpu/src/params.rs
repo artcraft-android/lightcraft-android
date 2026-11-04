@@ -26,6 +26,11 @@ const FIELDS: &[(&str, usize)] = &[
     // a rendered photo's Whites − / Blacks + gain (`RangeGain`): on, and its table's offset in aux
     ("RANGE", 1),
     ("RANGE_OFF", 1),
+    // Clarity's wide surround of the whole frame (`local::frame_surround`): on, its offset in aux and its size
+    ("SURR", 1),
+    ("SURR_OFF", 1),
+    ("SURR_W", 1),
+    ("SURR_H", 1),
     ("WIDE", 18),
     ("HL", 1),
     ("SH", 1),
@@ -65,8 +70,9 @@ const FIELDS: &[(&str, usize)] = &[
     ("VIG_POWER", 1),
     ("VIG_HL", 1),
     ("VIG_STYLE", 1),
-    // the window's offset in the whole output and the whole output's size (pixels)
-    ("VIG_VIEW", 4),
+    // the window's offset in the whole output and the whole output's size (pixels): the frame of the vignette and
+    // of Clarity's surround
+    ("VIEW", 4),
     ("GRAIN", 1),
     ("GRAIN_AMT", 1),
     ("GRAIN_SC", 1),
@@ -154,7 +160,7 @@ pub struct Present {
 }
 
 /// The `finish` kernel's parameter block and auxiliary table (tone LUT | chroma curve | sRGB LUT | curve LUTs |
-/// mask terms | range gain) for `fp` with `masks` (their local adjustments' terms).
+/// mask terms | range gain | Clarity surround) for `fp` with `masks` (their local adjustments' terms).
 pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Present) -> (Vec<u32>, Vec<f32>) {
     let mut aux: Vec<f32> = fp.tone.lut().to_vec();
     aux.extend_from_slice(fp.tone.chroma_lut());
@@ -175,6 +181,10 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     if let Some(g) = &fp.range_gain {
         aux.extend_from_slice(g.lut());
     }
+    let surr_off = aux.len();
+    if let Some(g) = &fp.surround {
+        aux.extend_from_slice(&g.data);
+    }
 
     let mut p = Block::new();
     p.u("W", fp.w as u32);
@@ -193,6 +203,10 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.b("PER_CHANNEL", fp.per_channel);
     p.b("RANGE", fp.range_gain.is_some());
     p.u("RANGE_OFF", range_off as u32);
+    p.b("SURR", fp.surround.is_some());
+    p.u("SURR_OFF", surr_off as u32);
+    p.u("SURR_W", fp.surround.as_ref().map_or(0, |g| g.width) as u32);
+    p.u("SURR_H", fp.surround.as_ref().map_or(0, |g| g.height) as u32);
     p.fs("WIDE", &lightcraft_pipeline::tone::wide().words());
     p.f("HL", fp.hl);
     p.f("SH", fp.sh);
@@ -231,6 +245,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     p.f("SKIN", ops.skin);
     p.fs("BANDH", lightcraft_pipeline::colorops::band_hues());
 
+    p.fs("VIEW", &fp.view);
     if let Some(v) = &fp.vig {
         p.b("VIG", true);
         p.f("VIG_AMOUNT", v.amount);
@@ -239,7 +254,6 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
         p.f("VIG_ASPECT_MIX", v.aspect_mix);
         p.f("VIG_POWER", v.power);
         p.f("VIG_HL", v.highlights);
-        p.fs("VIG_VIEW", &fp.view);
         p.u(
             "VIG_STYLE",
             match v.style {

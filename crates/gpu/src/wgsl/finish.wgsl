@@ -32,6 +32,23 @@ fn range_gain(y: f32) -> f32 {
     return aux[o + i] + (aux[o + i + 1u] - aux[o + i]) * t;
 }
 
+// `lightcraft_pipeline::finish::surround_at`: Clarity's wide surround of the whole frame (`SURR_W × SURR_H` at
+// `SURR_OFF` in aux) at output position (x, y) of the whole frame (`VIEW`'s size), bilinear.
+fn surround_at(x: f32, y: f32) -> f32 {
+    let gw = max(pu(F_SURR_W), 1u);
+    let gh = max(pu(F_SURR_H), 1u);
+    let gx = clamp(x / pf(F_VIEW + 2u) * f32(gw) - 0.5, 0.0, f32(gw - 1u));
+    let gy = clamp(y / pf(F_VIEW + 3u) * f32(gh) - 0.5, 0.0, f32(gh - 1u));
+    let x0 = u32(gx);
+    let y0 = u32(gy);
+    let x1 = min(x0 + 1u, gw - 1u);
+    let y1 = min(y0 + 1u, gh - 1u);
+    let o = pu(F_SURR_OFF);
+    let top = mix(aux[o + y0 * gw + x0], aux[o + y0 * gw + x1], gx - f32(x0));
+    let bottom = mix(aux[o + y1 * gw + x0], aux[o + y1 * gw + x1], gx - f32(x0));
+    return mix(top, bottom, gy - f32(y0));
+}
+
 // `lightcraft_pipeline::tone::wide`: linear Rec.2020 → the wide space (`off` 0) or back (`off` 9).
 fn wide_m(off: u32, c: vec3<f32>) -> vec3<f32> {
     let o = F_WIDE + off;
@@ -479,7 +496,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let det = clamp(l_pre - clar[i], -2.5, 2.5);
         let q = base / 3.2;
         let mid = exp(-(q * q));
-        delta += cl * 0.85 * det * (0.35 + 0.65 * mid);
+        // Clarity +: a finer detail boost and a local contrast against the frame's wide surround that
+        // leaves the highlights alone; Clarity − only softens the detail (`finish.rs`)
+        var fine = 0.85;
+        if (cl > 0.0) {
+            fine = 0.6;
+        }
+        delta += cl * fine * det * (0.35 + 0.65 * mid);
+        if (cl > 0.0 && pu(F_SURR) != 0u) {
+            let around = surround_at(pf(F_VIEW) + f32(x) + 0.5, pf(F_VIEW + 1u) + f32(y) + 0.5);
+            // (-12: `local::SURROUND_FLOOR`)
+            let wide = clamp(max(l_pre, -12.0) - around, -2.0, 2.0);
+            delta += cl * 0.7 * wide * (1.0 - sstep(-2.0, 1.0, l0));
+        }
     }
     let tx = pf(F_TEX) + lt[8];
     let sp = lt[13] * 0.6 + pf(F_SHARPEN);
@@ -557,14 +586,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- vignette (display linear, post-crop)
     if (pu(F_VIG) != 0u) {
         // the vignette belongs to the whole output frame, not to the window being drawn
-        let fw = pf(F_VIG_VIEW + 2u);
-        let fh = pf(F_VIG_VIEW + 3u);
+        let fw = pf(F_VIEW + 2u);
+        let fh = pf(F_VIEW + 3u);
         let aspect = fw / fh;
         let amount = pf(F_VIG_AMOUNT);
         let mixa = pf(F_VIG_ASPECT_MIX);
         let power = pf(F_VIG_POWER);
-        let u = (pf(F_VIG_VIEW) + f32(x) + 0.5) / fw * 2.0 - 1.0;
-        let vv = (pf(F_VIG_VIEW + 1u) + f32(y) + 0.5) / fh * 2.0 - 1.0;
+        let u = (pf(F_VIEW) + f32(x) + 0.5) / fw * 2.0 - 1.0;
+        let vv = (pf(F_VIEW + 1u) + f32(y) + 0.5) / fh * 2.0 - 1.0;
         let sx = 1.0 + (aspect - 1.0) * mixa;
         let sy = 1.0 + (1.0 / aspect - 1.0) * mixa;
         let ax = abs(u * max(sx, 1.0) / max(sx, sy));
