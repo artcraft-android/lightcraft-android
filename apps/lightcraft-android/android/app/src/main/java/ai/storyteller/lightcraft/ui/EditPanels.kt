@@ -83,6 +83,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
@@ -989,67 +990,116 @@ fun PresetsSheet(vm: AppViewModel, ed: EditorState, modifier: Modifier) {
     var group by remember(ed.presetTab) { mutableStateOf<String?>(null) }
     var amount by remember(ed.lastPreset) { mutableStateOf(ed.presetAmount) }
     Column(modifier) {
+        val applied = ed.lastPreset?.takeIf { p -> shown.any { it.id == p.id } }
         val open = group?.let { g -> groups[g]?.let { g to it } }
-        if (open == null) {
-            Tabs(listOf("lightcraft" to "LightCraft", "yours" to "Yours"), ed.presetTab, centred = false, textSize = 15.5f) { ed.presetTab = it }
-            Box(Modifier.fillMaxWidth().height(1.dp).background(Lc.panelButtonBorder))
-            if (shown.isEmpty()) {
-                Text(
-                    if (ed.presetTab == "yours") "No presets yet" else "No presets",
-                    color = Lc.panelTextDim,
-                    fontFamily = Inter,
-                    fontSize = 14.sp,
-                    modifier = Modifier.padding(16.dp),
-                )
-            }
-            LazyColumn(Modifier.sheetList(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)) {
-                items(groups.entries.toList(), key = { it.key }) { (name, presets) ->
-                    PresetGroupRow(vm, ed, name, presets) { group = name }
+        when {
+            // setting the preset up: the amount alone, no thumbnails under it
+            applied != null && ed.presetAmountOpen && LocalSheetLimit.current != null -> {
+                // measured against Lightroom on this screen: its panel starts at y=1436 and the label at
+                // y=1525, so the block gets a fixed 145.6 dp of card with 29.2 dp above it
+                Column(Modifier.fillMaxWidth().height(126.8.dp).padding(top = 24.9.dp)) {
+                    DevelopSlider(
+                        presetAmount(amount),
+                        onChange = { amount = it.toFloat(); vm.previewPresetAmount(amount) },
+                        onFinished = { vm.finishPresetAmount() },
+                        onReset = {
+                            amount = 100f
+                            vm.previewPresetAmount(100f)
+                            vm.finishPresetAmount()
+                        },
+                        label = "Amount",
+                        labelSize = 14.sp,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    // the reference's chevron sits under the slider and points up: fold the amount away
+                    Box(
+                        // the reference keeps 83 px (29.5 dp) between the thumb and the chevron
+                        Modifier.fillMaxWidth().padding(top = 12.2.dp).height(26.dp).clickable(role = Role.Button) { ed.presetAmountOpen = false }
+                            .semantics { contentDescription = "Hide the amount" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        LcIcon(LcIcon.ChevronDown, null, tint = Lc.panelText, size = 20.dp, weight = 1.2f, modifier = Modifier.rotate(180f))
+                    }
                 }
             }
-        } else {
-            val (name, presets) = open
-            Row(Modifier.fillMaxWidth().height(59.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(48.dp, 59.dp).clickable(role = Role.Button) { group = null }.semantics { contentDescription = "Back" }, contentAlignment = Alignment.Center) {
-                    LcIcon(LcIcon.Back, null, tint = Lc.panelText, size = 22.dp, weight = 1.2f)
+            open == null -> {
+                Tabs(listOf("lightcraft" to "LightCraft", "yours" to "Yours"), ed.presetTab, centred = false, textSize = 15.5f) { ed.presetTab = it }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Lc.panelButtonBorder))
+                if (shown.isEmpty()) {
+                    Text(
+                        if (ed.presetTab == "yours") "No presets yet" else "No presets",
+                        color = Lc.panelTextDim,
+                        fontFamily = Inter,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(16.dp),
+                    )
                 }
-                Text(name, color = Lc.panelText, fontFamily = Inter, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 16.dp))
-            }
-            Box(Modifier.fillMaxWidth().height(1.dp).background(Lc.panelButtonBorder))
-            ed.lastPreset?.takeIf { p -> presets.any { it.id == p.id } }?.let { p ->
-                DevelopSlider(
-                    presetAmount(amount),
-                    onChange = { amount = it.toFloat() },
-                    onFinished = { vm.setPresetAmount(amount) },
-                    onReset = {
-                        amount = 100f
-                        vm.setPresetAmount(100f)
-                    },
-                    label = "${p.name} amount",
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-            }
-            if (LocalSheetLimit.current == null) {
-                // sideways the reference shows two columns well in from the panel's sides, the names on the tiles
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
-                    contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                    modifier = Modifier.fillMaxSize(),
-                ) {
-                    items(presets, key = { it.id }) { p -> PresetTile(vm, ed, p) }
+                LazyColumn(Modifier.sheetList(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)) {
+                    items(groups.entries.toList(), key = { it.key }) { (name, presets) ->
+                        PresetGroupRow(vm, ed, name, presets) { group = name }
+                    }
                 }
-            } else {
-                // upright, its strip of 96 dp squares, each name under its tile
-                LazyRow(
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.6.dp),
-                ) {
-                    items(presets, key = { it.id }) { p -> PresetFilmTile(vm, ed, p) }
+            }
+            else -> {
+                val (name, presets) = open
+                Row(Modifier.fillMaxWidth().height(59.dp).hiddenWhileDragging(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(48.dp, 59.dp).clickable(role = Role.Button) { group = null }.semantics { contentDescription = "Back" }, contentAlignment = Alignment.Center) {
+                        LcIcon(LcIcon.Back, null, tint = Lc.panelText, size = 22.dp, weight = 1.2f)
+                    }
+                    Text(name, color = Lc.panelText, fontFamily = Inter, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 16.dp))
+                }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Lc.panelButtonBorder))
+                if (LocalSheetLimit.current == null) {
+                    // sideways the reference shows two columns well in from the panel's sides, the names on the tiles
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(2),
+                        contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        // the reference puts the amount under the row that holds the preset applied, in the grid
+                        val sel = presets.indexOfFirst { it.id == applied?.id }
+                        val afterRow = if (sel >= 0) ((sel / 2) + 1) * 2 else -1
+                        presets.forEachIndexed { i, p ->
+                            if (i == afterRow) {
+                                item(span = { GridItemSpan(2) }, key = "amount") { PresetAmountRow(vm, ed, amount, { v -> amount = v; vm.previewPresetAmount(v) }, { amount = 100f; vm.previewPresetAmount(100f); vm.finishPresetAmount() }) }
+                            }
+                            item(key = p.id) { Box(Modifier.hiddenWhileDragging()) { PresetTile(vm, ed, p) } }
+                        }
+                        if (afterRow >= presets.size) {
+                            item(span = { GridItemSpan(2) }, key = "amount") { PresetAmountRow(vm, ed, amount, { v -> amount = v; vm.previewPresetAmount(v) }, { amount = 100f; vm.previewPresetAmount(100f); vm.finishPresetAmount() }) }
+                        }
+                    }
+                } else {
+                    // upright, its strip of 96 dp squares, each name under its tile
+                    LazyRow(
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 27.5.dp, bottom = 27.5.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.6.dp),
+                    ) {
+                        items(presets, key = { it.id }) { p -> PresetFilmTile(vm, ed, p) }
+                    }
                 }
             }
         }
+    }
+}
+
+/** The amount under the preset applied, as the grid shows it sideways: its name, the bar, its value. */
+@Composable
+private fun PresetAmountRow(vm: AppViewModel, ed: EditorState, amount: Float, onChange: (Float) -> Unit, onReset: () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        DevelopSlider(
+            presetAmount(amount),
+            onChange = { onChange(it.toFloat()) },
+            onFinished = { vm.finishPresetAmount() },
+            onReset = onReset,
+            label = "Amount",
+            labelSize = 14.sp,
+            // the grid already insets the row: the bar runs from frame to frame, as wide as two tiles
+            edge = 0f,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 
@@ -1079,11 +1129,15 @@ private fun PresetFilmTile(vm: AppViewModel, ed: EditorState, p: PresetInfo) {
     val selected = ed.lastPreset?.id == p.id
     val shape = RoundedCornerShape(3.dp)
     Column(
-        Modifier.width(96.dp).combinedClickable(role = Role.RadioButton, onLongClick = { if (!p.builtin) ed.presetHeld = p }) { vm.applyPreset(p) },
+        Modifier.width(96.dp).combinedClickable(role = Role.RadioButton, onLongClick = { if (!p.builtin) ed.presetHeld = p }) {
+                if (selected) ed.presetAmountOpen = !ed.presetAmountOpen else vm.applyPreset(p)
+            },
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Box(Modifier.size(96.dp).clip(shape).background(Lc.cell).border(2.dp, if (selected) Lc.primaryBlue else Color.Transparent, shape)) {
+        Box(Modifier.size(96.dp).clip(shape).background(Lc.cell).border(3.dp, if (selected) Color.White else Color.Transparent, shape)) {
             look?.let { Image(it, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
+            // the reference puts its mark two thirds down the tile, not in the middle
+            if (selected) PresetAmountMark(Modifier.align(Alignment.Center))
         }
         Text(
             p.name,
@@ -1094,6 +1148,28 @@ private fun PresetFilmTile(vm: AppViewModel, ed: EditorState, p: PresetInfo) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(top = 7.dp),
         )
+    }
+}
+
+/**
+ * The reference's mark on the preset applied to the photo: a small amount slider (a line with its
+ * round knob) over the middle of the tile, saying that tapping it again brings the amount back.
+ */
+@Composable
+private fun PresetAmountMark(modifier: Modifier = Modifier) {
+    // measured on Lightroom: 40 dp across, the ring 13 dp wide, the bar a third of that, and a dark
+    // edge round the whole silhouette so it reads over any photo
+    Canvas(modifier.size(width = 40.dp, height = 13.dp)) {
+        val y = size.height / 2f
+        val cx = size.width / 2f
+        val bar = 3.6.dp.toPx()
+        val ringR = 6.5.dp.toPx()
+        val ringW = 3.4.dp.toPx()
+        val edge = 1.4.dp.toPx()
+        for ((grow, colour) in listOf(edge to Color.Black.copy(alpha = 0.55f), 0f to Color.White)) {
+            drawLine(colour, Offset(bar / 2, y), Offset(size.width - bar / 2, y), strokeWidth = bar + 2 * grow, cap = StrokeCap.Round)
+            drawCircle(colour, ringR, Offset(cx, y), style = Stroke(ringW + 2 * grow))
+        }
     }
 }
 
@@ -1110,10 +1186,13 @@ private fun PresetTile(vm: AppViewModel, ed: EditorState, p: PresetInfo) {
             .aspectRatio(1f)
             .clip(shape)
             .background(Lc.cell)
-            .border(2.dp, if (selected) Lc.primaryBlue else Color.Transparent, shape)
-            .combinedClickable(role = Role.RadioButton, onLongClick = { if (!p.builtin) ed.presetHeld = p }) { vm.applyPreset(p) },
+            .border(3.dp, if (selected) Color.White else Color.Transparent, shape)
+            .combinedClickable(role = Role.RadioButton, onLongClick = { if (!p.builtin) ed.presetHeld = p }) {
+                if (selected) ed.presetAmountOpen = !ed.presetAmountOpen else vm.applyPreset(p)
+            },
     ) {
         look?.let { Image(it, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
+        if (selected) PresetAmountMark(Modifier.align(Alignment.Center))
         Text(
             p.name,
             color = Color.White,

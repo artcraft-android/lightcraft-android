@@ -107,6 +107,9 @@ private val BASIC_GROUPS = listOf("treatment", "profile", "whiteBalance", "light
 /** The long edge of a choice's preview in the Reset and Apply from previous menus (px). */
 private const val CHOICE_EDGE = 180
 
+/** The id of the preset sheet's Amount slider (it has no develop control of its own). */
+private const val PRESET_AMOUNT = "preset.amount"
+
 class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin? = null) {
     var info by mutableStateOf(info)
     var controls by mutableStateOf<List<DevelopControl>>(emptyList())
@@ -237,6 +240,8 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     var gradingRange by mutableStateOf("shadows")
     var lastPreset by mutableStateOf<PresetInfo?>(null)
     var presetAmount by mutableFloatStateOf(100f)
+    /** Whether the applied preset's Amount row shows: tapping that preset again folds it away. */
+    var presetAmountOpen by mutableStateOf(true)
     var image by mutableStateOf<ImageBitmap?>(null)
 
     /**
@@ -656,7 +661,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun presetKey(p: PhotoInfo, preset: String) = "preset:${p.id}:${p.settingsHash}:$preset"
+    fun presetKey(p: PhotoInfo, preset: String) = "preset:${p.id}:$preset"
 
     fun profileKey(p: PhotoInfo, profile: String) = "profile:${p.id}:${p.settingsHash}:$profile"
 
@@ -3408,9 +3413,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun applyPreset(preset: PresetInfo) {
         val ed = editor ?: return
+        val previous = ed.lastPreset
         ed.lastPreset = preset
         ed.presetAmount = 100f
-        edit(after = { say("Preset: ${preset.name}") }) { it.applyPreset(preset.id, 100.0) }
+        // the tiles stay on screen with the mark on the one applied; tapping it again opens the amount
+        ed.presetAmountOpen = false
+        // no undo banner: the reference leaves the strip clear, the step is still in the history
+        edit(after = {}) { s ->
+            // one preset at a time: the one before is taken back before this one lands, so nothing of it
+            // is left under the new look
+            if (previous != null && previous.id != preset.id && s.history().undo == "Preset: ${previous.name}") s.undo()
+            s.applyPreset(preset.id, 100.0)
+        }
     }
 
     /** The last applied preset at [amount] percent: taken back and applied again, as the desktop does. */
@@ -3421,6 +3435,68 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         edit { s ->
             if (s.history().undo == "Preset: ${preset.name}") s.undo()
             s.applyPreset(preset.id, amount.toDouble())
+        }
+    }
+
+    /** Take the last preset back off the photo: its step is undone and the sheet forgets it. */
+    fun clearPreset() {
+        val ed = editor ?: return
+        val preset = ed.lastPreset ?: return
+        val label = "Preset: ${preset.name}"
+        var undone = false
+        edit(after = {
+            if (undone) {
+                ed.lastPreset = null
+                ed.presetAmount = 100f
+                say("Preset removed")
+            } else {
+                say("Undo back to the preset first")
+            }
+        }) { s ->
+            if (s.history().undo == label) {
+                s.undo()
+                undone = true
+            }
+        }
+    }
+
+    /**
+     * A drag of the last preset's amount: every move previews the photo and the release commits one
+     * step ([finishPresetAmount]). The engine keeps the photo as it was before the preset while the
+     * drag lasts, so each move applies the preset from there rather than stacking on the last one.
+     */
+    fun previewPresetAmount(amount: Float) {
+        val ed = editor ?: return
+        val preset = ed.lastPreset ?: return
+        val e = engine ?: return
+        ed.presetAmount = amount
+        val label = "Preset: ${preset.name}"
+        val begin = ed.adjusting != PRESET_AMOUNT
+        ed.adjusting = PRESET_AMOUNT
+        viewModelScope.launch {
+            runCatching {
+                e.command {
+                    if (begin) {
+                        // from the photo as it was before the preset, like a slider's drag
+                        if (history().undo == label) undo()
+                        beginAdjustment(label)
+                    }
+                    applyPreset(preset.id, amount.toDouble())
+                }
+            }.onFailure { say(it.message) }
+            requestView(draft = true)
+        }
+    }
+
+    /** The amount's release: what the drag previewed becomes one history step. */
+    fun finishPresetAmount() {
+        val ed = editor ?: return
+        val e = engine ?: return
+        if (ed.adjusting != PRESET_AMOUNT) return
+        ed.adjusting = null
+        viewModelScope.launch {
+            runCatching { e.command { endAdjustment(); snapshot(ed.photoId) } }.onSuccess { ed.update(it) }
+            requestView()
         }
     }
 

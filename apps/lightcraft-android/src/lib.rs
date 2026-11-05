@@ -707,7 +707,10 @@ impl MobileSession {
         let job = {
             let mut s = self.lock();
             let pr = s.presets.iter().find(|p| p.id == preset).cloned().ok_or_else(|| MobileError::Command(format!("unknown preset `{preset}`")))?;
-            let d = s.develop_of(PhotoId(id)).ok_or(MobileError::NoPhoto(id))?;
+            // from a blank base, not the photo's edits: the browser shows each look on its own, as
+            // Lightroom's does, and a thumbnail must not shift when the sliders move
+            s.develop_of(PhotoId(id)).ok_or(MobileError::NoPhoto(id))?;
+            let d = lightcraft_engine::develop::DevelopSettings::default();
             let look = pr.apply(&d, 1.0);
             s.variant_job(PhotoId(id), &look, edge as usize).ok_or(MobileError::NoPhoto(id))?
         };
