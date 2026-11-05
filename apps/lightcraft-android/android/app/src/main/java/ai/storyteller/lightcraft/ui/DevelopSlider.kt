@@ -45,6 +45,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.util.Locale
@@ -108,7 +109,7 @@ private fun DevelopControl.magnitude(v: Double): Pair<Int, String> {
 
 /** A brush's or an amount's slider: its value read plain (no sign), as the reference's own readouts for them. */
 private val DevelopControl.plain: Boolean get() =
-    id.startsWith("brush.") || id.startsWith("watermark.") || id == "preset.amount" || id == "profile.amount" || id == "slideshow.seconds" || id == "export.quality"
+    id.startsWith("brush.") || id.startsWith("watermark.") || id == "profile.amount" || id == "slideshow.seconds" || id == "export.quality"
 
 /**
  * The value as the reference's panels show it: a sign and a space before any value but 0 ("+ 25",
@@ -181,6 +182,8 @@ fun DevelopSlider(
     onReset: () -> Unit,
     modifier: Modifier = Modifier,
     label: String = control.label,
+    labelSize: TextUnit = 15.sp,
+    edge: Float = EDGE,
     enabled: Boolean = true,
 ) {
     val scale = remember(control.id, control.min, control.max) { SliderScale.of(control) }
@@ -306,15 +309,15 @@ fun DevelopSlider(
                     },
                 )
             }
-            .padding(horizontal = EDGE.dp),
+            .padding(horizontal = edge.dp),
     ) {
         // the reference's row: 52 dp, name and value on a line 2 dp down, the bar (a 23.8 dp seek bar) centred 36.2 dp down
         Row(
             Modifier.fillMaxWidth().padding(top = 2.dp).height(19.5.dp).alpha(if (drag?.id == control.id) 0f else 1f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(label, style = labelStyle, maxLines = 1, modifier = Modifier.weight(1f))
-            Text(control.format(control.value), style = labelStyle.copy(fontFeatureSettings = "tnum"), maxLines = 1)
+            Text(label, style = if (labelSize == 15.sp) labelStyle else labelStyle.copy(fontSize = labelSize, lineHeight = labelSize * 1.3f), maxLines = 1, modifier = Modifier.weight(1f))
+            Text(control.format(control.value), style = (if (labelSize == 15.sp) labelStyle else labelStyle.copy(fontSize = labelSize, lineHeight = labelSize * 1.3f)).copy(fontFeatureSettings = "tnum"), maxLines = 1)
         }
         val origin = when (control.id) {
             in fillFromStart -> 0f
@@ -327,7 +330,7 @@ fun DevelopSlider(
         Canvas(
             Modifier
                 .fillMaxWidth()
-                .padding(top = 2.8.dp)
+                .padding(top = 1.dp)
                 .height(23.8.dp)
                 .semantics {
                     contentDescription = label
@@ -361,7 +364,7 @@ private fun DrawScope.bar(stops: List<Pair<Float, Color>>, p: Float, origin: Flo
     val travel = (size.width - 2 * outer).coerceAtLeast(1f)
     val cx = outer + p * travel
     val cy = size.height / 2
-    val thick = 2.dp.toPx()
+    val thick = 1.6.dp.toPx()
     val left = 0f
     val right = size.width
     val brush = Brush.horizontalGradient(*stops.toTypedArray(), startX = left, endX = right)
