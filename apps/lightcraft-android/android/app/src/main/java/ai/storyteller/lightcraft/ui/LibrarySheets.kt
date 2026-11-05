@@ -46,6 +46,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -912,7 +913,7 @@ fun AddToAlbumSheet(vm: AppViewModel, onDismiss: () -> Unit, onNewAlbum: () -> U
 
 /**
  * Select mode's More, as the reference's: Select All and Select None; Add to and (in an album) Move
- * to; Edit Info, (in an album, one photo chosen) Set As Cover and Paste Settings.
+ * to; Edit Info, (in an album, one photo chosen) Set As Cover and Paste Settings; photo merges.
  */
 @Composable
 fun SelectMoreSheet(vm: AppViewModel, onDismiss: () -> Unit, onSheet: (String) -> Unit) {
@@ -942,8 +943,76 @@ fun SelectMoreSheet(vm: AppViewModel, onDismiss: () -> Unit, onSheet: (String) -
             onDismiss()
             vm.pasteToSelected()
         }
+        if (vm.view.kind != "deleted") {
+            SheetDivider()
+            SheetRow(LcIcon.PhotoStack, "HDR Merge", enabled = vm.selected.size >= 2 && !vm.merging) {
+                onDismiss()
+                vm.mergeSelected("merge.hdr")
+            }
+            SheetRow(LcIcon.PhotoStack, "Panorama Merge", enabled = vm.selected.size >= 2 && !vm.merging) {
+                onDismiss()
+                vm.mergeSelected("merge.panorama")
+            }
+            SheetRow(LcIcon.PhotoStack, "HDR Panorama Merge", enabled = vm.selected.size >= 4 && !vm.merging) {
+                onDismiss()
+                vm.mergeSelected("merge.hdrPanorama")
+            }
+        }
         Spacer(Modifier.height(8.dp))
     }
+}
+
+@Composable
+fun MergeOptionsDialog(vm: AppViewModel, dialog: MergeDialogState, onDismiss: () -> Unit) {
+    val projections = listOf(
+        "auto" to "Auto",
+        "spherical" to "Spherical",
+        "cylindrical" to "Cylindrical",
+        "perspective" to "Perspective",
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Lc.dialog,
+        title = { Text(dialog.title, fontFamily = Inter, color = Lc.text) },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(
+                    Modifier.fillMaxWidth().heightIn(min = 150.dp, max = 260.dp)
+                        .clip(RoundedCornerShape(6.dp)).background(Lc.canvas),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    dialog.preview?.let {
+                        Image(it, "Merge preview", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
+                    }
+                    if (dialog.loading) CircularProgressIndicator(color = Lc.highlight, trackColor = Lc.divider)
+                    if (dialog.preview == null && !dialog.loading && dialog.error == null) {
+                        Text("Preview unavailable", color = Lc.textDim, fontFamily = Inter, fontSize = 14.sp)
+                    }
+                }
+                if (dialog.command != "merge.hdr") {
+                    Text("Projection", color = Lc.text, fontFamily = Inter, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                    projections.forEach { (id, label) ->
+                        RadioRow(label, selected = dialog.projection == id) { vm.setMergeProjection(id) }
+                    }
+                }
+                dialog.error?.let {
+                    Text(it, color = Lc.reject, fontFamily = Inter, fontSize = 13.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = dialog.preview != null && !dialog.loading && !vm.merging,
+                onClick = vm::confirmMerge,
+            ) { Text("Merge", fontFamily = Inter, color = Lc.selected) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", fontFamily = Inter, color = Lc.text) }
+        },
+    )
 }
 
 /**
