@@ -214,7 +214,7 @@ fun LibraryScreen(vm: AppViewModel, snackbar: SnackbarHostState, list: LazyListS
                     vm.photos.isEmpty() -> EmptyLibrary(vm, Modifier.align(Alignment.Center))
                     else -> PhotoGrid(vm, list)
                 }
-                if (vm.importing) LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter), color = Lc.selected, trackColor = Lc.bar)
+                if (vm.importing || vm.merging) LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter), color = Lc.selected, trackColor = Lc.bar)
             }
             if (wide) {
                 WideHome(
@@ -328,6 +328,7 @@ fun LibraryScreen(vm: AppViewModel, snackbar: SnackbarHostState, list: LazyListS
             }
         }
     }
+    OverlayHost(vm.mergeDialog) { dialog -> MergeOptionsDialog(vm, dialog, vm::dismissMergeDialog) }
     if (naming) {
         NameDialog("New album", "Create", onDismiss = { naming = false }) { name ->
             naming = false
