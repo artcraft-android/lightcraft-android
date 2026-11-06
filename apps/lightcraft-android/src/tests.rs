@@ -211,7 +211,7 @@ fn renders_fit_the_requested_size() {
     let id = first_photo(&s);
     s.open_photo(id).unwrap();
     for (draft, before) in [(false, false), (true, false), (false, true)] {
-        let img = s.render_view(id, 96, 64, draft, before, None).unwrap();
+        let img = s.render_view(id, 96, 64, draft, before, None, None).unwrap();
         assert!(img.width <= 96 && img.height <= 64 && (img.width == 96 || img.height == 64), "{}x{}", img.width, img.height);
         assert_eq!(img.rgba.len(), img.width as usize * img.height as usize * 4);
         assert!(img.rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255), "opaque");
@@ -240,7 +240,7 @@ fn quick_views_and_prefetch_prepare_the_editor() {
     // the before view keeps its own stages: switching back and forth renders both
     s.open_photo(a).unwrap();
     for before in [false, true, false, true] {
-        assert!(s.render_view(a, 64, 64, false, before, None).is_ok());
+        assert!(s.render_view(a, 64, 64, false, before, None, None).is_ok());
     }
 }
 
@@ -336,9 +336,9 @@ fn bad_input_is_an_error_not_a_crash() {
     }
     s.set_control("light.exposure".into(), 99.0).unwrap();
     assert_eq!(control(&s, "light.exposure").value, 5.0, "clamped to the range");
-    assert!(matches!(s.render_view(u64::MAX, 64, 64, false, false, None), Err(MobileError::NoPhoto(_))));
+    assert!(matches!(s.render_view(u64::MAX, 64, 64, false, false, None, None), Err(MobileError::NoPhoto(_))));
     assert!(matches!(s.render_thumbnail(u64::MAX, 64), Err(MobileError::NoPhoto(_))));
-    assert!(s.render_view(first_photo(&s), 0, 0, false, false, None).is_ok(), "a zero size renders one pixel");
+    assert!(s.render_view(first_photo(&s), 0, 0, false, false, None, None).is_ok(), "a zero size renders one pixel");
     assert!(s.export(u64::MAX, String::new()).is_err());
     assert!(s.export(first_photo(&s), "[".into()).is_err());
     assert!(matches!(MobileSession::demo().redo(), Err(MobileError::Command(_))), "nothing to redo");
@@ -442,7 +442,7 @@ fn the_crop_tool_sees_the_crop_over_the_whole_photo() {
     assert!((f.corners[0] - 0.5).abs() < 1e-9 && (f.corners[2] - 1.0).abs() < 1e-9, "{:?}", f.corners);
     // the crop view is the whole photo, the view only its right half
     let whole = s.render_crop_view(id, 200, 200, false).unwrap();
-    let cropped = s.render_view(id, 200, 200, false, false, None).unwrap();
+    let cropped = s.render_view(id, 200, 200, false, false, None, None).unwrap();
     let wide = |i: &RenderedImage| i.width as f64 / i.height as f64;
     assert!((wide(&whole) / wide(&cropped) - 2.0).abs() < 0.1, "{}×{} vs {}×{}", whole.width, whole.height, cropped.width, cropped.height);
     // straightened, the corners turn about the middle
@@ -504,22 +504,38 @@ fn masks_list_their_shape_and_adjustments() {
     assert_eq!(small["rx"], 0.05);
     // the view with the mask shown over it differs from the view, as each mode, colour and opacity asks
     let overlay = |view: &str, color: u32, opacity: u8| Some(MaskOverlay { id: m[0].id, view: view.into(), color, opacity });
-    let plain = s.render_view(id, 96, 96, false, false, None).unwrap();
-    let red = s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 50)).unwrap();
+    let plain = s.render_view(id, 96, 96, false, false, None, None).unwrap();
+    let red = s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 50), None).unwrap();
     assert_ne!(plain.rgba, red.rgba);
-    let blue = s.render_view(id, 96, 96, false, false, overlay("color", 0x0000FF, 50)).unwrap();
+    let blue = s.render_view(id, 96, 96, false, false, overlay("color", 0x0000FF, 50), None).unwrap();
     assert_ne!(red.rgba, blue.rgba, "the colour asked");
-    let faint = s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 10)).unwrap();
+    let faint = s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 10), None).unwrap();
     assert_ne!(red.rgba, faint.rgba, "the opacity asked");
     // white on black: only greys, white in the mask's middle and black in the corner
-    let wb = s.render_view(id, 96, 96, false, false, overlay("whiteOnBlack", 0, 50)).unwrap();
+    let wb = s.render_view(id, 96, 96, false, false, overlay("whiteOnBlack", 0, 50), None).unwrap();
     assert!(wb.rgba.as_chunks::<4>().0.iter().all(|px| px[0] == px[1] && px[1] == px[2]));
     assert_eq!(&wb.rgba[..3], &[0, 0, 0]);
     // an unknown mode is the colour overlay; an opacity past 100 is 100
-    let odd = s.render_view(id, 96, 96, false, false, overlay("sparkles", 0xFF0000, 50)).unwrap();
+    let odd = s.render_view(id, 96, 96, false, false, overlay("sparkles", 0xFF0000, 50), None).unwrap();
     assert_eq!(odd.rgba, red.rgba);
-    let full = s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 100)).unwrap();
-    assert_eq!(s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 255)).unwrap().rgba, full.rgba);
+    let full = s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 100), None).unwrap();
+    assert_eq!(s.render_view(id, 96, 96, false, false, overlay("color", 0xFF0000, 255), None).unwrap().rgba, full.rgba);
+}
+
+#[test]
+fn clipping_previews_render_over_the_photo() {
+    let s = MobileSession::demo();
+    let id = first_photo(&s);
+    s.open_photo(id).unwrap();
+    let plain = s.render_view(id, 96, 64, false, false, None, None).unwrap();
+    for preview in [ClippingPreview::Highlights, ClippingPreview::Shadows] {
+        let clipped = s.render_view(id, 96, 64, false, false, None, Some(preview)).unwrap();
+        assert_ne!(clipped.rgba, plain.rgba);
+        assert!(
+            clipped.rgba.as_chunks::<4>().0.iter().all(|px| [px[0], px[1], px[2]].iter().all(|c| *c == 0 || *c == 255)),
+            "clipping previews should render as binary channel indicators",
+        );
+    }
 }
 
 #[test]
@@ -624,10 +640,10 @@ fn a_view_window_is_that_part_of_the_whole_frame() {
     let s = MobileSession::demo();
     let id = first_photo(&s);
     s.open_photo(id).unwrap();
-    let whole = s.render_view(id, 900, 900, false, false, None).unwrap();
+    let whole = s.render_view(id, 900, 900, false, false, None, None).unwrap();
     let (w, h) = (whole.width, whole.height);
     let (x, y, ww, wh) = (w / 3, h / 4, 160, 120);
-    let win = s.render_view_window(id, w, h, x, y, ww, wh, false, None).unwrap().expect("no spots: never refused");
+    let win = s.render_view_window(id, w, h, x, y, ww, wh, false, None, None).unwrap().expect("no spots: never refused");
     assert_eq!((win.width, win.height), (ww, wh));
     let mut diff = 0u64;
     for j in 0..wh {
@@ -641,11 +657,27 @@ fn a_view_window_is_that_part_of_the_whole_frame() {
     }
     let mean = diff as f64 / f64::from(ww * wh * 3);
     assert!(mean < 3.0, "the window matches the whole render there (mean difference {mean:.2})");
+    let clipping = s.render_view(id, 900, 900, false, false, None, Some(ClippingPreview::Highlights)).unwrap();
+    let clipping_window =
+        s.render_view_window(id, w, h, x, y, ww, wh, false, None, Some(ClippingPreview::Highlights)).unwrap().unwrap();
+    assert!(clipping_window.rgba.as_chunks::<4>().0.iter().all(|px| px[..3].iter().all(|c| *c == 0 || *c == 255)));
+    let mut clipping_diff = 0u64;
+    for j in 0..wh {
+        for i in 0..ww {
+            let a = (((y + j) * w + x + i) * 4) as usize;
+            let b = ((j * ww + i) * 4) as usize;
+            for c in 0..3 {
+                clipping_diff += u64::from(clipping.rgba[a + c].abs_diff(clipping_window.rgba[b + c]));
+            }
+        }
+    }
+    let clipping_mean = clipping_diff as f64 / f64::from(ww * wh * 3);
+    assert!(clipping_mean < 3.0, "the clipping window matches its whole render (mean difference {clipping_mean:.2})");
     // zoomed far in, the window is still only what was asked for
-    let deep = s.render_view_window(id, w * 6, h * 6, w * 3, h * 3, 1080, 1500, false, None).unwrap().unwrap();
+    let deep = s.render_view_window(id, w * 6, h * 6, w * 3, h * 3, 1080, 1500, false, None, None).unwrap().unwrap();
     assert_eq!((deep.width, deep.height), (1080, 1500));
     // a window past the frame's edge is cut to the frame
-    let edge = s.render_view_window(id, w, h, w - 50, h - 40, 400, 400, false, None).unwrap().unwrap();
+    let edge = s.render_view_window(id, w, h, w - 50, h - 40, 400, 400, false, None, None).unwrap().unwrap();
     assert_eq!((edge.width, edge.height), (50, 40));
-    assert!(matches!(s.render_view_window(u64::MAX, w, h, 0, 0, 10, 10, false, None), Err(MobileError::NoPhoto(_))));
+    assert!(matches!(s.render_view_window(u64::MAX, w, h, 0, 0, 10, 10, false, None, None), Err(MobileError::NoPhoto(_))));
 }
