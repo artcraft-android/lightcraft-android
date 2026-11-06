@@ -12,6 +12,11 @@ every develop slider, crop and straighten, paint masks, remove spots, apply pres
 (previewed on the photo), rate and flag them (one at a time or a selection), undo and redo, compare
 against the original, and save or share JPEGs.
 
+AI Denoise is available for raw photos. Download a compatible ONNX model and its
+`denoise-model.json` description yourself, then choose a ZIP containing both files or select
+the two files in Preferences › AI Denoise. The app validates the files and licence, then installs
+the model into its private storage; model weights are not bundled or downloaded by LightCraft.
+
 The screens follow the reference phone app's layout and behaviour.
 Where the reference uses Google's Material icons, so does LightCraft (the same Apache-2.0 set,
 `ui/MaterialIcons.kt`); its other icons are LightCraft's own, drawn in code in the same weight

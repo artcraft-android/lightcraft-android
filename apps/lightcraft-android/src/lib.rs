@@ -390,6 +390,8 @@ pub struct Choice {
 pub struct DevelopState {
     /// Black & white (the B&W treatment or a monochrome profile), as the desktop's `is_bw`.
     pub black_and_white: bool,
+    /// Whether AI Denoise is enabled for this photo.
+    pub denoise_enabled: bool,
     /// White balance mode id (`asShot`, `auto`, `daylight`… `custom`).
     pub wb_mode: String,
     pub profile: String,
@@ -517,6 +519,16 @@ impl MobileSession {
         Ok(Arc::new(Self::wrap(s)))
     }
 
+    /// Set the app-managed folder in which denoise models are installed.
+    pub fn set_denoise_models_dir(&self, dir: String) -> Result<(), MobileError> {
+        let path = std::path::PathBuf::from(dir);
+        if !path.is_absolute() {
+            return Err(MobileError::Command(format!("the denoise models folder must be an absolute path, not `{}`", path.display())));
+        }
+        self.lock().set_denoise_models_dir(Some(path));
+        Ok(())
+    }
+
     /// Run command `command` with JSON parameters (`""` = none) and return its JSON result: the
     /// command ids and parameters of the control channel and MCP (`docs/control-protocol.md`).
     pub fn execute(&self, command: String, params_json: String) -> Result<String, MobileError> {
@@ -616,6 +628,7 @@ impl MobileSession {
         let d = &p.develop;
         Some(DevelopState {
             black_and_white: d.treatment == Treatment::Bw || d.profile.id == "lc.mono" || d.profile.id.starts_with("lc.bw."),
+            denoise_enabled: d.enhance.denoise_enabled(),
             wb_mode: enum_id(d.wb.mode),
             profile: d.profile.id.clone(),
             profile_name: engine_presets::profile(&d.profile.id).map_or_else(|| d.profile.id.clone(), |x| x.name.to_string()),
