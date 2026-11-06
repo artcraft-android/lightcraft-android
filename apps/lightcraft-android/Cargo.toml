@@ -15,7 +15,7 @@ crate-type = ["cdylib", "lib"]
 workspace = true
 
 [dependencies]
-lightcraft-engine = { workspace = true }
+lightcraft-engine = { workspace = true, features = ["denoise"] }
 # the view ↔ photo mapping (an affine) for the tools that act on the photo
 lightcraft-geom = { workspace = true }
 # the point curves' spline, for the Curve tool to draw them as the engine applies them
