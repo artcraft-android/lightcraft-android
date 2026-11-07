@@ -3,6 +3,7 @@ package ai.storyteller.lightcraft.ui
 import ai.storyteller.lightcraft.LightcraftApplication
 import ai.storyteller.lightcraft.core.AlbumInfo
 import ai.storyteller.lightcraft.core.Choice
+import ai.storyteller.lightcraft.core.ClippingPreview
 import ai.storyteller.lightcraft.core.CropFrame
 import ai.storyteller.lightcraft.core.DevelopControl
 import ai.storyteller.lightcraft.core.DevelopState
@@ -268,6 +269,7 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     var detail by mutableStateOf<ViewDetail?>(null)
     var histogram by mutableStateOf<ImageHistogram?>(null)
     var showingBefore by mutableStateOf(false)
+    var clippingPreview by mutableStateOf<ClippingPreview?>(null)
 
     /** View options' sheet is open over the editor. */
     var viewOptions by mutableStateOf(false)
@@ -608,10 +610,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val looks = BitmapCache(32 shl 20)
     val messages = Channel<UiMessage>(Channel.BUFFERED)
 
-    private data class ViewRequest(val photo: ULong, val width: Int, val height: Int, val draft: Boolean, val before: Boolean, val crop: Boolean, val mask: MaskOverlay?, val seq: Long)
+    private data class ViewRequest(
+        val photo: ULong,
+        val width: Int,
+        val height: Int,
+        val draft: Boolean,
+        val before: Boolean,
+        val crop: Boolean,
+        val mask: MaskOverlay?,
+        val clipping: ClippingPreview?,
+        val seq: Long,
+    )
 
     /** The part of the zoomed view to render sharp over [base] (see [ViewDetail]). */
-    private class DetailRequest(val photo: ULong, val frame: IntSize, val window: IntRect, val before: Boolean, val mask: MaskOverlay?, val base: ImageBitmap)
+    private class DetailRequest(
+        val photo: ULong,
+        val frame: IntSize,
+        val window: IntRect,
+        val before: Boolean,
+        val mask: MaskOverlay?,
+        val clipping: ClippingPreview?,
+        val base: ImageBitmap,
+    )
 
     /** The latest view the editor wants: a busy render loop skips straight to the newest. */
     private val viewRequests = MutableStateFlow<ViewRequest?>(null)
@@ -1125,7 +1145,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val size = slideSize.takeIf { it.width > 0 && it.height > 0 } ?: return
         viewModelScope.launch {
             val img = withContext(e.viewRenders) {
-                runCatching { e.session.renderView(p.id, size.width.toUInt(), size.height.toUInt(), false, false, null).toImageBitmap() }.getOrNull()
+                runCatching { e.session.renderView(p.id, size.width.toUInt(), size.height.toUInt(), false, false, null, null).toImageBitmap() }.getOrNull()
             }
             if (slideshow == i && img != null) slideshowImage = img
             photos.getOrNull((i + 1) % photos.size)?.let { n ->
@@ -2331,7 +2351,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Crop's Aspect shows the whole photo under its frame; its Geometry, the photo as it comes out
         // Guided Upright draws its guides on the photo as the crop tool shows it
         val cropView = ed.tool == MainTool.CROP && (ed.cropTab != "geometry" || ed.state?.upright == "guided")
-        viewRequests.value = ViewRequest(ed.photoId, w, h, draft, ed.showingBefore && ed.tool != MainTool.CROP, cropView, mask, ++requestSeq)
+        val clipping = ed.clippingPreview.takeUnless { ed.showingBefore || cropView || ed.tool != MainTool.EDIT }
+        viewRequests.value = ViewRequest(ed.photoId, w, h, draft, ed.showingBefore && ed.tool != MainTool.CROP, cropView, mask, clipping, ++requestSeq)
     }
 
     /** The mask the view shows over the photo, as the masking options ask (none outside Masking). */
@@ -2358,7 +2379,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val current = ed.detail
         // what is on screen is already there
         if (current != null && current.base === base && current.frame == frame && current.window.covers(rect)) return
-        detailRequests.value = DetailRequest(ed.photoId, frame, rect, ed.showingBefore, viewMask(ed), base)
+        val clipping = ed.clippingPreview.takeUnless { ed.showingBefore || ed.tool != MainTool.EDIT }
+        detailRequests.value = DetailRequest(ed.photoId, frame, rect, ed.showingBefore, viewMask(ed), clipping, base)
     }
 
     private suspend fun renderDetails(e: Engine) {
@@ -2369,7 +2391,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     e.session.renderViewWindow(
                         req.photo, req.frame.width.toUInt(), req.frame.height.toUInt(),
-                        w.left.toUInt(), w.top.toUInt(), w.width.toUInt(), w.height.toUInt(), req.before, req.mask,
+                        w.left.toUInt(), w.top.toUInt(), w.width.toUInt(), w.height.toUInt(), req.before, req.mask, req.clipping,
                     )?.toImageBitmap()
                 }.getOrNull()
             }
@@ -2389,7 +2411,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val img = if (req.crop) {
                         e.session.renderCropView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft)
                     } else {
-                        e.session.renderView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft, req.before, req.mask)
+                        e.session.renderView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft, req.before, req.mask, req.clipping)
                     }
                     img.histogram to img.toImageBitmap()
                 }
@@ -3712,6 +3734,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (ed.sub == "curve" && control.id.startsWith("curve.")) refreshCurve()
                 }
                 .onFailure { say(it.message) }
+        }
+    }
+
+    fun setClippingPreview(ed: EditorState, controlId: String, active: Boolean) {
+        if (editor !== ed) return
+        val preview = if (active && ed.tool == MainTool.EDIT) {
+            when (controlId) {
+                "light.highlights", "light.whites" -> ClippingPreview.HIGHLIGHTS
+                "light.shadows", "light.blacks" -> ClippingPreview.SHADOWS
+                else -> null
+            }
+        } else {
+            null
+        }
+        if (ed.clippingPreview != preview) {
+            ed.clippingPreview = preview
+            requestView(draft = true)
         }
     }
 

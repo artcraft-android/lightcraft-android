@@ -327,6 +327,7 @@ private fun Slider(vm: AppViewModel, ed: EditorState, row: SliderRow) {
         onChange = { vm.onControlChange(c, it) },
         onFinished = vm::onControlChangeFinished,
         onReset = { vm.resetControl(c) },
+        onClippingPreview = { active -> vm.setClippingPreview(ed, c.id, active) },
         label = row.label ?: c.label,
         enabled = row.enabled(ed),
     )
