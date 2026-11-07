@@ -23,6 +23,7 @@ fn demo_lists_photos_controls_and_commands() {
     let id = first_photo(&s);
     s.open_photo(id).unwrap();
     assert_eq!(s.active_photo(), Some(id));
+    assert!(!s.develop_state().unwrap().denoise_enabled);
     let commands = s.commands();
     assert!(commands.iter().any(|c| c.id == "develop.set" && c.enabled));
     assert!(commands.iter().any(|c| c.id == "edit.undo" && !c.enabled && c.disabled_reason.is_some()));
@@ -41,6 +42,18 @@ fn demo_lists_photos_controls_and_commands() {
     assert!(control(&s, RELATIVE_TEMP).value.abs() < 1e-6);
     let tint = control(&s, "wb.tint");
     assert_eq!((tint.min, tint.max), (-100.0, 100.0));
+}
+
+#[test]
+fn denoise_models_use_the_configured_folder() {
+    let dir = temp_dir("denoise-models");
+    let s = MobileSession::demo();
+    assert!(s.set_denoise_models_dir("relative-models".into()).is_err());
+    s.set_denoise_models_dir(dir.to_string_lossy().into_owned()).unwrap();
+    let listed: serde_json::Value = serde_json::from_str(&s.execute("denoise.models.list".into(), "{}".into()).unwrap()).unwrap();
+    assert_eq!(listed["dir"].as_str(), Some(dir.to_string_lossy().as_ref()));
+    assert_eq!(listed["runtime"], true);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// The editor's Undo reaches back only to where the photo was opened: a library step before it (an
