@@ -71,7 +71,8 @@ rebuilds only what changed. Gradle finds `cargo` in `~/.cargo/bin` (or `$CARGO`)
   `end_adjustment`): previews while the finger moves, one undo step when it lifts. During a drag the
   view renders at draft quality and half size, then at full quality when the drag ends. A per-view
   `StageCache` means a drag reruns only the pipeline stages its setting feeds. The newest request
-  always wins: a busy render loop skips the requests that came in while it was rendering.
+  always wins: a busy render loop skips the requests that came in while it was rendering. Move
+  Highlights, Shadows, Whites or Blacks with two fingers to preview clipping as you adjust.
 - **The panel builds itself** from the engine's control specs (`develop_controls`): sections, ranges,
   defaults, precision and track styles (temperature, tint, hue, colour gradients). Double-tap a
   slider's label to reset it. White balance matches the desktop: a relative Temp slider (−100…100,

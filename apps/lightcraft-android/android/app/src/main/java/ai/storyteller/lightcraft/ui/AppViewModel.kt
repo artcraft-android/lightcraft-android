@@ -3,6 +3,7 @@ package ai.storyteller.lightcraft.ui
 import ai.storyteller.lightcraft.LightcraftApplication
 import ai.storyteller.lightcraft.core.AlbumInfo
 import ai.storyteller.lightcraft.core.Choice
+import ai.storyteller.lightcraft.core.ClippingPreview
 import ai.storyteller.lightcraft.core.CropFrame
 import ai.storyteller.lightcraft.core.DevelopControl
 import ai.storyteller.lightcraft.core.DevelopState
@@ -57,6 +58,7 @@ import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -70,6 +72,16 @@ import org.json.JSONObject
 
 /** A snackbar message, with an optional action. */
 class UiMessage(val text: String, val actionLabel: String? = null, val action: (() -> Unit)? = null)
+
+data class MergeDialogState(
+    val command: String,
+    val title: String,
+    val ids: List<ULong>,
+    val projection: String,
+    val preview: ImageBitmap? = null,
+    val loading: Boolean = true,
+    val error: String? = null,
+)
 
 /**
  * The editor's main tools along the bottom, the reference app's row. Labelled, a tool is as wide as
@@ -257,6 +269,7 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     var detail by mutableStateOf<ViewDetail?>(null)
     var histogram by mutableStateOf<ImageHistogram?>(null)
     var showingBefore by mutableStateOf(false)
+    var clippingPreview by mutableStateOf<ClippingPreview?>(null)
 
     /** View options' sheet is open over the editor. */
     var viewOptions by mutableStateOf(false)
@@ -581,6 +594,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var selected by mutableStateOf<Set<ULong>>(emptySet())
         private set
+    var merging by mutableStateOf(false)
+        private set
+    var mergeDialog by mutableStateOf<MergeDialogState?>(null)
+        private set
+    private var mergePreviewRequest = 0L
 
     /** Photos (and looks, and sizes) already prepared for the editor. */
     private val prefetched = HashSet<String>()
@@ -592,10 +610,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val looks = BitmapCache(32 shl 20)
     val messages = Channel<UiMessage>(Channel.BUFFERED)
 
-    private data class ViewRequest(val photo: ULong, val width: Int, val height: Int, val draft: Boolean, val before: Boolean, val crop: Boolean, val mask: MaskOverlay?, val seq: Long)
+    private data class ViewRequest(
+        val photo: ULong,
+        val width: Int,
+        val height: Int,
+        val draft: Boolean,
+        val before: Boolean,
+        val crop: Boolean,
+        val mask: MaskOverlay?,
+        val clipping: ClippingPreview?,
+        val seq: Long,
+    )
 
     /** The part of the zoomed view to render sharp over [base] (see [ViewDetail]). */
-    private class DetailRequest(val photo: ULong, val frame: IntSize, val window: IntRect, val before: Boolean, val mask: MaskOverlay?, val base: ImageBitmap)
+    private class DetailRequest(
+        val photo: ULong,
+        val frame: IntSize,
+        val window: IntRect,
+        val before: Boolean,
+        val mask: MaskOverlay?,
+        val clipping: ClippingPreview?,
+        val base: ImageBitmap,
+    )
 
     /** The latest view the editor wants: a busy render loop skips straight to the newest. */
     private val viewRequests = MutableStateFlow<ViewRequest?>(null)
@@ -1109,7 +1145,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val size = slideSize.takeIf { it.width > 0 && it.height > 0 } ?: return
         viewModelScope.launch {
             val img = withContext(e.viewRenders) {
-                runCatching { e.session.renderView(p.id, size.width.toUInt(), size.height.toUInt(), false, false, null).toImageBitmap() }.getOrNull()
+                runCatching { e.session.renderView(p.id, size.width.toUInt(), size.height.toUInt(), false, false, null, null).toImageBitmap() }.getOrNull()
             }
             if (slideshow == i && img != null) slideshowImage = img
             photos.getOrNull((i + 1) % photos.size)?.let { n ->
@@ -1790,6 +1826,112 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         selected = emptySet()
     }
 
+    /** Open the shared merge engine's preview and options for the selected photos. */
+    fun mergeSelected(command: String) {
+        val (title, minimum) = when (command) {
+            "merge.hdr" -> "HDR Merge" to 2
+            "merge.panorama" -> "Panorama Merge" to 2
+            "merge.hdrPanorama" -> "HDR Panorama Merge" to 4
+            else -> {
+                say("Unsupported merge type")
+                return
+            }
+        }
+        val ids = photos.filter { it.id in selected }.map { it.id }
+        if (engine == null || view.kind == "deleted" || ids.size < minimum || merging) return
+        mergeDialog = MergeDialogState(command, title, ids, "auto")
+        loadMergePreview(mergeDialog ?: return)
+    }
+
+    fun dismissMergeDialog() {
+        mergePreviewRequest++
+        mergeDialog = null
+    }
+
+    fun setMergeProjection(projection: String) {
+        val dialog = mergeDialog ?: return
+        if (projection !in setOf("auto", "spherical", "cylindrical", "perspective") || dialog.projection == projection) return
+        val next = dialog.copy(projection = projection, preview = null, loading = true, error = null)
+        mergeDialog = next
+        loadMergePreview(next)
+    }
+
+    private fun mergeParams(dialog: MergeDialogState, preview: Boolean = false, previewPath: String? = null): JSONObject =
+        JSONObject()
+            .put("ids", JSONArray(dialog.ids.map { it.toLong() }))
+            .put("align", true)
+            .put("deghost", "none")
+            .put("autoSettings", true)
+            .put("stack", false)
+            .put("projection", dialog.projection)
+            .put("boundaryWarp", 0.0)
+            .put("autoCrop", true)
+            .put("fillEdges", false)
+            .put("bracket", 0)
+            .put("preview", preview)
+            .apply { previewPath?.let { put("previewPath", it) } }
+
+    private fun loadMergePreview(dialog: MergeDialogState) {
+        val e = engine ?: return
+        val request = ++mergePreviewRequest
+        viewModelScope.launch {
+            try {
+                val image = withContext(Dispatchers.IO) {
+                    val previewFile = File.createTempFile("merge-preview-", ".png", getApplication<Application>().cacheDir)
+                    try {
+                        e.command {
+                            execute(
+                                dialog.command,
+                                mergeParams(dialog, preview = true, previewPath = previewFile.absolutePath).toString(),
+                            )
+                        }
+                        val bytes = previewFile.readBytes()
+                        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            ?: throw IllegalStateException("The merge preview could not be decoded")
+                    } finally {
+                        if (previewFile.exists() && !previewFile.delete()) {
+                            throw IllegalStateException("Could not remove the temporary merge preview")
+                        }
+                    }
+                }
+                if (request == mergePreviewRequest) {
+                    mergeDialog = mergeDialog?.copy(preview = image, loading = false, error = null)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (request == mergePreviewRequest) {
+                    mergeDialog = mergeDialog?.copy(loading = false, error = e.message ?: "Preview failed")
+                }
+            }
+        }
+    }
+
+    fun confirmMerge() {
+        val dialog = mergeDialog ?: return
+        val e = engine ?: return
+        if (dialog.loading || dialog.preview == null || merging) return
+        dismissMergeDialog()
+        merging = true
+        say("Merging ${dialog.title.removeSuffix(" Merge")}…")
+        viewModelScope.launch {
+            try {
+                val response = e.command { execute(dialog.command, mergeParams(dialog).toString()) }
+                val mergedId = JSONObject(response).optString("id").toULongOrNull()
+                    ?: throw IllegalStateException("The merge finished without returning the new photo")
+                refreshPhotos()
+                if (selecting) selected = setOf(mergedId)
+                say("${dialog.title.removeSuffix(" Merge")} merge added")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                say("${dialog.title.removeSuffix(" Merge")} merge failed: ${e.message ?: "Unknown error"}")
+            } finally {
+                merging = false
+            }
+        }
+    }
+
     /**
      * Run [command] with the selected photos' ids added to [params], then leave select mode if [done];
      * [after] gets the step's mark (for an Undo, see [sayUndoable]).
@@ -2220,7 +2362,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Crop's Aspect shows the whole photo under its frame; its Geometry, the photo as it comes out
         // Guided Upright draws its guides on the photo as the crop tool shows it
         val cropView = ed.tool == MainTool.CROP && (ed.cropTab != "geometry" || ed.state?.upright == "guided")
-        viewRequests.value = ViewRequest(ed.photoId, w, h, draft, ed.showingBefore && ed.tool != MainTool.CROP, cropView, mask, ++requestSeq)
+        val clipping = ed.clippingPreview.takeUnless { ed.showingBefore || cropView || ed.tool != MainTool.EDIT }
+        viewRequests.value = ViewRequest(ed.photoId, w, h, draft, ed.showingBefore && ed.tool != MainTool.CROP, cropView, mask, clipping, ++requestSeq)
     }
 
     /** The mask the view shows over the photo, as the masking options ask (none outside Masking). */
@@ -2247,7 +2390,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val current = ed.detail
         // what is on screen is already there
         if (current != null && current.base === base && current.frame == frame && current.window.covers(rect)) return
-        detailRequests.value = DetailRequest(ed.photoId, frame, rect, ed.showingBefore, viewMask(ed), base)
+        val clipping = ed.clippingPreview.takeUnless { ed.showingBefore || ed.tool != MainTool.EDIT }
+        detailRequests.value = DetailRequest(ed.photoId, frame, rect, ed.showingBefore, viewMask(ed), clipping, base)
     }
 
     private suspend fun renderDetails(e: Engine) {
@@ -2258,7 +2402,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     e.session.renderViewWindow(
                         req.photo, req.frame.width.toUInt(), req.frame.height.toUInt(),
-                        w.left.toUInt(), w.top.toUInt(), w.width.toUInt(), w.height.toUInt(), req.before, req.mask,
+                        w.left.toUInt(), w.top.toUInt(), w.width.toUInt(), w.height.toUInt(), req.before, req.mask, req.clipping,
                     )?.toImageBitmap()
                 }.getOrNull()
             }
@@ -2278,7 +2422,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val img = if (req.crop) {
                         e.session.renderCropView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft)
                     } else {
-                        e.session.renderView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft, req.before, req.mask)
+                        e.session.renderView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft, req.before, req.mask, req.clipping)
                     }
                     img.histogram to img.toImageBitmap()
                 }
@@ -3601,6 +3745,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (ed.sub == "curve" && control.id.startsWith("curve.")) refreshCurve()
                 }
                 .onFailure { say(it.message) }
+        }
+    }
+
+    fun setClippingPreview(ed: EditorState, controlId: String, active: Boolean) {
+        if (editor !== ed) return
+        val preview = if (active && ed.tool == MainTool.EDIT) {
+            when (controlId) {
+                "light.highlights", "light.whites" -> ClippingPreview.HIGHLIGHTS
+                "light.shadows", "light.blacks" -> ClippingPreview.SHADOWS
+                else -> null
+            }
+        } else {
+            null
+        }
+        if (ed.clippingPreview != preview) {
+            ed.clippingPreview = preview
+            requestView(draft = true)
         }
     }
 
