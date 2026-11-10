@@ -132,6 +132,51 @@ private class Pen(private val scope: DrawScope, private val color: Color, weight
 
     fun ovalFill(x0: Float, y0: Float, x1: Float, y1: Float) = scope.drawOval(color, pt(x0, y0), Size((x1 - x0) * k, (y1 - y0) * k))
 
+    /**
+     * Optics, as the reference draws it: a lens ring thick on its near side, the crescent of light
+     * beside it, and the element inside. Traced from the reference's icon, on the 20 grid.
+     */
+    private fun optics() {
+        // the barrel's near rim
+        fill(
+            listOf(
+                12.93f to 17.00f, 9.60f to 16.92f, 8.66f to 16.53f, 7.43f to 14.90f,
+                6.72f to 12.85f, 6.48f to 11.19f, 6.48f to 8.89f, 6.88f to 6.60f,
+                7.35f to 5.25f, 8.06f to 4.07f, 8.97f to 3.24f, 9.76f to 3.00f,
+                13.95f to 3.00f, 14.67f to 3.24f, 15.58f to 4.07f, 15.89f to 4.62f,
+                16.60f to 6.68f, 16.92f to 8.50f, 17.00f to 10.47f, 16.84f to 12.29f,
+                16.45f to 13.95f, 15.81f to 15.38f, 14.82f to 16.68f, 14.19f to 16.92f,
+            ),
+        )
+        // its counter
+        cutFill(
+            listOf(
+                14.15f to 16.17f, 14.43f to 16.13f, 15.02f to 15.46f, 15.89f to 13.48f,
+                16.21f to 11.82f, 16.29f to 9.60f, 15.97f to 6.84f, 15.34f to 4.94f,
+                15.02f to 4.38f, 14.35f to 3.71f, 13.80f to 3.63f, 12.73f to 4.78f,
+                12.02f to 6.52f, 11.70f to 8.50f, 11.70f to 11.66f, 12.02f to 13.48f,
+                12.65f to 15.14f, 13.40f to 16.05f,
+            ),
+        )
+        // the crescent of light beside it
+        fill(
+            listOf(
+                6.60f to 15.18f, 4.94f to 15.10f, 4.03f to 14.35f, 3.24f to 12.61f,
+                3.00f to 11.19f, 3.00f to 8.73f, 3.16f to 7.71f, 3.55f to 6.52f,
+                4.11f to 5.57f, 4.78f to 4.90f, 5.65f to 4.66f, 6.64f to 4.70f,
+                5.77f to 6.84f, 5.45f to 8.89f, 5.45f to 11.11f, 5.61f to 12.37f,
+            ),
+        )
+        // the glass inside
+        fill(
+            listOf(
+                13.32f to 14.07f, 13.05f to 13.88f, 12.57f to 11.19f, 12.65f to 7.86f,
+                13.24f to 5.85f, 13.92f to 6.36f, 14.39f to 7.07f, 14.79f to 7.86f,
+                15.10f to 9.05f, 15.10f to 10.95f, 14.86f to 11.90f, 14.15f to 13.24f,
+            ),
+        )
+    }
+
     /** A checkerboard of [cell]-unit squares over the grid, only those whose middle [inside] accepts. */
     fun checker(cell: Float, inside: (Float, Float) -> Boolean) {
         var row = 0
@@ -334,11 +379,7 @@ private class Pen(private val scope: DrawScope, private val color: Color, weight
                 circle(10f, 10f, 3.5f)
             }
             LcIcon.Detail -> closed(10f to 3.5f, 17f to 16f, 3f to 16f)
-            LcIcon.Optics -> {
-                circle(10f, 10f, 7f)
-                circle(10f, 10f, 3f)
-                dot(12.6f, 7.4f, 0.9f)
-            }
+            LcIcon.Optics -> optics()
             LcIcon.Geometry -> {
                 closed(5.5f to 4f, 14.5f to 4f, 17.5f to 16f, 2.5f to 16f)
                 line(10f to 4f, 10f to 16f)
@@ -766,14 +807,7 @@ private class Pen(private val scope: DrawScope, private val color: Color, weight
                 cutDot(10f, 10f, 5.9f)
             }
             LcIcon.SectionDetail -> fill(listOf(10f to 2f, 16.5f to 18f, 3.5f to 18f))
-            LcIcon.SectionOptics -> {
-                // a lens from the side: its barrel, then its glass
-                rectFill(1f, 4.5f, 11f, 15.5f, 1.5f)
-                cutOval(6.3f, 0.3f, 18.9f, 19.7f)
-                ovalFill(7.5f, 1.5f, 17.7f, 18.5f)
-                cutOval(10.2f, 5.5f, 15.2f, 14.5f)
-                ovalFill(11.2f, 6.9f, 14.2f, 13.1f)
-            }
+            LcIcon.SectionOptics -> optics()
         }
     }
 }
