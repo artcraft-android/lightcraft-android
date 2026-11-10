@@ -115,6 +115,53 @@ fn clarity_lifts_a_subject_on_a_black_ground_and_spares_highlights() {
     assert!((b - a).abs() < 6.0, "light square {a} -> {b}");
 }
 
+// Issue #26: a mask's Contrast, Whites and Blacks move a photo as far as the sliders of the photo itself (a
+// mask covering the whole frame at full strength renders as the global slider does)
+#[test]
+fn a_full_frame_mask_matches_the_global_contrast_whites_and_blacks() {
+    use lightcraft_develop::{LocalAdjustments, Mask, MaskComponent, MaskOp, MaskShape};
+    use lightcraft_geom::Point;
+    let src = scene();
+    // a rendered photo, and a raw with its camera's tone curve (a raw without one carries Contrast in its tone
+    // map, `ToneMap::hdr`, which a mask doesn't follow)
+    let knots: [[f32; 2]; 32] = std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    });
+    let curve = crate::tone::CameraTone::new(knots);
+    for raw in [false, true] {
+        let info = SourceInfo { raw, camera_tone: curve.filter(|_| raw), ..Default::default() };
+        let shot = |s: &DevelopSettings| render(&src, &info, s, &RenderRequest::fit(240, 240)).image;
+        for (id, v) in [("light.contrast", 100.0), ("light.contrast", -100.0), ("light.whites", 100.0), ("light.blacks", -100.0)] {
+            let mut global = DevelopSettings::default();
+            controls::set(&mut global, id, v);
+            let mut adjust = LocalAdjustments::default();
+            match id {
+                "light.contrast" => adjust.contrast = v,
+                "light.whites" => adjust.whites = v,
+                _ => adjust.blacks = v,
+            }
+            // a linear gradient whose ends lie below the frame: full strength everywhere
+            let shape = MaskShape::Linear { start: Point::new(0.5, 5.0), end: Point::new(0.5, 6.0) };
+            let mut masked = DevelopSettings::default();
+            masked.masks.push(Mask {
+                id: 1,
+                visible: true,
+                components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
+                adjust,
+                ..Default::default()
+            });
+            let (a, b, plain) = (shot(&global), shot(&masked), shot(&DevelopSettings::default()));
+            let diff = |x: &lightcraft_raster::Rgba8, y: &lightcraft_raster::Rgba8| {
+                x.data.iter().zip(&y.data).map(|(p, q)| (0..3).map(|k| p[k].abs_diff(q[k]) as f32).sum::<f32>() / 3.0).sum::<f32>()
+                    / x.data.len() as f32
+            };
+            let (off, moved) = (diff(&a, &b), diff(&a, &plain));
+            assert!(moved > 3.0 && off < 0.6, "{id} {v} raw {raw}: mask off by {off:.2} levels, the slider moves {moved:.2}");
+        }
+    }
+}
+
 #[test]
 fn dehaze_does_not_crush_dark_regions_next_to_bright_ones() {
     // a dark field against a bright hazy sky; the blur bleeds the sky's dark channel ~10 px into

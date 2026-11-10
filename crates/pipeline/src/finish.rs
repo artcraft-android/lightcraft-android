@@ -12,7 +12,7 @@ use crate::colorops::ColorOps;
 use crate::geometry::Frame;
 use crate::local::{SURROUND_FLOOR, log_lum};
 use crate::output::{DeepImage, DeepSamples, OutputDepth, OutputSpace, OutputTrc};
-use crate::tone::{GREY, RangeGain, ToneMap, contrast_ev, wide};
+use crate::tone::{GREY, RangeGain, ToneMap, contrast_ev, display_sliders, wide};
 use crate::{Prepared, SourceInfo, for_rows};
 
 #[inline]
@@ -302,7 +302,7 @@ impl FinishParams {
 }
 
 /// One output pixel of [`finish_with`]: its index and position in the image, its log luminance
-/// before exposure, after it and after the scene adjustments, and its highlights/shadows base.
+/// before and after exposure, and its highlights/shadows base.
 #[derive(Clone, Copy)]
 struct Px {
     i: usize,
@@ -310,7 +310,6 @@ struct Px {
     y: usize,
     l_pre: f32,
     l0: f32,
-    l1: f32,
     base: f32,
 }
 
@@ -380,11 +379,38 @@ fn adjust_scene(p: &Prepared, fp: &FinishParams, i: usize, raw: [f32; 3], mut c:
     (c, dz != 0.0 || l_exp != 0.0)
 }
 
+/// [`contrast_ev`] (`c` in −1…1) on one scene-linear channel `v`.
+#[inline]
+fn contrast_px(c: f32, v: f32) -> f32 {
+    if c == 0.0 || v <= 0.0 { v } else { v * contrast_ev(c, (v / GREY).log2()).exp2() }
+}
+
+/// A mask's Whites `w` and Blacks `b` (−1…1) on the display-linear `d`, as the photo's own sliders move a value
+/// ([`display_sliders`]; issue #26): for a rendered photo (`per_channel`) Whites + and Blacks − on each channel
+/// of the wide space and Whites − and Blacks + on luminance, as its curve and [`RangeGain`] place them; on
+/// luminance for a raw, whose tone map takes them on luminance too.
+fn local_whites_blacks(mut d: [f32; 3], w: f32, b: f32, per_channel: bool, peak: f32) -> [f32; 3] {
+    let (wc, bc) = if per_channel { (w.max(0.0), b.min(0.0)) } else { (0.0, 0.0) };
+    let (wl, bl) = (w - wc, b - bc);
+    if wc != 0.0 || bc != 0.0 {
+        let s = wide();
+        d = s.from_wide(s.to_wide(d).map(|v| if v > 0.0 { display_sliders(v, wc, bc, peak) } else { v }));
+    }
+    if wl != 0.0 || bl != 0.0 {
+        let o = luminance_2020(d);
+        if o > 1e-9 {
+            let k = display_sliders(o, wl, bl, peak) / o;
+            d = d.map(|v| v * k);
+        }
+    }
+    d
+}
+
 /// The local tone in log luminance, as an EV shift: Highlights and Shadows (fitted to the photo),
 /// the masks' Whites, Blacks and Contrast, Clarity, Texture, sharpening and local Noise.
 fn local_tone_delta(p: &Prepared, fp: &FinishParams, px: &Px, l: &[f32; MASK_SUMS]) -> f32 {
-    let [_, _, _, l_con, l_hl, l_sh, l_wh, l_bl, l_tex, l_clar, _, _, _, l_sharp, l_noise, _, _] = *l;
-    let Px { i, x, y, l_pre, l0, l1, base } = *px;
+    let [_, _, _, _, l_hl, l_sh, _, _, l_tex, l_clar, _, _, _, l_sharp, l_noise, _, _] = *l;
+    let Px { i, x, y, l_pre, l0, base } = *px;
     let [hl_k, hl_at, sh_k, sh_at] = fp.hs_adapt;
     let [vx, vy, vw, vh] = fp.view;
     let mut delta = 0.0f32;
@@ -397,15 +423,6 @@ fn local_tone_delta(p: &Prepared, fp: &FinishParams, px: &Px, l: &[f32; MASK_SUM
         let ws = 2.01 * (1.0 - smooth(-4.46, 1.66, bs)) + 0.49 * (1.0 - smooth(-6.0, 8.48, bs));
         let wh = 0.436 * smooth(-7.6, 0.8, bh) + 0.878 * smooth(0.2, 2.8, bh);
         delta += ss * sh_k * ws + hh * hl_k * wh;
-    }
-    if l_wh != 0.0 {
-        delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
-    }
-    if l_bl != 0.0 {
-        delta += l_bl * 0.8 * (1.0 - smooth(-6.0, -1.5, l1));
-    }
-    if l_con != 0.0 {
-        delta += l_con * 0.14 * l1.clamp(-6.0, 4.0);
     }
     let cl = fp.clar + l_clar;
     if cl != 0.0
@@ -702,7 +719,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             // --- local tone in log luminance
             let l1 = if moved { log_lum(c) } else { l0 };
             let base = p.base.data[i] + ev + (l1 - l0);
-            let delta = local_tone_delta(p, fp, &Px { i, x, y, l_pre, l0, l1, base }, &l);
+            let delta = local_tone_delta(p, fp, &Px { i, x, y, l_pre, l0, base }, &l);
             if delta != 0.0 {
                 let g = delta.exp2();
                 c = c.map(|v| v * g);
@@ -714,10 +731,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             }
 
             // --- contrast, per channel of the wide space in scene EV (issue 7: Lightroom's spreads a
-            // colour's channels too)
-            if con != 0.0 {
+            // colour's channels too); a mask's after the photo's, on the same curve (#26)
+            let l_con = l[3];
+            if con != 0.0 || l_con != 0.0 {
                 let w = wide();
-                c = w.from_wide(w.to_wide(c).map(|v| if v > 0.0 { v * contrast_ev(con, (v / GREY).log2()).exp2() } else { v }));
+                c = w.from_wide(w.to_wide(c).map(|v| contrast_px(l_con, contrast_px(con, v))));
             }
 
             // --- a rendered photo's Whites − / Blacks +: an exposure by the pixel's brightness
@@ -728,7 +746,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
 
             // --- tone map: on each channel of the wide space for a rendered photo (its expansion's
             // inverse), on luminance with the camera's chroma curve otherwise; highlight desaturation
-            let (mut d, o) = if fp.per_channel {
+            let (mut d, mut o) = if fp.per_channel {
                 let w = wide();
                 let d = w.from_wide(w.to_wide(c).map(|v| tone.apply(v)));
                 (d, luminance_2020(d))
@@ -742,6 +760,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
                 (d, o)
             };
+            // --- a mask's Whites and Blacks, on the photo's toned values with the curve the sliders have (#26)
+            if l[6] != 0.0 || l[7] != 0.0 {
+                d = local_whites_blacks(d, l[6], l[7], fp.per_channel, peak);
+                o = luminance_2020(d);
+            }
             // (a rendered photo's channels were each rolled off already; the output clips the rest)
             let mx = d[0].max(d[1]).max(d[2]);
             if mx > peak && !fp.per_channel {

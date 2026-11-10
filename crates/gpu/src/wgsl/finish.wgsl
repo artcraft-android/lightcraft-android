@@ -60,6 +60,63 @@ fn wide_m(off: u32, c: vec3<f32>) -> vec3<f32> {
     return mul3(m, c);
 }
 
+// `lightcraft_pipeline::tone::display_sliders` (SDR): Whites `w` and Blacks `b` (−1…1) on a display-linear value.
+fn display_sliders(y: f32, w: f32, b: f32) -> f32 {
+    if (y <= 0.0) {
+        return 0.0;
+    }
+    var p = pow(y, 1.0 / 2.2);
+    if (b < 0.0) {
+        let bp = 0.2078 * pow(-b, 2.2152);
+        let v = (p - bp) / (1.0 - bp);
+        let s = 0.5 * (v + sqrt(v * v + 0.0004)) - 0.01;
+        let s1 = 0.5 * (1.0 + sqrt(1.0004)) - 0.01;
+        p = max(s / s1, 0.0);
+    } else if (b > 0.0) {
+        let q = min(p, 1.0);
+        p += 0.535 * b * q * (1.0 - q) * (1.0 - q);
+    }
+    if (w > 0.0) {
+        p *= 1.0 + 0.4469 * w * sstep(0.0209, 0.4361, p);
+    } else if (w < 0.0) {
+        p *= 1.0 + 0.0982 * w * sstep(0.2, 0.6, p);
+    }
+    var o = pow(max(p, 0.0), 2.2);
+    if (o > 0.95 && (w != 0.0 || b != 0.0)) {
+        let e = min(o - 0.95, 0.1);
+        o = 0.95 + e - e * e / 0.2;
+    }
+    return clamp(o, 0.0, 1.0);
+}
+
+// `lightcraft_pipeline::finish::local_whites_blacks` (SDR): a mask's Whites and Blacks on the display-linear `d`.
+fn local_whites_blacks(d0: vec3<f32>, w: f32, b: f32) -> vec3<f32> {
+    var d = d0;
+    var wc = 0.0;
+    var bc = 0.0;
+    if (pu(F_PER_CHANNEL) != 0u) {
+        wc = max(w, 0.0);
+        bc = min(b, 0.0);
+    }
+    let wl = w - wc;
+    let bl = b - bc;
+    if (wc != 0.0 || bc != 0.0) {
+        let v = wide_m(0u, d);
+        var r = v;
+        if (v.x > 0.0) { r.x = display_sliders(v.x, wc, bc); }
+        if (v.y > 0.0) { r.y = display_sliders(v.y, wc, bc); }
+        if (v.z > 0.0) { r.z = display_sliders(v.z, wc, bc); }
+        d = wide_m(9u, r);
+    }
+    if (wl != 0.0 || bl != 0.0) {
+        let o = lum2020(d);
+        if (o > 1e-9) {
+            d = d * (display_sliders(o, wl, bl) / o);
+        }
+    }
+    return d;
+}
+
 // `lightcraft_pipeline::tone::contrast_ev` on one scene-linear channel.
 fn contrast_px(c: f32, v: f32) -> f32 {
     if (v <= 0.0) {
@@ -484,15 +541,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let wh = 0.436 * sstep(-7.6, 0.8, bh) + 0.878 * sstep(0.2, 2.8, bh);
         delta += ss * pf(F_HS_ADAPT + 2u) * ws + hh * pf(F_HS_ADAPT) * wh;
     }
-    if (lt[6] != 0.0) {
-        delta += lt[6] * 0.8 * sstep(0.5, 3.0, l1);
-    }
-    if (lt[7] != 0.0) {
-        delta += lt[7] * 0.8 * (1.0 - sstep(-6.0, -1.5, l1));
-    }
-    if (lt[3] != 0.0) {
-        delta += lt[3] * 0.14 * clamp(l1, -6.0, 4.0);
-    }
     let cl = pf(F_CLAR) + lt[9];
     if (cl != 0.0 && pu(F_HAS_CLAR) != 0u) {
         let det = clamp(l_pre - clar[i], -2.5, 2.5);
@@ -542,10 +590,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // --- contrast, per channel of the wide space in scene EV
+    // (a mask's after the photo's, on the same curve: #26)
     let con = pf(F_CON);
-    if (con != 0.0) {
-        let w = wide_m(0u, c);
-        c = wide_m(9u, vec3<f32>(contrast_px(con, w.x), contrast_px(con, w.y), contrast_px(con, w.z)));
+    let l_con = lt[3];
+    if (con != 0.0 || l_con != 0.0) {
+        var w = wide_m(0u, c);
+        if (con != 0.0) {
+            w = vec3<f32>(contrast_px(con, w.x), contrast_px(con, w.y), contrast_px(con, w.z));
+        }
+        if (l_con != 0.0) {
+            w = vec3<f32>(contrast_px(l_con, w.x), contrast_px(l_con, w.y), contrast_px(l_con, w.z));
+        }
+        c = wide_m(9u, w);
     }
 
     // --- a rendered photo's Whites − / Blacks +: an exposure by the pixel's brightness
@@ -571,6 +627,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (k != 1.0) {
             d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
         }
+    }
+    // --- a mask's Whites and Blacks (`finish::local_whites_blacks`, #26)
+    if (lt[6] != 0.0 || lt[7] != 0.0) {
+        d = local_whites_blacks(d, lt[6], lt[7]);
+        o = lum2020(d);
     }
     let mx = max(d.x, max(d.y, d.z));
     if (mx > 1.0 && pu(F_PER_CHANNEL) == 0u) {

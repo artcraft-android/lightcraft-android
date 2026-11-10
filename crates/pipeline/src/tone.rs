@@ -339,42 +339,10 @@ impl ToneMap {
         let peak = if peak.is_finite() { peak.max(1.0) } else { 1.0 };
         let w = (whites / 100.0) as f32;
         let b = (blacks / 100.0) as f32;
-        // Neutral sliders are the identity up to white (issue #1945): the SDR shoulder below would
-        // pull 1.0 down to 0.9875 (8-bit 255 to 254), so it only shapes an edited curve.
-        let neutral = w == 0.0 && b == 0.0;
         let lut = (0..LUT_N)
             .map(|i| {
                 let ev = LUT_MIN_EV + (LUT_MAX_EV - LUT_MIN_EV) * i as f32 / (LUT_N - 1) as f32;
-                let y = GREY * 2f32.powf(ev);
-                let mut p = y.powf(1.0 / 2.2);
-                // Blacks and Whites (issue 7), shapes of our own whose few numbers were fitted to how far
-                // Lightroom's sliders move the greys of our test chart. Blacks −: the black point moves up
-                // (a soft toe) and the rest stretches back to white; +: the shadows lift, black stays black.
-                if b < 0.0 {
-                    let bp = 0.2078 * (-b).powf(2.2152);
-                    let soft = |v: f32| 0.5 * (v + (v * v + 0.0004).sqrt()) - 0.01;
-                    p = (soft((p - bp) / (1.0 - bp)) / soft(1.0)).max(0.0);
-                } else if b > 0.0 {
-                    let q = p.min(1.0);
-                    p += 0.535 * b * q * (1.0 - q) * (1.0 - q);
-                }
-                // Whites +: the mid-tones and highlights brighten towards white; −: the upper tones dim
-                if w > 0.0 {
-                    p *= 1.0 + 0.4469 * w * smooth(0.0209, 0.4361, p);
-                } else if w < 0.0 {
-                    p *= 1.0 + 0.0982 * w * smooth(0.2, 0.6, p);
-                }
-                let mut o = p.max(0.0).powf(2.2);
-                // short shoulder (SDR, edited curves): slope 1 at 0.95, reaching 1.0 at 1.05
-                if peak > 1.0 && o > 0.95 {
-                    // exponential shoulder: slope 1 at 0.95, asymptote at `peak`
-                    let r = peak - 0.95;
-                    o = 0.95 + r * (1.0 - (-(o - 0.95) / r).exp());
-                } else if o > 0.95 && !neutral {
-                    let d = (o - 0.95).min(0.1);
-                    o = 0.95 + d - d * d / 0.2;
-                }
-                o.clamp(0.0, peak)
+                display_sliders(GREY * 2f32.powf(ev), w, b, peak)
             })
             .collect();
         ToneMap { lut, chroma: NO_CHROMA }
@@ -464,6 +432,47 @@ impl RangeGain {
         let t = f - i as f32;
         self.lut[i] + (self.lut[i + 1] - self.lut[i]) * t
     }
+}
+
+/// Whites `w` and Blacks `b` (−1…1) on a display-linear value `y`: the shape [`ToneMap::display`] tables, for a
+/// value at a time (a mask's Whites and Blacks, whose amount varies from pixel to pixel: issue #26). Identity
+/// with both at 0; values above SDR white roll off towards `peak` (1 = SDR).
+pub fn display_sliders(y: f32, w: f32, b: f32, peak: f32) -> f32 {
+    if y.is_nan() || y <= 0.0 {
+        return 0.0;
+    }
+    // Neutral sliders are the identity up to white (issue #1945): the SDR shoulder below would
+    // pull 1.0 down to 0.9875 (8-bit 255 to 254), so it only shapes an edited curve.
+    let neutral = w == 0.0 && b == 0.0;
+    let mut p = y.powf(1.0 / 2.2);
+    // Blacks and Whites (issue 7), shapes of our own whose few numbers were fitted to how far
+    // Lightroom's sliders move the greys of our test chart. Blacks −: the black point moves up
+    // (a soft toe) and the rest stretches back to white; +: the shadows lift, black stays black.
+    if b < 0.0 {
+        let bp = 0.2078 * (-b).powf(2.2152);
+        let soft = |v: f32| 0.5 * (v + (v * v + 0.0004).sqrt()) - 0.01;
+        p = (soft((p - bp) / (1.0 - bp)) / soft(1.0)).max(0.0);
+    } else if b > 0.0 {
+        let q = p.min(1.0);
+        p += 0.535 * b * q * (1.0 - q) * (1.0 - q);
+    }
+    // Whites +: the mid-tones and highlights brighten towards white; −: the upper tones dim
+    if w > 0.0 {
+        p *= 1.0 + 0.4469 * w * smooth(0.0209, 0.4361, p);
+    } else if w < 0.0 {
+        p *= 1.0 + 0.0982 * w * smooth(0.2, 0.6, p);
+    }
+    let mut o = p.max(0.0).powf(2.2);
+    // short shoulder (SDR, edited curves): slope 1 at 0.95, reaching 1.0 at 1.05
+    if peak > 1.0 && o > 0.95 {
+        // exponential shoulder: slope 1 at 0.95, asymptote at `peak`
+        let r = peak - 0.95;
+        o = 0.95 + r * (1.0 - (-(o - 0.95) / r).exp());
+    } else if o > 0.95 && !neutral {
+        let d = (o - 0.95).min(0.1);
+        o = 0.95 + d - d * d / 0.2;
+    }
+    o.clamp(0.0, peak)
 }
 
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
