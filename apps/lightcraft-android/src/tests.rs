@@ -245,6 +245,21 @@ fn quick_views_and_prefetch_prepare_the_editor() {
 }
 
 #[test]
+fn preset_thumbnails_start_from_a_blank_base() {
+    let s = MobileSession::demo();
+    let id = first_photo(&s);
+    s.open_photo(id).unwrap();
+    let presets = s.presets();
+    let target = presets[0].id.clone();
+    let clean = s.render_preset_thumbnail(id, target.clone(), 96).unwrap();
+    // an edit changes the photo, not the look's own preview
+    s.apply_preset(presets[1].id.clone(), 100.0).unwrap();
+    let after = s.render_preset_thumbnail(id, target, 96).unwrap();
+    assert_eq!(clean.width, after.width);
+    assert!(clean.rgba == after.rgba, "a preset's thumbnail must not carry the current edits");
+}
+
+#[test]
 fn presets_profiles_and_the_panel_state() {
     let s = MobileSession::demo();
     let id = first_photo(&s);

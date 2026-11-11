@@ -607,6 +607,30 @@ private fun SideArea(vm: AppViewModel, ed: EditorState) {
             ModeStrip(onCancel = vm::cancelMasking, onApply = vm::applyMasking)
             return@Row
         }
+        if (ed.tool == MainTool.PRESETS && ed.lastPreset != null) {
+            // sideways the reference trades the tool column for Cancel and Done while a preset is set
+            // measured on the reference: glyphs 40 px across, their centres 20 dp in from the screen's edge
+            Column(
+                // the reference draws a hairline where the presets panel meets this rail
+                Modifier.width(53.5.dp).fillMaxHeight()
+                    .drawBehind { drawRect(Lc.toolRowsHairline, size = Size(1.dp.toPx(), size.height)) },
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(Modifier.size(40.dp, 53.5.dp).clickable(role = Role.Button) {
+                    vm.clearPreset()
+                    vm.selectTool(MainTool.PRESETS)
+                }.semantics { contentDescription = "Cancel" }, contentAlignment = Alignment.Center) {
+                    MdIcon(MdIcon.Close, null, tint = Lc.panelText, size = 25.dp)
+                }
+                Box(Modifier.size(40.dp, 53.5.dp).clickable(role = Role.Button) {
+                    vm.selectTool(MainTool.PRESETS)
+                }.semantics { contentDescription = "Done" }, contentAlignment = Alignment.Center) {
+                    MdIcon(MdIcon.Check, null, tint = Lc.panelText, size = 25.dp)
+                }
+            }
+            return@Row
+        }
         val labels = ed.tool == null
         // no tool open: the tools are a card of their own at the top of the side; one open, a column with a hairline along it
         Column(
@@ -1073,6 +1097,33 @@ private fun ToolDivider(column: Boolean) {
 /** The tools, centred; labelled (68 dp) until one is open (53.5 dp), as the reference app's. */
 @Composable
 private fun ToolRow(vm: AppViewModel, ed: EditorState) {
+    // while a preset is being set up the reference replaces the tools with Cancel and Done
+    if (ed.tool == MainTool.PRESETS && ed.lastPreset != null && ed.presetAmountOpen) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .drawBehind { drawRect(Lc.toolRowsHairline, Offset(0.5.dp.toPx(), 0.5.dp.toPx()), Size(size.width - 1.dp.toPx(), 1.dp.toPx())) }
+                .padding(bottom = 7.8.dp)
+                .height(53.5.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            // Cancel and Done at the two ends, the tool's name exactly in the middle
+            // the reference's glyphs are 14 dp across, centred 27 dp in from either edge
+            Box(Modifier.align(Alignment.CenterStart).size(54.4.dp).clickable(role = Role.Button) {
+                vm.clearPreset()
+                vm.selectTool(MainTool.PRESETS)
+            }.semantics { contentDescription = "Cancel" }, contentAlignment = Alignment.Center) {
+                MdIcon(MdIcon.Close, null, tint = Lc.panelText, size = 25.dp)
+            }
+            Text("Presets", color = Lc.panelText, fontFamily = Inter, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            Box(Modifier.align(Alignment.CenterEnd).size(54.4.dp).clickable(role = Role.Button) {
+                vm.selectTool(MainTool.PRESETS)
+            }.semantics { contentDescription = "Done" }, contentAlignment = Alignment.Center) {
+                MdIcon(MdIcon.Check, null, tint = Lc.panelText, size = 25.dp)
+            }
+        }
+        return
+    }
     val labels = ed.tool == null
     if (labels) {
         Box(Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 8.dp), contentAlignment = Alignment.Center) {
