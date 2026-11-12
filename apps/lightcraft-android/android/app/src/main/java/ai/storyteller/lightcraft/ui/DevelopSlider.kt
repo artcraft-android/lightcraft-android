@@ -164,6 +164,7 @@ private const val EDGE = 16f
 /** The row's height and where its track runs (dp from the row's top). */
 private const val ROW = 52f
 private const val TRACK_Y = 36.2f
+private val clippingPreviewControls = setOf("light.highlights", "light.shadows", "light.whites", "light.blacks")
 
 /**
  * One develop slider, as the reference's (52 dp): its name and value (15 sp) over a thin track that runs
@@ -182,6 +183,7 @@ fun DevelopSlider(
     modifier: Modifier = Modifier,
     label: String = control.label,
     enabled: Boolean = true,
+    onClippingPreview: (Boolean) -> Unit = {},
 ) {
     val scale = remember(control.id, control.min, control.max) { SliderScale.of(control) }
     val drag = LocalSliderDrag.current
@@ -190,6 +192,8 @@ fun DevelopSlider(
     val change by rememberUpdatedState(onChange)
     val finished by rememberUpdatedState(onFinished)
     val reset by rememberUpdatedState(onReset)
+    val clippingPreviewChange by rememberUpdatedState(onClippingPreview)
+    val supportsClippingPreview = control.id in clippingPreviewControls
     var dragging by remember { mutableStateOf(false) }
     // a double-tap within a second of a drag isn't a reset (the reference's)
     var lastDragEnd by remember { mutableStateOf(0L) }
@@ -234,41 +238,52 @@ fun DevelopSlider(
                     val slop = viewConfiguration.touchSlop
                     val travel = (size.width - 2 * edge - 2 * RING_OUTER.dp.toPx()).coerceAtLeast(1f)
                     var moving = false
+                    var clippingPreview = false
                     var p0 = 0f
                     var last = 0.0
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
-                        if (!pointer.pressed) break
-                        val d = pointer.position - down.position
-                        if (!moving) {
-                            if (abs(d.x) <= slop && abs(d.y) <= slop) continue
-                            // up or down: the list scrolls
-                            if (abs(d.x) <= abs(d.y)) break
-                            // sideways but slow to start: nothing at all, not even a tap
-                            if (pointer.uptimeMillis - down.uptimeMillis > 250) {
-                                do {
-                                    val rest = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                                    rest.consume()
-                                } while (rest.pressed)
-                                break
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!pointer.pressed) break
+                            val d = pointer.position - down.position
+                            if (!moving) {
+                                if (abs(d.x) <= slop && abs(d.y) <= slop) continue
+                                // up or down: the list scrolls
+                                if (abs(d.x) <= abs(d.y)) break
+                                // sideways but slow to start: nothing at all, not even a tap
+                                if (pointer.uptimeMillis - down.uptimeMillis > 250) {
+                                    do {
+                                        val rest = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                                        rest.consume()
+                                    } while (rest.pressed)
+                                    break
+                                }
+                                moving = true
+                                dragging = true
+                                p0 = scale.position(current.value)
+                                last = current.value
+                                drag?.id = current.id
+                                drag?.text = pill(current.value)
                             }
-                            moving = true
-                            dragging = true
-                            p0 = scale.position(current.value)
-                            last = current.value
-                            drag?.id = current.id
-                            drag?.text = pill(current.value)
+                            val hasTwoFingers = supportsClippingPreview && event.changes.count { it.pressed } >= 2
+                            if (hasTwoFingers != clippingPreview) {
+                                clippingPreview = hasTwoFingers
+                                clippingPreviewChange(clippingPreview)
+                            }
+                            pointer.consume()
+                            if (hasTwoFingers) event.changes.filter { it.pressed && it.id != down.id }.forEach { it.consume() }
+                            val v = scale.value(p0 + d.x / travel, current.step)
+                            if (v != last) {
+                                val def = current.defaultValue
+                                if (v == def || (last - def).sign * (v - def).sign < 0) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                last = v
+                                drag?.text = pill(v)
+                                change(v)
+                            }
                         }
-                        pointer.consume()
-                        val v = scale.value(p0 + d.x / travel, current.step)
-                        if (v != last) {
-                            val def = current.defaultValue
-                            if (v == def || (last - def).sign * (v - def).sign < 0) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                            last = v
-                            drag?.text = pill(v)
-                            change(v)
-                        }
+                    } finally {
+                        if (clippingPreview) clippingPreviewChange(false)
                     }
                     if (moving) {
                         dragging = false

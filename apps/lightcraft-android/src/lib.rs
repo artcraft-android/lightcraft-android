@@ -138,6 +138,13 @@ pub struct MaskOverlay {
     pub opacity: u8,
 }
 
+/// Clipping view shown while a global tone slider is moved with two fingers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ClippingPreview {
+    Highlights,
+    Shadows,
+}
+
 /// An album (not a folder of albums) as the title menu lists it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AlbumInfo {
@@ -1016,6 +1023,7 @@ impl MobileSession {
         draft: bool,
         before: bool,
         mask_overlay: Option<MaskOverlay>,
+        clipping_preview: Option<ClippingPreview>,
     ) -> Result<RenderedImage, MobileError> {
         let photo = PhotoId(id);
         let (w, h) = (max_width.max(1) as usize, max_height.max(1) as usize);
@@ -1025,7 +1033,7 @@ impl MobileSession {
         }
         .ok_or(MobileError::NoPhoto(id))?
         .with_stages(self.stages_for(photo, before));
-        let job = with_mask_overlay(job, mask_overlay);
+        let job = with_view_overlay(job, mask_overlay, clipping_preview);
         let job = if draft { job.draft() } else { job };
         let r = job.run();
         self.lock().accept(&r);
@@ -1050,6 +1058,7 @@ impl MobileSession {
         height: u32,
         before: bool,
         mask_overlay: Option<MaskOverlay>,
+        clipping_preview: Option<ClippingPreview>,
     ) -> Result<Option<RenderedImage>, MobileError> {
         let photo = PhotoId(id);
         let (fw, fh) = (frame_width.max(1) as usize, frame_height.max(1) as usize);
@@ -1063,7 +1072,7 @@ impl MobileSession {
             if before { s.region_job_before(photo, fw, fh, window, true) } else { s.region_job(photo, fw, fh, window, true) }
         };
         let Some(job) = job else { return Ok(None) };
-        let r = with_mask_overlay(job, mask_overlay).run();
+        let r = with_view_overlay(job, mask_overlay, clipping_preview).run();
         self.lock().accept(&r);
         Ok(Some(rendered_image(id, r.rendered.map_err(MobileError::Render)?, false)))
     }
@@ -1420,6 +1429,14 @@ fn with_mask_overlay(job: RenderJob, overlay: Option<MaskOverlay>) -> RenderJob 
             })
         }
         None => job,
+    }
+}
+
+fn with_view_overlay(job: RenderJob, mask: Option<MaskOverlay>, clipping: Option<ClippingPreview>) -> RenderJob {
+    match clipping {
+        Some(ClippingPreview::Highlights) => job.with_overlay(lightcraft_engine::pipeline::Overlay::ClipHighlights),
+        Some(ClippingPreview::Shadows) => job.with_overlay(lightcraft_engine::pipeline::Overlay::ClipShadows),
+        None => with_mask_overlay(job, mask),
     }
 }
 
