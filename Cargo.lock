@@ -733,6 +733,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-crw"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=f3b62ec61f45534392376492fc5ad33047375205#f3b62ec61f45534392376492fc5ad33047375205"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
@@ -1218,6 +1226,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5c95b673b8f6f7235229ae11c5642d81b04c2e64c1e2fb417bc0cf73ca45f29"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2143,7 +2161,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "lightcraft-android"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "android_logger",
  "lightcraft-color",
@@ -2158,14 +2176,14 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-android-bindgen"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "uniffi",
 ]
 
 [[package]]
 name = "lightcraft-catalog"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -2186,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-codecs"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "avif-serialize",
  "bytemuck",
@@ -2217,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-color"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "lightcraft-geom",
  "proptest",
@@ -2226,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-denoise"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "faer-core",
  "lightcraft-denoise-core",
@@ -2243,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-denoise-core"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "dhat",
  "lightcraft-raster",
@@ -2259,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-develop"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "lightcraft-color",
  "lightcraft-geom",
@@ -2271,11 +2289,12 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-engine"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "ab_glyph",
  "chrono",
  "craft-docpath",
+ "fs4",
  "harfrust",
  "jxl-oxide",
  "libc",
@@ -2309,13 +2328,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "unicode-normalization",
  "unicode-segmentation",
  "web-time",
 ]
 
 [[package]]
 name = "lightcraft-faces"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "lightcraft-testkit",
  "matrixmultiply",
@@ -2330,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-fetch"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "log",
  "rustls",
@@ -2341,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-geocode"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "miniz_oxide 0.9.1",
  "serde",
@@ -2349,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-geom"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "proptest",
  "serde",
@@ -2357,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-gpu"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "bytemuck",
  "lightcraft-color",
@@ -2377,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-heif"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "heic-rs",
  "rayon",
@@ -2385,14 +2405,14 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-inpaint"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "lightcraft-lensdb"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "lightcraft-develop",
  "lightcraft-geom",
@@ -2401,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-merge"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "lightcraft-codecs",
  "lightcraft-color",
@@ -2417,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-meta"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "chrono",
  "lightcraft-geom",
@@ -2431,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-pipeline"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "dhat",
  "image",
@@ -2450,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-preview"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "jpeg-encoder",
  "lightcraft-raster",
@@ -2462,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-raster"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "libc",
  "lightcraft-color",
@@ -2474,8 +2494,10 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-raw"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
+ "chrono",
+ "craft-crw",
  "dhat",
  "jpeg-encoder",
  "jxl-oxide",
@@ -2498,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-scenes"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "image",
  "lightcraft-color",
@@ -2509,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-segment"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -2523,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-slideshow"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "lightcraft-raster",
  "serde",
@@ -2532,11 +2554,11 @@ dependencies = [
 
 [[package]]
 name = "lightcraft-testkit"
-version = "0.18.0"
+version = "0.20.0"
 
 [[package]]
 name = "lightcraft-tiff"
-version = "0.18.0"
+version = "0.20.0"
 dependencies = [
  "proptest",
  "serde",
@@ -4207,6 +4229,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4349,6 +4377,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

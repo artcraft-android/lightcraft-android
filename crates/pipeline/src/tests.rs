@@ -115,6 +115,56 @@ fn clarity_lifts_a_subject_on_a_black_ground_and_spares_highlights() {
     assert!((b - a).abs() < 6.0, "light square {a} -> {b}");
 }
 
+// Issue #26: a mask's Contrast, Whites and Blacks move a photo as far as the sliders of the photo itself (a
+// mask covering the whole frame at full strength renders as the global slider does). Under process V2: from V4
+// a raw with a camera look takes the photo's Contrast and Blacks from calibrated operators (`light_v3`), which
+// a mask's don't follow yet
+#[test]
+fn a_full_frame_mask_matches_the_global_contrast_whites_and_blacks() {
+    use lightcraft_develop::{LocalAdjustments, Mask, MaskComponent, MaskOp, MaskShape};
+    use lightcraft_geom::Point;
+    let src = scene();
+    // a rendered photo, and a raw with its camera's tone curve (a raw without one carries Contrast in its tone
+    // map, `ToneMap::hdr`, which a mask doesn't follow)
+    let knots: [[f32; 2]; 32] = std::array::from_fn(|i| {
+        let x = 0.004 * 1.18f32.powi(i as i32);
+        [x, 1.0 - (-2.0 * x).exp()]
+    });
+    let curve = crate::tone::CameraTone::new(knots);
+    for raw in [false, true] {
+        let info = SourceInfo { raw, camera_tone: curve.filter(|_| raw), ..Default::default() };
+        let shot = |s: &DevelopSettings| render(&src, &info, s, &RenderRequest::fit(240, 240)).image;
+        for (id, v) in [("light.contrast", 100.0), ("light.contrast", -100.0), ("light.whites", 100.0), ("light.blacks", -100.0)] {
+            let v2 = DevelopSettings { process: lightcraft_develop::Process::V2.version(), ..Default::default() };
+            let mut global = v2.clone();
+            controls::set(&mut global, id, v);
+            let mut adjust = LocalAdjustments::default();
+            match id {
+                "light.contrast" => adjust.contrast = v,
+                "light.whites" => adjust.whites = v,
+                _ => adjust.blacks = v,
+            }
+            // a linear gradient whose ends lie below the frame: full strength everywhere
+            let shape = MaskShape::Linear { start: Point::new(0.5, 5.0), end: Point::new(0.5, 6.0) };
+            let mut masked = v2.clone();
+            masked.masks.push(Mask {
+                id: 1,
+                visible: true,
+                components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
+                adjust,
+                ..Default::default()
+            });
+            let (a, b, plain) = (shot(&global), shot(&masked), shot(&v2));
+            let diff = |x: &lightcraft_raster::Rgba8, y: &lightcraft_raster::Rgba8| {
+                x.data.iter().zip(&y.data).map(|(p, q)| (0..3).map(|k| p[k].abs_diff(q[k]) as f32).sum::<f32>() / 3.0).sum::<f32>()
+                    / x.data.len() as f32
+            };
+            let (off, moved) = (diff(&a, &b), diff(&a, &plain));
+            assert!(moved > 3.0 && off < 0.6, "{id} {v} raw {raw}: mask off by {off:.2} levels, the slider moves {moved:.2}");
+        }
+    }
+}
+
 #[test]
 fn dehaze_does_not_crush_dark_regions_next_to_bright_ones() {
     // a dark field against a bright hazy sky; the blur bleeds the sky's dark channel ~10 px into
@@ -324,12 +374,16 @@ fn drafts_keep_wide_planes_across_a_noise_reduction_change_and_full_renders_do_n
     let full = RenderRequest { quality: Quality::Full, ..draft };
     let mut s = typical_edits();
     s.effects.clarity = 60.0;
+    s.detail.sharpen_amount = 80.0;
     render_cached(&src, &info, &s, &draft, &cache);
     let clarity_plane = |c: &StageCache| c.entries.lock().unwrap().first().and_then(|e| e.planes.clarity.clone()).unwrap().1;
+    let sharpen_plane = |c: &StageCache| c.entries.lock().unwrap().first().and_then(|e| e.planes.sharpen.clone()).unwrap().1;
     let first = clarity_plane(&cache);
+    let first_sharpen = sharpen_plane(&cache);
     s.detail.nr_luminance = 50.0;
     render_cached(&src, &info, &s, &draft, &cache);
     assert!(Arc::ptr_eq(&first, &clarity_plane(&cache)), "a draft redid the clarity plane for a noise-reduction change");
+    assert!(!Arc::ptr_eq(&first_sharpen, &sharpen_plane(&cache)), "a draft reused the old sharpening plane after noise reduction changed");
     for v in [10.0, 45.0, 80.0] {
         s.detail.nr_luminance = v;
         s.detail.nr_color = v / 2.0;
@@ -877,6 +931,48 @@ fn sliver_crops_render_quickly_with_wide_stages_on() {
         assert!(t.elapsed().as_secs_f64() < 20.0, "{rect:?}: {:?}", t.elapsed());
         assert!(r.image.width >= 1 && r.image.height >= 1, "{rect:?}");
     }
+}
+
+// Given a cached render with one process, a change to a process with another colour filter (Update
+// to Current Process, undo) renders like a fresh render, not the cached denoised image
+#[test]
+fn a_process_change_does_not_reuse_the_other_colour_filter() {
+    use crate::{StageCache, render_cached};
+    use lightcraft_develop::Process;
+    use std::sync::Arc;
+    let src = Arc::new(colour_noise_scene(128, 96, 128));
+    let info = SourceInfo::default();
+    let req = RenderRequest::fit(128, 96);
+    let cache = StageCache::default();
+    let mut old = DevelopSettings::default();
+    old.detail.nr_color = 25.0;
+    old.detail.nr_color_smoothness = 0.0;
+    old.process = Process::V2.version();
+    let current = DevelopSettings { process: Process::LATEST.version(), ..old.clone() };
+    let first = render_cached(&src, &info, &old, &req, &cache).image;
+    let fresh = render(&src, &info, &current, &req).image;
+    assert!(max_diff(&first, &fresh) > 0, "the two colour filters differ on this scene");
+    assert_eq!(render_cached(&src, &info, &current, &req, &cache).image, fresh, "process update");
+    assert_eq!(render_cached(&src, &info, &old, &req, &cache).image, first, "undo");
+}
+
+/// Flat grey with chroma noise: `quiet` columns on the left with little noise, the rest with much.
+pub(crate) fn colour_noise_scene(w: usize, h: usize, quiet: usize) -> Rgb32f {
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut noise = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 2.0
+    };
+    let mut img = Rgb32f::new(w, h);
+    for (i, p) in img.data.iter_mut().enumerate() {
+        let sigma = if i % w < quiet { 0.001 } else { 0.015 };
+        let y = 0.04f32;
+        let (r, b) = (y + noise() * sigma, y + noise() * sigma);
+        *p = [r, (y - 0.2627 * r - 0.0593 * b) / 0.6780, b];
+    }
+    img
 }
 
 /// A crop of no width used to give grain NaN coordinates (and NaN pixels); the render stays finite.
