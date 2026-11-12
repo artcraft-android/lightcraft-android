@@ -182,13 +182,19 @@ pub(super) fn rotate(s: &mut Session, p: &Value, cw: bool) -> Result<Value> {
     let targets = s.targets(p)?;
     let mut ops = Vec::new();
     for id in targets {
-        if let Some(d) = s.develop_of(id) {
-            let mut d = (*d).clone();
+        if let Some(before) = s.develop_of(id) {
+            let mut d = (*before).clone();
             d.orientation = d.orientation.rotated(cw);
             // the crop turns with the photo: the same part of it, in the turned frame, the lock's
             // ratio turned too (it is stored in the frame's normalized coordinates, so left alone
             // it would describe another part and shape)
+            let turn = lightcraft_geom::Orientation::Normal.rotated(cw);
             d.crop.geometry = d.crop.geometry.quarter_turned(cw);
+            // and so do the masks: on the photo first (an old one), then turned with it
+            s.attach_masks(id, &before, &mut d);
+            for m in &mut d.masks {
+                lightcraft_pipeline::mask_space::turn(m, turn);
+            }
             d.crop.aspect = d.crop.aspect.map(|(x, y)| (y, x));
             ops.extend(s.develop_op(id, d, "Rotate"));
         }
