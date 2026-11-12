@@ -51,6 +51,7 @@ import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,6 +63,16 @@ import org.json.JSONObject
 
 /** A snackbar message, with an optional action. */
 class UiMessage(val text: String, val actionLabel: String? = null, val action: (() -> Unit)? = null)
+
+data class MergeDialogState(
+    val command: String,
+    val title: String,
+    val ids: List<ULong>,
+    val projection: String,
+    val preview: ImageBitmap? = null,
+    val loading: Boolean = true,
+    val error: String? = null,
+)
 
 /**
  * The editor's main tools along the bottom, the reference app's row. Labelled, a tool is as wide as
@@ -558,6 +569,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var selected by mutableStateOf<Set<ULong>>(emptySet())
         private set
+    var merging by mutableStateOf(false)
+        private set
+    var mergeDialog by mutableStateOf<MergeDialogState?>(null)
+        private set
+    private var mergePreviewRequest = 0L
 
     /** Photos (and looks, and sizes) already prepared for the editor. */
     private val prefetched = HashSet<String>()
@@ -1579,6 +1595,112 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Select mode's Select None: nothing chosen, still selecting. */
     fun selectNone() {
         selected = emptySet()
+    }
+
+    /** Open the shared merge engine's preview and options for the selected photos. */
+    fun mergeSelected(command: String) {
+        val (title, minimum) = when (command) {
+            "merge.hdr" -> "HDR Merge" to 2
+            "merge.panorama" -> "Panorama Merge" to 2
+            "merge.hdrPanorama" -> "HDR Panorama Merge" to 4
+            else -> {
+                say("Unsupported merge type")
+                return
+            }
+        }
+        val ids = photos.filter { it.id in selected }.map { it.id }
+        if (engine == null || view.kind == "deleted" || ids.size < minimum || merging) return
+        mergeDialog = MergeDialogState(command, title, ids, "auto")
+        loadMergePreview(mergeDialog ?: return)
+    }
+
+    fun dismissMergeDialog() {
+        mergePreviewRequest++
+        mergeDialog = null
+    }
+
+    fun setMergeProjection(projection: String) {
+        val dialog = mergeDialog ?: return
+        if (projection !in setOf("auto", "spherical", "cylindrical", "perspective") || dialog.projection == projection) return
+        val next = dialog.copy(projection = projection, preview = null, loading = true, error = null)
+        mergeDialog = next
+        loadMergePreview(next)
+    }
+
+    private fun mergeParams(dialog: MergeDialogState, preview: Boolean = false, previewPath: String? = null): JSONObject =
+        JSONObject()
+            .put("ids", JSONArray(dialog.ids.map { it.toLong() }))
+            .put("align", true)
+            .put("deghost", "none")
+            .put("autoSettings", true)
+            .put("stack", false)
+            .put("projection", dialog.projection)
+            .put("boundaryWarp", 0.0)
+            .put("autoCrop", true)
+            .put("fillEdges", false)
+            .put("bracket", 0)
+            .put("preview", preview)
+            .apply { previewPath?.let { put("previewPath", it) } }
+
+    private fun loadMergePreview(dialog: MergeDialogState) {
+        val e = engine ?: return
+        val request = ++mergePreviewRequest
+        viewModelScope.launch {
+            try {
+                val image = withContext(Dispatchers.IO) {
+                    val previewFile = File.createTempFile("merge-preview-", ".png", getApplication<Application>().cacheDir)
+                    try {
+                        e.command {
+                            execute(
+                                dialog.command,
+                                mergeParams(dialog, preview = true, previewPath = previewFile.absolutePath).toString(),
+                            )
+                        }
+                        val bytes = previewFile.readBytes()
+                        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            ?: throw IllegalStateException("The merge preview could not be decoded")
+                    } finally {
+                        if (previewFile.exists() && !previewFile.delete()) {
+                            throw IllegalStateException("Could not remove the temporary merge preview")
+                        }
+                    }
+                }
+                if (request == mergePreviewRequest) {
+                    mergeDialog = mergeDialog?.copy(preview = image, loading = false, error = null)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (request == mergePreviewRequest) {
+                    mergeDialog = mergeDialog?.copy(loading = false, error = e.message ?: "Preview failed")
+                }
+            }
+        }
+    }
+
+    fun confirmMerge() {
+        val dialog = mergeDialog ?: return
+        val e = engine ?: return
+        if (dialog.loading || dialog.preview == null || merging) return
+        dismissMergeDialog()
+        merging = true
+        say("Merging ${dialog.title.removeSuffix(" Merge")}…")
+        viewModelScope.launch {
+            try {
+                val response = e.command { execute(dialog.command, mergeParams(dialog).toString()) }
+                val mergedId = JSONObject(response).optString("id").toULongOrNull()
+                    ?: throw IllegalStateException("The merge finished without returning the new photo")
+                refreshPhotos()
+                if (selecting) selected = setOf(mergedId)
+                say("${dialog.title.removeSuffix(" Merge")} merge added")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                say("${dialog.title.removeSuffix(" Merge")} merge failed: ${e.message ?: "Unknown error"}")
+            } finally {
+                merging = false
+            }
+        }
     }
 
     /**
