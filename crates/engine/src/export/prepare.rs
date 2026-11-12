@@ -1,6 +1,6 @@
 use super::batch::run_batch;
 use super::encoding::{encode_gain_map_jpeg, encode_rendered, export_metadata, removes_location};
-use super::options::{ExportFormat, ResizeMode};
+use super::options::ExportFormat;
 use super::params::apple_photos_unsupported;
 use super::{ExportOptions, Metadata, OutputDepth};
 
@@ -27,25 +27,6 @@ pub fn output_size(p: &lightcraft_catalog::Photo, o: &ExportOptions) -> (usize, 
         Some(r) => r.apply(w, h),
         None => (w as usize, h as usize),
     }
-}
-
-/// The box to render into for an output of `w × h` ([`output_size`]). The render fits the photo's
-/// aspect (at the resolution of the source it decodes, maybe a smaller one) into its box and
-/// rounds again, so a box of exactly `w × h` could come out a pixel short on the side the size
-/// options fix (a 2048 px long edge came out 2047). That side gets the box's length and the other
-/// a pixel to spare, so it is exactly what was asked for.
-fn render_box(o: &ExportOptions, w: usize, h: usize) -> (usize, usize) {
-    let Some(r) = &o.resize else { return (w, h) };
-    let (width_fixed, long) = match r.mode {
-        ResizeMode::LongEdge => (w >= h, true),
-        ResizeMode::ShortEdge => (w < h, false),
-        ResizeMode::Width => (true, false),
-        ResizeMode::Height => (false, false),
-        ResizeMode::Dimensions | ResizeMode::WidthHeight | ResizeMode::Megapixels | ResizeMode::Percent => return (w, h),
-    };
-    // a long edge stays the long edge (a square crop doesn't come out a pixel taller than wide)
-    let spare = |fixed: usize, free: usize| if long { (free + 1).min(fixed) } else { (free + 1).min(65_535) };
-    if width_fixed { (w, spare(w, h)) } else { (spare(h, w), h) }
 }
 
 /// Render photo `id` at the requested size and encode it (or copy / convert its original for
@@ -142,13 +123,21 @@ fn prepare_guarded(
         let label = p.file_name.clone();
         let meta = export_metadata(p, &session.catalog, o);
         let gain_map = o.hdr_output() && o.format == ExportFormat::Jpeg;
-        let (bw, bh) = render_box(o, w, h);
-        let job = session.export_job(id, bw, bh, o.effective_space(), o.effective_depth())?;
+        let mut job = session.export_job(id, w, h, o.effective_space(), o.effective_depth())?;
+        job.request.exact_size = true;
+        job.key ^= 0x86e2_fadc_0917_b435;
         let weight = render_weight(full_px, long, job.level, w.saturating_mul(h));
         if let Some(why) = too_big_for_memory((w, h), native_px, weight, crate::memory::total_ram()) {
             return Err(format!("{label}: {why}"));
         }
-        let hdr_job = if gain_map { Some(session.export_job(id, bw, bh, o.effective_space(), OutputDepth::F32Hdr)?) } else { None };
+        let hdr_job = if gain_map {
+            let mut hdr = session.export_job(id, w, h, o.effective_space(), OutputDepth::F32Hdr)?;
+            hdr.request.exact_size = true;
+            hdr.key ^= 0x86e2_fadc_0917_b435;
+            Some(hdr)
+        } else {
+            None
+        };
         (Work::Render(Box::new(RenderWork { job, hdr_job, meta, opts: o.clone() })), weight)
     } else {
         let lightcraft_catalog::Source::File { path } = &p.source else {
