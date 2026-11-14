@@ -56,6 +56,7 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -326,6 +327,7 @@ private fun Slider(vm: AppViewModel, ed: EditorState, row: SliderRow) {
         onChange = { vm.onControlChange(c, it) },
         onFinished = vm::onControlChangeFinished,
         onReset = { vm.resetControl(c) },
+        onClippingPreview = { active -> vm.setClippingPreview(ed, c.id, active) },
         label = row.label ?: c.label,
         enabled = row.enabled(ed),
     )
@@ -908,11 +910,53 @@ private fun DetailPanel(vm: AppViewModel, ed: EditorState) {
         return listOf(SliderRow(amount, "Amount")) + details.map { SliderRow(it, shown = set) }
     }
     val rows = when (ed.detailTab) {
-        "noise" -> tab("detail.nrLuminance", listOf("detail.nrDetail", "detail.nrContrast"))
+        "noise" -> listOf(
+            SliderRow("enhance.denoise", "Amount", shown = { it.state?.denoiseEnabled == true }),
+            SliderRow("detail.nrLuminance", "Noise Reduction"),
+            SliderRow("detail.nrDetail", shown = { it.value("detail.nrLuminance") > 0.0 }),
+            SliderRow("detail.nrContrast", shown = { it.value("detail.nrLuminance") > 0.0 }),
+        )
         "color" -> tab("detail.nrColor", listOf("detail.nrColorDetail", "detail.nrColorSmoothness"))
         else -> tab("detail.sharpenAmount", listOf("detail.sharpenRadius", "detail.sharpenDetail", "detail.sharpenMasking"))
     }
-    PanelList(vm, ed, rows)
+    if (ed.detailTab == "noise" && ed.denoiseApplicable) {
+        PanelList(vm, ed, rows, header = {
+            item(key = "ai-denoise") {
+                Column {
+                    SubTitle("AI Denoise")
+                    SwitchRow("AI Denoise", ed.state?.denoiseEnabled == true) { vm.setDenoiseEnabled(it) }
+                    if (ed.denoiseStatus == "Processing") {
+                        val progress = ed.denoiseProgress
+                        if (progress != null) {
+                            LinearProgressIndicator(
+                                progress = { progress },
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                color = Lc.highlight,
+                                trackColor = Lc.divider,
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                color = Lc.highlight,
+                                trackColor = Lc.divider,
+                            )
+                        }
+                    }
+                    ed.denoiseStatus?.let {
+                        Text(
+                            it,
+                            color = Lc.panelTextDim,
+                            fontFamily = Inter,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+                        )
+                    }
+                }
+            }
+        })
+    } else {
+        PanelList(vm, ed, rows)
+    }
 }
 
 /**

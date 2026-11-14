@@ -138,6 +138,13 @@ pub struct MaskOverlay {
     pub opacity: u8,
 }
 
+/// Clipping view shown while a global tone slider is moved with two fingers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ClippingPreview {
+    Highlights,
+    Shadows,
+}
+
 /// An album (not a folder of albums) as the title menu lists it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AlbumInfo {
@@ -390,6 +397,8 @@ pub struct Choice {
 pub struct DevelopState {
     /// Black & white (the B&W treatment or a monochrome profile), as the desktop's `is_bw`.
     pub black_and_white: bool,
+    /// Whether AI Denoise is enabled for this photo.
+    pub denoise_enabled: bool,
     /// White balance mode id (`asShot`, `auto`, `daylight`… `custom`).
     pub wb_mode: String,
     pub profile: String,
@@ -517,6 +526,16 @@ impl MobileSession {
         Ok(Arc::new(Self::wrap(s)))
     }
 
+    /// Set the app-managed folder in which denoise models are installed.
+    pub fn set_denoise_models_dir(&self, dir: String) -> Result<(), MobileError> {
+        let path = std::path::PathBuf::from(dir);
+        if !path.is_absolute() {
+            return Err(MobileError::Command(format!("the denoise models folder must be an absolute path, not `{}`", path.display())));
+        }
+        self.lock().set_denoise_models_dir(Some(path));
+        Ok(())
+    }
+
     /// Run command `command` with JSON parameters (`""` = none) and return its JSON result: the
     /// command ids and parameters of the control channel and MCP (`docs/control-protocol.md`).
     pub fn execute(&self, command: String, params_json: String) -> Result<String, MobileError> {
@@ -616,6 +635,7 @@ impl MobileSession {
         let d = &p.develop;
         Some(DevelopState {
             black_and_white: d.treatment == Treatment::Bw || d.profile.id == "lc.mono" || d.profile.id.starts_with("lc.bw."),
+            denoise_enabled: d.enhance.denoise_enabled(),
             wb_mode: enum_id(d.wb.mode),
             profile: d.profile.id.clone(),
             profile_name: engine_presets::profile(&d.profile.id).map_or_else(|| d.profile.id.clone(), |x| x.name.to_string()),
@@ -1016,6 +1036,7 @@ impl MobileSession {
         draft: bool,
         before: bool,
         mask_overlay: Option<MaskOverlay>,
+        clipping_preview: Option<ClippingPreview>,
     ) -> Result<RenderedImage, MobileError> {
         let photo = PhotoId(id);
         let (w, h) = (max_width.max(1) as usize, max_height.max(1) as usize);
@@ -1025,7 +1046,7 @@ impl MobileSession {
         }
         .ok_or(MobileError::NoPhoto(id))?
         .with_stages(self.stages_for(photo, before));
-        let job = with_mask_overlay(job, mask_overlay);
+        let job = with_view_overlay(job, mask_overlay, clipping_preview);
         let job = if draft { job.draft() } else { job };
         let r = job.run();
         self.lock().accept(&r);
@@ -1050,6 +1071,7 @@ impl MobileSession {
         height: u32,
         before: bool,
         mask_overlay: Option<MaskOverlay>,
+        clipping_preview: Option<ClippingPreview>,
     ) -> Result<Option<RenderedImage>, MobileError> {
         let photo = PhotoId(id);
         let (fw, fh) = (frame_width.max(1) as usize, frame_height.max(1) as usize);
@@ -1063,7 +1085,7 @@ impl MobileSession {
             if before { s.region_job_before(photo, fw, fh, window, true) } else { s.region_job(photo, fw, fh, window, true) }
         };
         let Some(job) = job else { return Ok(None) };
-        let r = with_mask_overlay(job, mask_overlay).run();
+        let r = with_view_overlay(job, mask_overlay, clipping_preview).run();
         self.lock().accept(&r);
         Ok(Some(rendered_image(id, r.rendered.map_err(MobileError::Render)?, false)))
     }
@@ -1420,6 +1442,14 @@ fn with_mask_overlay(job: RenderJob, overlay: Option<MaskOverlay>) -> RenderJob 
             })
         }
         None => job,
+    }
+}
+
+fn with_view_overlay(job: RenderJob, mask: Option<MaskOverlay>, clipping: Option<ClippingPreview>) -> RenderJob {
+    match clipping {
+        Some(ClippingPreview::Highlights) => job.with_overlay(lightcraft_engine::pipeline::Overlay::ClipHighlights),
+        Some(ClippingPreview::Shadows) => job.with_overlay(lightcraft_engine::pipeline::Overlay::ClipShadows),
+        None => with_mask_overlay(job, mask),
     }
 }
 

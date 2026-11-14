@@ -3,6 +3,7 @@ package ai.storyteller.lightcraft.ui
 import ai.storyteller.lightcraft.LightcraftApplication
 import ai.storyteller.lightcraft.core.AlbumInfo
 import ai.storyteller.lightcraft.core.Choice
+import ai.storyteller.lightcraft.core.ClippingPreview
 import ai.storyteller.lightcraft.core.CropFrame
 import ai.storyteller.lightcraft.core.DevelopControl
 import ai.storyteller.lightcraft.core.DevelopState
@@ -26,11 +27,14 @@ import ai.storyteller.lightcraft.core.whiteBalanceModes
 import ai.storyteller.lightcraft.engine.DeviceAccess
 import ai.storyteller.lightcraft.engine.DeviceMedia
 import ai.storyteller.lightcraft.engine.DevicePhoto
+import ai.storyteller.lightcraft.engine.DenoiseModelArchive
 import ai.storyteller.lightcraft.engine.Engine
 import ai.storyteller.lightcraft.engine.PhotoFiles
 import ai.storyteller.lightcraft.engine.toImageBitmap
 import android.app.Application
+import android.content.ContentResolver
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.os.StatFs
 import android.util.LruCache
 import androidx.compose.runtime.Stable
@@ -48,11 +52,17 @@ import androidx.compose.ui.unit.IntSize
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
@@ -62,6 +72,16 @@ import org.json.JSONObject
 
 /** A snackbar message, with an optional action. */
 class UiMessage(val text: String, val actionLabel: String? = null, val action: (() -> Unit)? = null)
+
+data class MergeDialogState(
+    val command: String,
+    val title: String,
+    val ids: List<ULong>,
+    val projection: String,
+    val preview: ImageBitmap? = null,
+    val loading: Boolean = true,
+    val error: String? = null,
+)
 
 /**
  * The editor's main tools along the bottom, the reference app's row. Labelled, a tool is as wide as
@@ -77,8 +97,8 @@ enum class MainTool(val label: String, val icon: Glyph, val labelledWidth: Float
 }
 
 /**
- * Actions' row, where Edit's sections go: one-tap edits. The reference's others (enhance, subject,
- * background) need AI models the phone doesn't have; rating is More › Info and rating, as there.
+ * Actions' row, where Edit's sections go: one-tap edits. The reference's other AI actions
+ * (enhance, subject, background) need models the phone doesn't have; rating is More › Info and rating.
  */
 enum class QuickAction(val label: String, val icon: Glyph, val width: Float = 53.5f) {
     AUTO("Auto", LcIcon.SectionAuto),
@@ -111,6 +131,9 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     var info by mutableStateOf(info)
     var controls by mutableStateOf<List<DevelopControl>>(emptyList())
     var state by mutableStateOf<DevelopState?>(null)
+    var denoiseStatus by mutableStateOf<String?>(null)
+    var denoiseProgress by mutableStateOf<Float?>(null)
+    var denoiseApplicable by mutableStateOf(info.raw)
 
     /** The open main tool (none: just the photo and the tool row). */
     var tool by mutableStateOf<MainTool?>(null)
@@ -246,6 +269,7 @@ class EditorState(val photoId: ULong, info: PhotoInfo, val device: DeviceOrigin?
     var detail by mutableStateOf<ViewDetail?>(null)
     var histogram by mutableStateOf<ImageHistogram?>(null)
     var showingBefore by mutableStateOf(false)
+    var clippingPreview by mutableStateOf<ClippingPreview?>(null)
 
     /** View options' sheet is open over the editor. */
     var viewOptions by mutableStateOf(false)
@@ -332,6 +356,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var profiles by mutableStateOf<List<ProfileEntry>>(emptyList())
         private set
+    var denoiseModels by mutableStateOf<JSONObject?>(null)
+        private set
+    var pendingDenoiseModel by mutableStateOf<JSONObject?>(null)
+        private set
+    var denoiseModelImporting by mutableStateOf(false)
+        private set
+    var denoiseModelRemoving by mutableStateOf<String?>(null)
+        private set
+    var denoiseModelError by mutableStateOf<String?>(null)
+        private set
+    private var pendingDenoiseImportDir: File? = null
+    private var denoisePumpJob: Job? = null
     val wbModes: List<Choice> = runCatching { whiteBalanceModes() }.getOrDefault(emptyList())
 
     private val prefs = app.getSharedPreferences("library", Application.MODE_PRIVATE)
@@ -558,6 +594,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var selected by mutableStateOf<Set<ULong>>(emptySet())
         private set
+    var merging by mutableStateOf(false)
+        private set
+    var mergeDialog by mutableStateOf<MergeDialogState?>(null)
+        private set
+    private var mergePreviewRequest = 0L
 
     /** Photos (and looks, and sizes) already prepared for the editor. */
     private val prefetched = HashSet<String>()
@@ -569,10 +610,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val looks = BitmapCache(32 shl 20)
     val messages = Channel<UiMessage>(Channel.BUFFERED)
 
-    private data class ViewRequest(val photo: ULong, val width: Int, val height: Int, val draft: Boolean, val before: Boolean, val crop: Boolean, val mask: MaskOverlay?, val seq: Long)
+    private data class ViewRequest(
+        val photo: ULong,
+        val width: Int,
+        val height: Int,
+        val draft: Boolean,
+        val before: Boolean,
+        val crop: Boolean,
+        val mask: MaskOverlay?,
+        val clipping: ClippingPreview?,
+        val seq: Long,
+    )
 
     /** The part of the zoomed view to render sharp over [base] (see [ViewDetail]). */
-    private class DetailRequest(val photo: ULong, val frame: IntSize, val window: IntRect, val before: Boolean, val mask: MaskOverlay?, val base: ImageBitmap)
+    private class DetailRequest(
+        val photo: ULong,
+        val frame: IntSize,
+        val window: IntRect,
+        val before: Boolean,
+        val mask: MaskOverlay?,
+        val clipping: ClippingPreview?,
+        val base: ImageBitmap,
+    )
 
     /** The latest view the editor wants: a busy render loop skips straight to the newest. */
     private val viewRequests = MutableStateFlow<ViewRequest?>(null)
@@ -1086,7 +1145,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val size = slideSize.takeIf { it.width > 0 && it.height > 0 } ?: return
         viewModelScope.launch {
             val img = withContext(e.viewRenders) {
-                runCatching { e.session.renderView(p.id, size.width.toUInt(), size.height.toUInt(), false, false, null).toImageBitmap() }.getOrNull()
+                runCatching { e.session.renderView(p.id, size.width.toUInt(), size.height.toUInt(), false, false, null, null).toImageBitmap() }.getOrNull()
             }
             if (slideshow == i && img != null) slideshowImage = img
             photos.getOrNull((i + 1) % photos.size)?.let { n ->
@@ -1362,6 +1421,192 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun refreshDenoiseModels() {
+        val e = engine ?: return
+        viewModelScope.launch {
+            runCatching { JSONObject(e.command { execute("denoise.models.list", "{}") }) }
+                .onSuccess {
+                    denoiseModels = it
+                    denoiseModelError = null
+                }
+                .onFailure {
+                    denoiseModelError = it.message ?: "Couldn't read AI Denoise settings"
+                    say(denoiseModelError)
+                }
+        }
+    }
+
+    private fun JSONObject.hasInstalledDenoiseModel(): Boolean {
+        val models = optJSONArray("models") ?: return false
+        return (0 until models.length()).any { index ->
+            models.optJSONObject(index)?.optBoolean("installed") == true
+        }
+    }
+
+    fun removeDenoiseModel(id: String) {
+        val e = engine ?: return
+        if (denoiseModelImporting || denoiseModelRemoving != null) return
+        denoiseModelRemoving = id
+        denoiseModelError = null
+        viewModelScope.launch {
+            runCatching {
+                e.command {
+                    execute("denoise.models.remove", JSONObject().put("id", id).toString())
+                }
+            }
+                .onSuccess {
+                    refreshDenoiseModels()
+                    say("Removed AI Denoise model")
+                }
+                .onFailure {
+                    denoiseModelError = it.message ?: "Couldn't remove the model"
+                    say(denoiseModelError)
+                }
+            denoiseModelRemoving = null
+        }
+    }
+
+    /** Copy a downloaded ONNX model and its manifest from the document picker into app storage. */
+    fun inspectDenoiseModel(uris: List<Uri>) {
+        if (uris.isEmpty() || denoiseModelImporting) return
+        if (denoiseModelRemoving != null) {
+            say("Wait for the current model operation to finish.")
+            return
+        }
+        val e = engine ?: return
+        dismissPendingDenoiseModel()
+        denoiseModelImporting = true
+        denoiseModelError = null
+        viewModelScope.launch {
+            var staged: File? = null
+            try {
+                val installedModels = e.command {
+                    JSONObject(execute("denoise.models.list", "{}"))
+                }
+                if (installedModels.hasInstalledDenoiseModel()) {
+                    throw IOException("Remove the installed AI Denoise model before installing another one.")
+                }
+                val stagedDir = withContext(Dispatchers.IO) {
+                    val resolver = getApplication<Application>().contentResolver
+                    val named = uris.map { uri -> uri to documentName(resolver, uri) }
+                    val archives = named.filter { (uri, name) ->
+                        name?.endsWith(".zip", ignoreCase = true) == true ||
+                            resolver.getType(uri).equals("application/zip", ignoreCase = true) ||
+                            resolver.getType(uri).equals("application/x-zip-compressed", ignoreCase = true)
+                    }
+                    if (archives.isNotEmpty() && named.size != 1) {
+                        throw IOException("Choose one ZIP archive or the .onnx model and denoise-model.json files, not both.")
+                    }
+                    val dir = File(e.stagingDir.parentFile, "Denoise Import/${UUID.randomUUID()}")
+                    if (!dir.mkdirs()) throw IOException("Couldn't create temporary model storage.")
+                    try {
+                        if (archives.isNotEmpty()) {
+                            val input = resolver.openInputStream(archives.single().first)
+                                ?: throw IOException("Couldn't open the selected ZIP archive.")
+                            input.use { DenoiseModelArchive.extract(it, dir) }
+                        } else {
+                            val model = named.filter { (_, name) -> name?.endsWith(".onnx", ignoreCase = true) == true }
+                            val manifest = named.filter { (_, name) -> name.equals("denoise-model.json", ignoreCase = true) }
+                            if (named.size != 2 || model.size != 1 || manifest.size != 1) {
+                                throw IOException("Choose one ZIP archive or the .onnx model and denoise-model.json files together.")
+                            }
+                            copyDocument(resolver, model.single().first, File(dir, "model.onnx"), 2L * 1024 * 1024 * 1024)
+                            copyDocument(resolver, manifest.single().first, File(dir, "denoise-model.json"), 64L * 1024)
+                        }
+                    } catch (error: Exception) {
+                        dir.deleteRecursively()
+                        throw error
+                    }
+                    dir
+                }
+                staged = stagedDir
+                val info = e.command {
+                    JSONObject(execute("denoise.models.inspect", JSONObject().put("path", File(stagedDir, "model.onnx").absolutePath).toString()))
+                }
+                val model = info.optJSONObject("model") ?: throw IOException("The model description is missing.")
+                if (info.optBoolean("alreadyInstalled")) {
+                    throw IOException("Remove the installed AI Denoise model before installing another one.")
+                } else {
+                    pendingDenoiseImportDir = stagedDir
+                    pendingDenoiseModel = model
+                    staged = null
+                }
+            } catch (error: Exception) {
+                denoiseModelError = error.message ?: "Couldn't inspect the model"
+                say(denoiseModelError)
+            } finally {
+                staged?.deleteRecursively()
+                denoiseModelImporting = false
+            }
+        }
+    }
+
+    fun dismissPendingDenoiseModel() {
+        if (denoiseModelImporting && pendingDenoiseModel != null) return
+        pendingDenoiseModel = null
+        pendingDenoiseImportDir?.deleteRecursively()
+        pendingDenoiseImportDir = null
+    }
+
+    fun acceptDenoiseModel() {
+        val model = pendingDenoiseModel ?: return
+        val dir = pendingDenoiseImportDir ?: return
+        val e = engine ?: return
+        if (denoiseModelImporting || denoiseModelRemoving != null) return
+        denoiseModelImporting = true
+        denoiseModelError = null
+        viewModelScope.launch {
+            try {
+                e.command {
+                    val installedModels = JSONObject(execute("denoise.models.list", "{}"))
+                    if (installedModels.hasInstalledDenoiseModel()) {
+                        throw IOException("Remove the installed AI Denoise model before installing another one.")
+                    }
+                    execute(
+                        "denoise.models.install",
+                        JSONObject().put("path", File(dir, "model.onnx").absolutePath).put("acknowledged", true).toString(),
+                    )
+                }
+                pendingDenoiseModel = null
+                pendingDenoiseImportDir = null
+                denoiseModelError = null
+                refreshDenoiseModels()
+                say("Installed ${model.optString("name", "AI Denoise model")}")
+            } catch (error: Exception) {
+                denoiseModelError = error.message ?: "Couldn't install the model"
+                say(denoiseModelError)
+            } finally {
+                dir.deleteRecursively()
+                pendingDenoiseModel = null
+                pendingDenoiseImportDir = null
+                denoiseModelImporting = false
+            }
+        }
+    }
+
+    private fun documentName(resolver: ContentResolver, uri: Uri): String? =
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+
+    private fun copyDocument(resolver: ContentResolver, uri: Uri, destination: File, maxBytes: Long) {
+        val input = resolver.openInputStream(uri) ?: throw IOException("Couldn't open the selected model file.")
+        input.use { source ->
+            FileOutputStream(destination).use { output ->
+                val buffer = ByteArray(64 * 1024)
+                var copied = 0L
+                while (true) {
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    copied += count
+                    if (copied > maxBytes) throw IOException("The selected model file is too large.")
+                    output.write(buffer, 0, count)
+                }
+                if (copied == 0L) throw IOException("The selected model file is empty.")
+            }
+        }
+    }
+
     /** The photo [photoMeta] is of. */
     var photoMetaOf by mutableStateOf<ULong?>(null)
         private set
@@ -1579,6 +1824,112 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Select mode's Select None: nothing chosen, still selecting. */
     fun selectNone() {
         selected = emptySet()
+    }
+
+    /** Open the shared merge engine's preview and options for the selected photos. */
+    fun mergeSelected(command: String) {
+        val (title, minimum) = when (command) {
+            "merge.hdr" -> "HDR Merge" to 2
+            "merge.panorama" -> "Panorama Merge" to 2
+            "merge.hdrPanorama" -> "HDR Panorama Merge" to 4
+            else -> {
+                say("Unsupported merge type")
+                return
+            }
+        }
+        val ids = photos.filter { it.id in selected }.map { it.id }
+        if (engine == null || view.kind == "deleted" || ids.size < minimum || merging) return
+        mergeDialog = MergeDialogState(command, title, ids, "auto")
+        loadMergePreview(mergeDialog ?: return)
+    }
+
+    fun dismissMergeDialog() {
+        mergePreviewRequest++
+        mergeDialog = null
+    }
+
+    fun setMergeProjection(projection: String) {
+        val dialog = mergeDialog ?: return
+        if (projection !in setOf("auto", "spherical", "cylindrical", "perspective") || dialog.projection == projection) return
+        val next = dialog.copy(projection = projection, preview = null, loading = true, error = null)
+        mergeDialog = next
+        loadMergePreview(next)
+    }
+
+    private fun mergeParams(dialog: MergeDialogState, preview: Boolean = false, previewPath: String? = null): JSONObject =
+        JSONObject()
+            .put("ids", JSONArray(dialog.ids.map { it.toLong() }))
+            .put("align", true)
+            .put("deghost", "none")
+            .put("autoSettings", true)
+            .put("stack", false)
+            .put("projection", dialog.projection)
+            .put("boundaryWarp", 0.0)
+            .put("autoCrop", true)
+            .put("fillEdges", false)
+            .put("bracket", 0)
+            .put("preview", preview)
+            .apply { previewPath?.let { put("previewPath", it) } }
+
+    private fun loadMergePreview(dialog: MergeDialogState) {
+        val e = engine ?: return
+        val request = ++mergePreviewRequest
+        viewModelScope.launch {
+            try {
+                val image = withContext(Dispatchers.IO) {
+                    val previewFile = File.createTempFile("merge-preview-", ".png", getApplication<Application>().cacheDir)
+                    try {
+                        e.command {
+                            execute(
+                                dialog.command,
+                                mergeParams(dialog, preview = true, previewPath = previewFile.absolutePath).toString(),
+                            )
+                        }
+                        val bytes = previewFile.readBytes()
+                        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            ?: throw IllegalStateException("The merge preview could not be decoded")
+                    } finally {
+                        if (previewFile.exists() && !previewFile.delete()) {
+                            throw IllegalStateException("Could not remove the temporary merge preview")
+                        }
+                    }
+                }
+                if (request == mergePreviewRequest) {
+                    mergeDialog = mergeDialog?.copy(preview = image, loading = false, error = null)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (request == mergePreviewRequest) {
+                    mergeDialog = mergeDialog?.copy(loading = false, error = e.message ?: "Preview failed")
+                }
+            }
+        }
+    }
+
+    fun confirmMerge() {
+        val dialog = mergeDialog ?: return
+        val e = engine ?: return
+        if (dialog.loading || dialog.preview == null || merging) return
+        dismissMergeDialog()
+        merging = true
+        say("Merging ${dialog.title.removeSuffix(" Merge")}…")
+        viewModelScope.launch {
+            try {
+                val response = e.command { execute(dialog.command, mergeParams(dialog).toString()) }
+                val mergedId = JSONObject(response).optString("id").toULongOrNull()
+                    ?: throw IllegalStateException("The merge finished without returning the new photo")
+                refreshPhotos()
+                if (selecting) selected = setOf(mergedId)
+                say("${dialog.title.removeSuffix(" Merge")} merge added")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                say("${dialog.title.removeSuffix(" Merge")} merge failed: ${e.message ?: "Unknown error"}")
+            } finally {
+                merging = false
+            }
+        }
     }
 
     /**
@@ -1809,6 +2160,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openEditor(p: PhotoInfo, device: DeviceOrigin? = null) {
         val e = engine ?: return
         val ed = EditorState(p.id, p, device)
+        denoisePumpJob?.cancel()
+        denoisePumpJob = null
         // stepping from photo to photo: same view, same tool and section
         editor?.let {
             if (it.photoId != p.id) viewModelScope.launch { discardUntouched(it) }
@@ -1841,7 +2194,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     Snapshot(developControls(), developState(), history(), photo(p.id))
                 }
             }
-                .onSuccess { ed.update(it) }
+                .onSuccess {
+                    ed.update(it)
+                    startDenoisePump(ed)
+                }
                 .onFailure { say("Can't open ${p.fileName}: ${it.message}") }
             requestView()
         }
@@ -1857,6 +2213,78 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         state = s.state
         history = s.history
         s.info?.let { info = it }
+    }
+
+    fun setDenoiseEnabled(enabled: Boolean) {
+        val ed = editor ?: return
+        val e = engine ?: return
+        viewModelScope.launch {
+            runCatching {
+                e.command {
+                    if (enabled && JSONObject(execute("denoise.models.list", "{}")).optString("model").isBlank()) {
+                        throw IllegalStateException("Choose a model in Preferences > AI Denoise before turning this on.")
+                    }
+                    execute(
+                        "denoise.toggle",
+                        JSONObject().put("id", ed.photoId.toLong()).put("enabled", enabled).toString(),
+                    )
+                    snapshot(ed.photoId)
+                }
+            }
+                .onSuccess {
+                    ed.update(it)
+                    requestView()
+                }
+                .onFailure {
+                    ed.denoiseStatus = it.message
+                    say(it.message)
+                }
+        }
+    }
+
+    private fun startDenoisePump(ed: EditorState) {
+        val e = engine ?: return
+        if (!ed.info.raw) return
+        denoisePumpJob = viewModelScope.launch {
+            var generation = -1L
+            while (editor === ed) {
+                val status = try {
+                    e.command {
+                        execute("denoise.pump", JSONObject().put("pace", "light").toString())
+                        JSONObject(execute("denoise.status", JSONObject().put("id", ed.photoId.toLong()).toString()))
+                    }
+                } catch (error: Exception) {
+                    ed.denoiseStatus = error.message ?: "AI Denoise status is unavailable"
+                    ed.denoiseProgress = null
+                    say(ed.denoiseStatus)
+                    break
+                }
+                val photo = status.optJSONObject("photo")
+                val photoState = photo?.optString("state").orEmpty()
+                ed.denoiseApplicable = photoState != "notApplicable"
+                ed.denoiseProgress = if (photoState == "running") {
+                    val total = photo?.optLong("total") ?: 0L
+                    if (total > 0L) (((photo?.optLong("done") ?: 0L).toFloat() / total).coerceIn(0f, 1f)) else null
+                } else {
+                    null
+                }
+                ed.denoiseStatus = when (photoState) {
+                    "noModel" -> "Choose a model in Preferences > AI Denoise."
+                    "ready" -> "Ready"
+                    "queued" -> "Waiting to process"
+                    "running" -> "Processing"
+                    "failed" -> photo?.optString("why")?.takeIf { it.isNotBlank() } ?: "Denoising failed"
+                    else -> null
+                }
+                if (status.isNull("model")) break
+                val nextGeneration = status.optLong("generation")
+                if (generation >= 0L && nextGeneration != generation && ed.state?.denoiseEnabled == true) {
+                    requestView()
+                }
+                generation = nextGeneration
+                delay(700)
+            }
+        }
     }
 
     /** Back: out of Profiles, a range picker or Masking (as Cancel), out of a sub-panel, off the white balance selector, then out of the editor. */
@@ -1877,6 +2305,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun closeEditor() {
         val ed = editor ?: return
+        denoisePumpJob?.cancel()
+        denoisePumpJob = null
         editor = null
         val e = engine ?: return
         viewModelScope.launch {
@@ -1932,7 +2362,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Crop's Aspect shows the whole photo under its frame; its Geometry, the photo as it comes out
         // Guided Upright draws its guides on the photo as the crop tool shows it
         val cropView = ed.tool == MainTool.CROP && (ed.cropTab != "geometry" || ed.state?.upright == "guided")
-        viewRequests.value = ViewRequest(ed.photoId, w, h, draft, ed.showingBefore && ed.tool != MainTool.CROP, cropView, mask, ++requestSeq)
+        val clipping = ed.clippingPreview.takeUnless { ed.showingBefore || cropView || ed.tool != MainTool.EDIT }
+        viewRequests.value = ViewRequest(ed.photoId, w, h, draft, ed.showingBefore && ed.tool != MainTool.CROP, cropView, mask, clipping, ++requestSeq)
     }
 
     /** The mask the view shows over the photo, as the masking options ask (none outside Masking). */
@@ -1959,7 +2390,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val current = ed.detail
         // what is on screen is already there
         if (current != null && current.base === base && current.frame == frame && current.window.covers(rect)) return
-        detailRequests.value = DetailRequest(ed.photoId, frame, rect, ed.showingBefore, viewMask(ed), base)
+        val clipping = ed.clippingPreview.takeUnless { ed.showingBefore || ed.tool != MainTool.EDIT }
+        detailRequests.value = DetailRequest(ed.photoId, frame, rect, ed.showingBefore, viewMask(ed), clipping, base)
     }
 
     private suspend fun renderDetails(e: Engine) {
@@ -1970,7 +2402,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     e.session.renderViewWindow(
                         req.photo, req.frame.width.toUInt(), req.frame.height.toUInt(),
-                        w.left.toUInt(), w.top.toUInt(), w.width.toUInt(), w.height.toUInt(), req.before, req.mask,
+                        w.left.toUInt(), w.top.toUInt(), w.width.toUInt(), w.height.toUInt(), req.before, req.mask, req.clipping,
                     )?.toImageBitmap()
                 }.getOrNull()
             }
@@ -1990,7 +2422,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val img = if (req.crop) {
                         e.session.renderCropView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft)
                     } else {
-                        e.session.renderView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft, req.before, req.mask)
+                        e.session.renderView(req.photo, req.width.toUInt(), req.height.toUInt(), req.draft, req.before, req.mask, req.clipping)
                     }
                     img.histogram to img.toImageBitmap()
                 }
@@ -3313,6 +3745,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (ed.sub == "curve" && control.id.startsWith("curve.")) refreshCurve()
                 }
                 .onFailure { say(it.message) }
+        }
+    }
+
+    fun setClippingPreview(ed: EditorState, controlId: String, active: Boolean) {
+        if (editor !== ed) return
+        val preview = if (active && ed.tool == MainTool.EDIT) {
+            when (controlId) {
+                "light.highlights", "light.whites" -> ClippingPreview.HIGHLIGHTS
+                "light.shadows", "light.blacks" -> ClippingPreview.SHADOWS
+                else -> null
+            }
+        } else {
+            null
+        }
+        if (ed.clippingPreview != preview) {
+            ed.clippingPreview = preview
+            requestView(draft = true)
         }
     }
 
